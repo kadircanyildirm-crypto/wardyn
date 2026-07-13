@@ -127,7 +127,8 @@ impl Policy {
         if let Some(p) = path {
             let text = std::fs::read_to_string(p)
                 .with_context(|| format!("reading policy {}", p.display()))?;
-            return Policy::from_yaml_str(&text).with_context(|| format!("parsing {}", p.display()));
+            return Policy::from_yaml_str(&text)
+                .with_context(|| format!("parsing {}", p.display()));
         }
         if let Ok(text) = std::fs::read_to_string("policy.yaml") {
             return Policy::from_yaml_str(&text).context("parsing ./policy.yaml");
@@ -164,9 +165,8 @@ impl Policy {
         for r in raw.network {
             match (&r.cidr, &r.domain) {
                 (Some(cidr), _) => {
-                    let net: Ipv4Net = cidr
-                        .parse()
-                        .with_context(|| format!("bad cidr `{cidr}`"))?;
+                    let net: Ipv4Net =
+                        cidr.parse().with_context(|| format!("bad cidr `{cidr}`"))?;
                     network.push(NetRule {
                         label: format!("cidr:{cidr}"),
                         which: NetMatch::Cidr(net),
@@ -387,17 +387,32 @@ exec:
     #[test]
     fn network_cidr_matching() {
         let p = policy();
-        assert_eq!(p.eval_connect("127.0.0.1".parse().unwrap()).action, Action::Allow);
-        assert_eq!(p.eval_connect("192.168.1.5".parse().unwrap()).action, Action::Allow);
-        assert_eq!(p.eval_connect("1.1.1.1".parse().unwrap()).action, Action::Block);
-        assert_eq!(p.eval_connect("8.8.8.8".parse().unwrap()).action, Action::Block);
+        assert_eq!(
+            p.eval_connect("127.0.0.1".parse().unwrap()).action,
+            Action::Allow
+        );
+        assert_eq!(
+            p.eval_connect("192.168.1.5".parse().unwrap()).action,
+            Action::Allow
+        );
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap()).action,
+            Action::Block
+        );
+        assert_eq!(
+            p.eval_connect("8.8.8.8".parse().unwrap()).action,
+            Action::Block
+        );
     }
 
     #[test]
     fn verdict_carries_rule() {
         let p = policy();
         assert_eq!(p.eval_file("/x/.env").rule, "**/.env");
-        assert_eq!(p.eval_connect("1.1.1.1".parse().unwrap()).rule, "cidr:0.0.0.0/0");
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap()).rule,
+            "cidr:0.0.0.0/0"
+        );
         assert_eq!(p.eval_file("/x/main.rs").rule, "**");
     }
 
@@ -424,6 +439,9 @@ exec:
     fn empty_policy_uses_default() {
         let p = Policy::from_yaml_str("default_action: warn").unwrap();
         assert_eq!(p.eval_file("/anything").action, Action::Warn);
-        assert_eq!(p.eval_connect("8.8.8.8".parse().unwrap()).action, Action::Warn);
+        assert_eq!(
+            p.eval_connect("8.8.8.8".parse().unwrap()).action,
+            Action::Warn
+        );
     }
 }

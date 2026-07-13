@@ -5,6 +5,7 @@ tree with eBPF and enforces — in real time, at the syscall boundary — what i
 **read**, **run**, and **connect to**. It catches the agent reading your `.env`
 or dialing an unknown IP, and can *block* it before the operation completes.
 
+[![CI](https://github.com/kadircanyildirm-crypto/leash/actions/workflows/ci.yml/badge.svg)](https://github.com/kadircanyildirm-crypto/leash/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)
 ![built with Rust + aya](https://img.shields.io/badge/built%20with-Rust%20%2B%20aya-orange?logo=rust)
 ![eBPF](https://img.shields.io/badge/eBPF-tracepoints%20%C2%B7%20cgroup%20%C2%B7%20LSM-6f42c1)

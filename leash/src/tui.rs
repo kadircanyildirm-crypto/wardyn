@@ -87,9 +87,15 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {}    ", self.target)),
-            Span::styled(format!("exec {}", self.exec), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("exec {}", self.exec),
+                Style::default().fg(Color::Gray),
+            ),
             Span::raw("  "),
-            Span::styled(format!("open {}", self.open), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("open {}", self.open),
+                Style::default().fg(Color::Gray),
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("connect {}", self.connect),
@@ -98,7 +104,9 @@ impl App {
             Span::raw("    "),
             Span::styled(
                 format!("⚠ warn {}", self.warn),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(

@@ -83,9 +83,7 @@ fn parse_args() -> anyhow::Result<Opts> {
             }
             "--policy" => {
                 it.next();
-                policy_path = Some(PathBuf::from(
-                    it.next().context("--policy needs a path")?,
-                ));
+                policy_path = Some(PathBuf::from(it.next().context("--policy needs a path")?));
             }
             "--audit" => {
                 it.next();
@@ -192,7 +190,9 @@ async fn main() -> anyhow::Result<()> {
             .program_mut("file_open")
             .context("file_open program not found")?
             .try_into()?;
-        lprog.load("file_open", &btf).context("loading lsm/file_open")?;
+        lprog
+            .load("file_open", &btf)
+            .context("loading lsm/file_open")?;
         lprog.attach().context("attaching lsm/file_open")?;
 
         let bprog: &mut Lsm = ebpf
@@ -202,7 +202,9 @@ async fn main() -> anyhow::Result<()> {
         bprog
             .load("bprm_check_security", &btf)
             .context("loading lsm/bprm_check_security")?;
-        bprog.attach().context("attaching lsm/bprm_check_security")?;
+        bprog
+            .attach()
+            .context("attaching lsm/bprm_check_security")?;
 
         info!("enforcement ON — deny blocked egress (cgroup) + secret-file opens + blocked execs (LSM)");
     }
@@ -226,17 +228,20 @@ async fn main() -> anyhow::Result<()> {
         let mut bn: BpfHashMap<_, NameKey, u8> =
             BpfHashMap::try_from(ebpf.take_map("BLOCK_NAMES").context("BLOCK_NAMES")?)?;
         for k in names {
-            bn.insert(NameKey(k), 1u8, 0).context("populating BLOCK_NAMES")?;
+            bn.insert(NameKey(k), 1u8, 0)
+                .context("populating BLOCK_NAMES")?;
         }
         let mut bd: BpfHashMap<_, NameKey, u8> =
             BpfHashMap::try_from(ebpf.take_map("BLOCK_DIRS").context("BLOCK_DIRS")?)?;
         for k in dirs {
-            bd.insert(NameKey(k), 1u8, 0).context("populating BLOCK_DIRS")?;
+            bd.insert(NameKey(k), 1u8, 0)
+                .context("populating BLOCK_DIRS")?;
         }
         let mut be: BpfHashMap<_, NameKey, u8> =
             BpfHashMap::try_from(ebpf.take_map("BLOCK_EXEC").context("BLOCK_EXEC")?)?;
         for k in policy.exec_enforcement() {
-            be.insert(NameKey(k), 1u8, 0).context("populating BLOCK_EXEC")?;
+            be.insert(NameKey(k), 1u8, 0)
+                .context("populating BLOCK_EXEC")?;
         }
     }
 
@@ -283,8 +288,8 @@ async fn run_plain(
     audit: &mut Audit,
 ) -> anyhow::Result<()> {
     println!(
-        "{:<7} {:<15} {:<8} {:<6} {}",
-        "PID", "COMM", "EVENT", "ACT", "DETAIL"
+        "{:<7} {:<15} {:<8} {:<6} DETAIL",
+        "PID", "COMM", "EVENT", "ACT"
     );
     loop {
         tokio::select! {

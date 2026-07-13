@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # nightly + rust-src is required: build.rs (aya-build) compiles the eBPF
+      # crate for bpfel-unknown-none with -Z build-std.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      # Builds userspace + the eBPF object (via aya-build). Does not load it —
+      # GitHub runners have no BPF LSM — so runtime enforcement is tested manually.
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test
