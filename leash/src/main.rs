@@ -22,8 +22,9 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context as _};
+use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{Array, HashMap as BpfHashMap, MapData, RingBuf};
-use aya::programs::TracePoint;
+use aya::programs::{CgroupAttachMode, CgroupSockAddr, TracePoint};
 use leash_common::{kind, Event, PATH_LEN};
 use log::info;
 use tokio::io::unix::AsyncFd;
@@ -48,6 +49,7 @@ impl Mode {
 
 struct Opts {
     plain: bool,
+    enforce: bool,
     policy_path: Option<PathBuf>,
     audit_path: PathBuf,
     mode: Mode,
@@ -56,6 +58,7 @@ struct Opts {
 fn parse_args() -> anyhow::Result<Opts> {
     let mut it = std::env::args().skip(1).peekable();
     let mut plain = false;
+    let mut enforce = false;
     let mut policy_path = None;
     let mut audit_path = PathBuf::from("leash-audit.jsonl");
 
@@ -63,6 +66,10 @@ fn parse_args() -> anyhow::Result<Opts> {
         match a.as_str() {
             "--plain" => {
                 plain = true;
+                it.next();
+            }
+            "--enforce" => {
+                enforce = true;
                 it.next();
             }
             "--policy" => {
@@ -98,6 +105,7 @@ fn parse_args() -> anyhow::Result<Opts> {
 
     Ok(Opts {
         plain,
+        enforce,
         policy_path,
         audit_path,
         mode,
@@ -153,8 +161,37 @@ async fn main() -> anyhow::Result<()> {
     load_tracepoint(&mut ebpf, "leash_connect", "syscalls", "sys_enter_connect")?;
     load_tracepoint(&mut ebpf, "leash_fork", "sched", "sched_process_fork")?;
 
+    // Enforcement (opt-in): attach the cgroup/connect4 denier BEFORE taking any
+    // map, so map relocation still finds NET_RULES/CONFIG/WATCHED in the object.
+    // Kept in `_cgroup` for the program's lifetime.
+    let mut _cgroup = None;
+    if opts.enforce {
+        let prog: &mut CgroupSockAddr = ebpf
+            .program_mut("connect4")
+            .context("connect4 program not found")?
+            .try_into()?;
+        prog.load()?;
+        let cg = std::fs::File::open("/sys/fs/cgroup")
+            .context("open /sys/fs/cgroup (cgroup v2 required for network enforcement)")?;
+        prog.attach(&cg, CgroupAttachMode::Single)
+            .context("attaching connect4 to the cgroup")?;
+        _cgroup = Some(cg);
+        info!("enforcement ON — blocked egress is denied for the watched subtree");
+    }
+
     let mut config: Array<_, u32> = Array::try_from(ebpf.take_map("CONFIG").context("CONFIG")?)?;
-    config.set(0, u32::from(matches!(opts.mode, Mode::All)), 0)?;
+    config.set(0, u32::from(matches!(opts.mode, Mode::All)), 0)?; // watch_all
+    config.set(1, u32::from(opts.enforce), 0)?; // enforce
+    config.set(2, policy.default_action_code(), 0)?; // net_default
+
+    {
+        let mut net: LpmTrie<_, u32, u32> =
+            LpmTrie::try_from(ebpf.take_map("NET_RULES").context("NET_RULES")?)?;
+        for (plen, data, act) in policy.net_entries() {
+            net.insert(&Key::new(plen, data), act, 0)
+                .context("populating NET_RULES")?;
+        }
+    }
 
     let ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("EVENTS")?)?;
     let async_fd = AsyncFd::new(ring)?;

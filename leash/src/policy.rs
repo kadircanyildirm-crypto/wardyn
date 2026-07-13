@@ -32,6 +32,15 @@ impl Action {
             Action::Block => "block",
         }
     }
+
+    /// Wire value shared with the eBPF side (`leash_common::action`).
+    pub fn code(self) -> u32 {
+        match self {
+            Action::Allow => 0,
+            Action::Warn => 1,
+            Action::Block => 2,
+        }
+    }
 }
 
 /// A policy decision plus the rule that produced it (for audit / display).
@@ -198,6 +207,30 @@ impl Policy {
             self.exec.len(),
             self.default_action.as_str()
         )
+    }
+
+    pub fn default_action_code(&self) -> u32 {
+        self.default_action.code()
+    }
+
+    /// Network rules as `(prefix_len, ipv4-in-network-byte-order-as-u32, action
+    /// code)` for the kernel LPM trie. Reversed so earlier policy rules win on
+    /// identical keys (LPM `insert` overwrites on collision).
+    pub fn net_entries(&self) -> Vec<(u32, u32, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .map(|r| {
+                let (plen, data) = match &r.which {
+                    NetMatch::Cidr(net) => (
+                        net.prefix_len() as u32,
+                        u32::from_le_bytes(net.network().octets()),
+                    ),
+                    NetMatch::Ip(a) => (32u32, u32::from_le_bytes(a.octets())),
+                };
+                (plen, data, r.action.code())
+            })
+            .collect()
     }
 
     pub fn eval_file(&self, path: &str) -> Verdict {
