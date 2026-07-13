@@ -1,6 +1,0 @@
-{"action":"block","comm":"bash","detail":"8.8.8.8:53","event":"connect","pid":17834,"rule":"cidr:0.0.0.0/0","ts":"2026-07-13T08:34:29.114Z"}
-{"action":"block","comm":"bash","detail":"8.8.8.8:53","event":"connect","pid":17837,"rule":"cidr:0.0.0.0/0","ts":"2026-07-13T08:34:30.123Z"}
-{"action":"block","comm":"bash","detail":"8.8.8.8:53","event":"connect","pid":17840,"rule":"cidr:0.0.0.0/0","ts":"2026-07-13T08:34:31.136Z"}
-{"action":"block","comm":"bash","detail":"8.8.8.8:53","event":"connect","pid":17849,"rule":"cidr:0.0.0.0/0","ts":"2026-07-13T08:34:32.146Z"}
-{"action":"block","comm":"bash","detail":"8.8.8.8:53","event":"connect","pid":17852,"rule":"cidr:0.0.0.0/0","ts":"2026-07-13T08:34:33.156Z"}
-{"action":"block","comm":"bash","detail":"8.8.8.8:53","event":"connect","pid":17855,"rule":"cidr:0.0.0.0/0","ts":"2026-07-13T08:34:34.166Z"}
