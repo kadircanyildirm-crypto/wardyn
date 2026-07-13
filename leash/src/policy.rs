@@ -13,6 +13,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use globset::{Glob, GlobMatcher};
 use ipnet::Ipv4Net;
+use leash_common::NAME_LEN;
 use serde::Deserialize;
 
 /// The three policy verdicts. Wire values match `leash_common::action`.
@@ -233,6 +234,27 @@ impl Policy {
             .collect()
     }
 
+    /// Block rules compiled for kernel-side file enforcement: exact basenames
+    /// (e.g. `.env`, `shadow`) and exact parent-directory names (e.g. `.ssh`).
+    /// Patterns that can't reduce to a literal segment stay observe/warn only.
+    pub fn file_enforcement(&self) -> (Vec<[u8; NAME_LEN]>, Vec<[u8; NAME_LEN]>) {
+        let mut names = Vec::new();
+        let mut dirs = Vec::new();
+        for r in &self.files {
+            if r.action != Action::Block {
+                continue;
+            }
+            if let Some(stripped) = r.pattern.strip_suffix("/**") {
+                if let Some(k) = last_segment(stripped).and_then(name_key) {
+                    dirs.push(k);
+                }
+            } else if let Some(k) = last_segment(&r.pattern).and_then(name_key) {
+                names.push(k);
+            }
+        }
+        (names, dirs)
+    }
+
     pub fn eval_file(&self, path: &str) -> Verdict {
         eval_path(&self.files, path, self.default_action)
     }
@@ -270,6 +292,26 @@ fn eval_path(rules: &[PathRule], path: &str, default: Action) -> Verdict {
         action: default,
         rule: "default".to_string(),
     }
+}
+
+/// Last non-empty `/`-separated segment of a glob pattern.
+fn last_segment(p: &str) -> Option<&str> {
+    p.rsplit('/').find(|s| !s.is_empty())
+}
+
+/// A literal path segment -> NUL-padded fixed key, or `None` if it contains glob
+/// metacharacters (those can't be enforced as an exact name).
+fn name_key(seg: &str) -> Option<[u8; NAME_LEN]> {
+    if seg == "**" || seg.chars().any(|c| matches!(c, '*' | '?' | '[' | ']')) {
+        return None;
+    }
+    let bytes = seg.as_bytes();
+    if bytes.is_empty() || bytes.len() >= NAME_LEN {
+        return None;
+    }
+    let mut k = [0u8; NAME_LEN];
+    k[..bytes.len()].copy_from_slice(bytes);
+    Some(k)
 }
 
 /// Best-effort A-record lookup; returns the IPv4 addresses for `domain`.
@@ -348,6 +390,21 @@ exec:
         assert_eq!(p.eval_file("/x/.env").rule, "**/.env");
         assert_eq!(p.eval_connect("1.1.1.1".parse().unwrap()).rule, "cidr:0.0.0.0/0");
         assert_eq!(p.eval_file("/x/main.rs").rule, "**");
+    }
+
+    #[test]
+    fn file_enforcement_compiles_block_rules() {
+        let p = policy();
+        let (names, dirs) = p.file_enforcement();
+        let key = |s: &str| {
+            let mut k = [0u8; NAME_LEN];
+            k[..s.len()].copy_from_slice(s.as_bytes());
+            k
+        };
+        assert!(names.contains(&key(".env"))); // **/.env
+        assert!(names.contains(&key("shadow"))); // /etc/shadow
+        assert!(dirs.contains(&key(".ssh"))); // **/.ssh/**
+        assert!(!names.contains(&key(".env.*"))); // glob segment -> not enforced
     }
 
     #[test]

@@ -5,8 +5,10 @@ eBPF and enforces — in real time, at the syscall boundary — what it may read
 connect to. It catches the agent reading your `.env` or dialing an unknown IP, and can
 *block* it before the operation completes.
 
-> ⚠️ **Status: early development.** M1 (observe) + M2 (policy / warn) done; M3 (block)
-> is next. See [Roadmap](#roadmap) — not production-ready yet.
+> ⚠️ **Status: early development.** M1–M3 done: observe + policy + **kernel-level
+> enforcement** — blocks secret-file reads (LSM `file_open`) and blocked egress
+> (cgroup `connect4`), scoped to the watched subtree and opt-in via `--enforce`.
+> M4 (README polish + demo GIF) next. See [Roadmap](#roadmap) — not production-ready yet.
 
 ```
 $ leash run -- claude "refactor the auth module"
@@ -46,8 +48,9 @@ See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the hook map and enforcement de
 
 - [x] **M1 — Observe:** live tree of exec/open/connect events, scoped to a subtree.
 - [x] **M2 — Policy:** `policy.yaml` (glob + CIDR), allow/warn/block verdicts, JSONL audit log.
-- [ ] **M3 — Block:** deny network (cgroup) + file/exec (LSM).
-- [ ] **M4 — Ship:** demo GIF, presets, devcontainer.
+- [x] **M3 — Block:** deny blocked egress (cgroup `connect4`) + secret-file reads
+      (LSM `file_open`); scoped to the subtree, opt-in via `--enforce`.
+- [ ] **M4 — Ship:** demo GIF, presets, devcontainer, exec blocking (LSM `bprm_check`).
 
 ## License
 

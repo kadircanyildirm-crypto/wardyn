@@ -10,6 +10,14 @@
 pub const COMM_LEN: usize = 16;
 /// Max bytes we copy for a path/filename in an event (truncated if longer).
 pub const PATH_LEN: usize = 256;
+/// Fixed key width for the file-enforcement basename / directory maps.
+pub const NAME_LEN: usize = 40;
+
+/// A NUL-padded file basename or directory name, used as an exact hash-map key
+/// on both sides of the kernel boundary.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NameKey(pub [u8; NAME_LEN]);
 
 /// What kind of syscall/LSM event this is.
 pub mod kind {

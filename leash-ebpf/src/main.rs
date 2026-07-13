@@ -1,42 +1,47 @@
 //! Leash eBPF programs.
 //!
 //! Observation (tracepoints) streams a structured [`Event`] per exec/open/connect
-//! for the watched subtree. Enforcement (M3) adds a `cgroup/connect4` program
-//! that *denies* outbound IPv4 connections matching a blocked CIDR — but only for
-//! watched pids and only when `CONFIG[ENFORCE]` is set, so it can never break the
-//! wider system.
+//! for the watched subtree. Enforcement (M3, gated on `CONFIG[ENFORCE]` and only
+//! for WATCHED pids) adds:
+//!   - `cgroup/connect4` — deny outbound IPv4 to a blocked CIDR (LPM trie).
+//!   - `lsm/file_open`   — deny opening a file whose basename or parent directory
+//!     is on the block list (exact match; no kernel path-walk needed).
 #![no_std]
 #![no_main]
 
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
+        bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user,
+        bpf_probe_read_user_str_bytes,
     },
-    macros::{cgroup_sock_addr, map, tracepoint},
+    macros::{cgroup_sock_addr, lsm, map, tracepoint},
     maps::{lpm_trie::Key, Array, HashMap, LpmTrie, RingBuf},
-    programs::{SockAddrContext, TracePointContext},
+    programs::{LsmContext, SockAddrContext, TracePointContext},
 };
-use leash_common::{action, kind, Event, COMM_LEN, PATH_LEN};
+use leash_common::{action, kind, Event, NameKey, COMM_LEN, NAME_LEN, PATH_LEN};
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
-/// PIDs in the watched subtree (pid -> 1).
 #[map]
 static WATCHED: HashMap<u32, u8> = HashMap::with_max_entries(8192, 0);
 
-/// Config array:
-///   [0] watch_all  (1 = observe system-wide, 0 = scoped to WATCHED)
-///   [1] enforce    (1 = cgroup/LSM hooks may deny, 0 = observe only)
-///   [2] net_default (action code applied to a connect with no CIDR match)
+/// Config: [0] watch_all, [1] enforce, [2] net_default (action code).
 #[map]
 static CONFIG: Array<u32> = Array::with_max_entries(4, 0);
 
-/// Compiled network policy: longest-prefix CIDR -> action code. Populated by
-/// userspace from `policy.yaml`. Keyed by the IPv4 address in network byte order.
+/// Blocked-CIDR -> action code (longest-prefix), keyed by IPv4 in network order.
 #[map]
 static NET_RULES: LpmTrie<u32, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Blocked file basenames (e.g. `.env`, `shadow`) — exact match, NUL-padded.
+#[map]
+static BLOCK_NAMES: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
+
+/// Blocked parent-directory names (e.g. `.ssh`, `.aws`) — exact match.
+#[map]
+static BLOCK_DIRS: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 
 const CFG_WATCH_ALL: u32 = 0;
 const CFG_ENFORCE: u32 = 1;
@@ -48,13 +53,21 @@ const CONNECT_USERVADDR_OFFSET: usize = 24;
 const FORK_PARENT_PID_OFFSET: usize = 24;
 const FORK_CHILD_PID_OFFSET: usize = 44;
 
+// struct offsets for kernel 6.8 (from `pahole`); see scripts/kernel-offsets.sh.
+// file.f_path(152) + path.dentry(8):
+const FILE_DENTRY_OFF: usize = 160;
+// dentry.d_name(32) + qstr.name(8):
+const DENTRY_NAME_OFF: usize = 40;
+// dentry.d_parent(24):
+const DENTRY_PARENT_OFF: usize = 24;
+
 const AF_INET: u16 = 2;
 
 #[repr(C)]
 struct SockAddrIn {
     family: u16,
-    port: u16, // network byte order
-    addr: u32, // network byte order
+    port: u16,
+    addr: u32,
 }
 
 #[inline(always)]
@@ -77,7 +90,7 @@ fn in_scope(pid: u32) -> bool {
     watch_all() || is_watched(pid)
 }
 
-// ── exec + open: single user-space path pointer ─────────────────────────────
+// ── exec + open observation ─────────────────────────────────────────────────
 
 #[tracepoint]
 pub fn leash_execve(ctx: TracePointContext) -> u32 {
@@ -122,7 +135,7 @@ fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -
     Ok(())
 }
 
-// ── connect: observation (IPv4 dest addr:port) ──────────────────────────────
+// ── connect observation ─────────────────────────────────────────────────────
 
 #[tracepoint]
 pub fn leash_connect(ctx: TracePointContext) -> u32 {
@@ -161,21 +174,20 @@ fn emit_connect(ctx: &TracePointContext) -> Result<(), i64> {
     Ok(())
 }
 
-// ── connect: enforcement (deny blocked egress) ──────────────────────────────
+// ── network enforcement: deny blocked egress ────────────────────────────────
+
+const ALLOW: i32 = 1;
+const DENY: i32 = 0;
 
 #[cgroup_sock_addr(connect4)]
 pub fn connect4(ctx: SockAddrContext) -> i32 {
     match try_connect4(&ctx) {
         Ok(v) => v,
-        Err(_) => 1, // fail open
+        Err(_) => ALLOW, // fail open
     }
 }
 
-const ALLOW: i32 = 1;
-const DENY: i32 = 0;
-
 fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
-    // Enforcement is opt-in and scoped: never touch unwatched processes.
     if cfg(CFG_ENFORCE) == 0 {
         return Ok(ALLOW);
     }
@@ -193,6 +205,64 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     } else {
         Ok(ALLOW)
     }
+}
+
+// ── file enforcement: deny opening blocked secrets ──────────────────────────
+
+const EPERM: i32 = -1;
+const OK: i32 = 0;
+
+#[lsm(hook = "file_open")]
+pub fn file_open(ctx: LsmContext) -> i32 {
+    match try_file_open(&ctx) {
+        Ok(v) => v,
+        Err(_) => OK, // fail open on a read error
+    }
+}
+
+fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
+    if cfg(CFG_ENFORCE) == 0 {
+        return Ok(OK);
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if !is_watched(pid) {
+        return Ok(OK);
+    }
+
+    // struct file* -> f_path.dentry
+    let file: *const u8 = unsafe { ctx.arg(0) };
+    let dentry = read_ptr(file, FILE_DENTRY_OFF)?;
+
+    // basename: dentry->d_name.name
+    let mut name = [0u8; NAME_LEN];
+    read_name(dentry, &mut name)?;
+    if unsafe { BLOCK_NAMES.get(&NameKey(name)).is_some() } {
+        return Ok(EPERM);
+    }
+
+    // parent directory name: dentry->d_parent->d_name.name
+    let parent = read_ptr(dentry, DENTRY_PARENT_OFF)?;
+    let mut dir = [0u8; NAME_LEN];
+    read_name(parent, &mut dir)?;
+    if unsafe { BLOCK_DIRS.get(&NameKey(dir)).is_some() } {
+        return Ok(EPERM);
+    }
+
+    Ok(OK)
+}
+
+#[inline(always)]
+fn read_ptr(base: *const u8, off: usize) -> Result<*const u8, i64> {
+    let p = base.wrapping_add(off) as *const *const u8;
+    unsafe { bpf_probe_read_kernel(p) }
+}
+
+#[inline(always)]
+fn read_name(dentry: *const u8, buf: &mut [u8; NAME_LEN]) -> Result<(), i64> {
+    let name_pp = dentry.wrapping_add(DENTRY_NAME_OFF) as *const *const u8;
+    let name_ptr: *const u8 = unsafe { bpf_probe_read_kernel(name_pp) }?;
+    let _ = unsafe { bpf_probe_read_kernel_str_bytes(name_ptr, buf) };
+    Ok(())
 }
 
 // ── fork: adopt children of watched processes ───────────────────────────────

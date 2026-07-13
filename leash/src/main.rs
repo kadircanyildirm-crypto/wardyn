@@ -24,14 +24,23 @@ use std::path::PathBuf;
 use anyhow::{bail, Context as _};
 use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{Array, HashMap as BpfHashMap, MapData, RingBuf};
-use aya::programs::{CgroupAttachMode, CgroupSockAddr, TracePoint};
-use leash_common::{kind, Event, PATH_LEN};
+use aya::programs::{CgroupAttachMode, CgroupSockAddr, Lsm, TracePoint};
+use aya::Btf;
+use leash_common::{kind, Event, NAME_LEN, PATH_LEN};
 use log::info;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 
 use crate::audit::Audit;
 use crate::policy::{Action, Policy};
+
+/// Userspace mirror of `leash_common::NameKey` (identical C layout) carrying a
+/// `Pod` impl so aya can use it as a hash-map key. The `Pod` impl can't live on
+/// the leash_common type (orphan rule), hence this local copy.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NameKey([u8; NAME_LEN]);
+unsafe impl aya::Pod for NameKey {}
 
 pub(crate) enum Mode {
     All,
@@ -176,7 +185,17 @@ async fn main() -> anyhow::Result<()> {
         prog.attach(&cg, CgroupAttachMode::Single)
             .context("attaching connect4 to the cgroup")?;
         _cgroup = Some(cg);
-        info!("enforcement ON — blocked egress is denied for the watched subtree");
+
+        // Files: LSM file_open denier (needs kernel BTF to resolve the hook).
+        let btf = Btf::from_sys_fs().context("loading kernel BTF")?;
+        let lprog: &mut Lsm = ebpf
+            .program_mut("file_open")
+            .context("file_open program not found")?
+            .try_into()?;
+        lprog.load("file_open", &btf).context("loading lsm/file_open")?;
+        lprog.attach().context("attaching lsm/file_open")?;
+
+        info!("enforcement ON — blocked egress denied (cgroup) + secret-file opens denied (LSM)");
     }
 
     let mut config: Array<_, u32> = Array::try_from(ebpf.take_map("CONFIG").context("CONFIG")?)?;
@@ -190,6 +209,20 @@ async fn main() -> anyhow::Result<()> {
         for (plen, data, act) in policy.net_entries() {
             net.insert(&Key::new(plen, data), act, 0)
                 .context("populating NET_RULES")?;
+        }
+    }
+
+    {
+        let (names, dirs) = policy.file_enforcement();
+        let mut bn: BpfHashMap<_, NameKey, u8> =
+            BpfHashMap::try_from(ebpf.take_map("BLOCK_NAMES").context("BLOCK_NAMES")?)?;
+        for k in names {
+            bn.insert(NameKey(k), 1u8, 0).context("populating BLOCK_NAMES")?;
+        }
+        let mut bd: BpfHashMap<_, NameKey, u8> =
+            BpfHashMap::try_from(ebpf.take_map("BLOCK_DIRS").context("BLOCK_DIRS")?)?;
+        for k in dirs {
+            bd.insert(NameKey(k), 1u8, 0).context("populating BLOCK_DIRS")?;
         }
     }
 
