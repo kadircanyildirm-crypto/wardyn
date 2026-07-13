@@ -1,5 +1,0 @@
-{"action":"block","comm":"cat","detail":"/tmp/leash-fix/proj/.env","event":"open","pid":19820,"rule":"**/.env","ts":"2026-07-13T08:51:47.709Z"}
-{"action":"block","comm":"cat","detail":"/tmp/leash-fix/proj/.env","event":"open","pid":19822,"rule":"**/.env","ts":"2026-07-13T08:51:48.714Z"}
-{"action":"block","comm":"cat","detail":"/tmp/leash-fix/proj/.env","event":"open","pid":19827,"rule":"**/.env","ts":"2026-07-13T08:51:49.719Z"}
-{"action":"block","comm":"cat","detail":"/tmp/leash-fix/proj/.env","event":"open","pid":19829,"rule":"**/.env","ts":"2026-07-13T08:51:50.722Z"}
-{"action":"block","comm":"cat","detail":"/tmp/leash-fix/proj/.env","event":"open","pid":19831,"rule":"**/.env","ts":"2026-07-13T08:51:51.727Z"}
