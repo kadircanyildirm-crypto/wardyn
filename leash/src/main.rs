@@ -7,6 +7,8 @@
 //! Scoped mode is race-free: we seed WATCHED with our *own* pid before spawning,
 //! so the in-kernel `sched_process_fork` hook adopts the child the instant it is
 //! forked — no userspace window where the child could exec unwatched.
+use std::net::Ipv4Addr;
+
 use anyhow::{bail, Context as _};
 use aya::maps::{Array, HashMap as BpfHashMap, RingBuf};
 use aya::programs::TracePoint;
@@ -78,6 +80,8 @@ async fn main() -> anyhow::Result<()> {
     .context("loading eBPF object")?;
 
     load_tracepoint(&mut ebpf, "leash_execve", "syscalls", "sys_enter_execve")?;
+    load_tracepoint(&mut ebpf, "leash_openat", "syscalls", "sys_enter_openat")?;
+    load_tracepoint(&mut ebpf, "leash_connect", "syscalls", "sys_enter_connect")?;
     load_tracepoint(&mut ebpf, "leash_fork", "sched", "sched_process_fork")?;
 
     // watch_all flag: 1 for system-wide, 0 for scoped.
@@ -108,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("{:<8} {:<16} {}", "PID", "COMM", "PATH");
+    println!("{:<8} {:<16} {:<8} {}", "PID", "COMM", "EVENT", "DETAIL");
 
     loop {
         tokio::select! {
@@ -144,11 +148,21 @@ fn field_str(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..end]).into_owned()
 }
 
+fn event_path(ev: &Event) -> String {
+    let len = (ev.path_len as usize).min(PATH_LEN);
+    field_str(&ev.path[..len])
+}
+
 fn print_event(ev: &Event) {
-    if ev.kind == kind::EXEC {
-        let comm = field_str(&ev.comm);
-        let len = (ev.path_len as usize).min(PATH_LEN);
-        let path = field_str(&ev.path[..len]);
-        println!("{:<8} {:<16} {}", ev.pid, comm, path);
-    }
+    let comm = field_str(&ev.comm);
+    let (kind_str, detail) = match ev.kind {
+        kind::EXEC => ("exec", event_path(ev)),
+        kind::OPEN => ("open", event_path(ev)),
+        kind::CONNECT => (
+            "connect",
+            format!("{}:{}", Ipv4Addr::from(ev.daddr.to_ne_bytes()), ev.dport),
+        ),
+        _ => return,
+    };
+    println!("{:<8} {:<16} {:<8} {}", ev.pid, comm, kind_str, detail);
 }
