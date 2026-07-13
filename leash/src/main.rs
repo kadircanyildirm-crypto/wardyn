@@ -5,14 +5,17 @@
 //!   leash [OPTIONS] [--all]                  watch system-wide
 //!
 //! Options:
+//!   --enforce          deny blocked file reads / execs / egress (default: observe)
 //!   --plain            force the plain line printer (no TUI)
 //!   --policy <path>    policy file (default: ./policy.yaml, else embedded)
 //!   --audit <path>     JSONL audit log (default: ./leash-audit.jsonl)
 //!
 //! Renders a live ratatui TUI when stdout is a terminal, else a plain table.
 //! Each event is evaluated against the policy (allow/warn/block); violations are
-//! coloured and written to the audit log. M2 is warn-only — nothing is blocked
-//! yet (that is M3).
+//! coloured and written to the audit log. With `--enforce`, blocked file reads,
+//! execs and egress are denied in-kernel for the watched subtree. The feed is
+//! honest about it: `BLOCK` = actually denied, `block~` = flagged but the rule
+//! can't be kernel-enforced, `block` = observe-only (no --enforce).
 mod audit;
 mod policy;
 mod tui;
@@ -155,6 +158,16 @@ async fn main() -> anyhow::Result<()> {
 
     let policy = Policy::load(opts.policy_path.as_deref())?;
     info!("policy loaded: {}", policy.summary());
+    if opts.enforce {
+        // Be honest up front: block rules that can't reduce to a kernel-checkable
+        // basename/dir are flagged in the feed but never actually denied.
+        for pat in policy.observe_only_blocks() {
+            eprintln!(
+                "leash: warning: policy `{pat}` (block) can't be kernel-enforced \
+                 (only basename/dir file rules and CIDRs are) — it will be flagged, not denied"
+            );
+        }
+    }
     let mut audit = Audit::create(&opts.audit_path)?;
 
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -167,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
     load_tracepoint(&mut ebpf, "leash_openat", "syscalls", "sys_enter_openat")?;
     load_tracepoint(&mut ebpf, "leash_connect", "syscalls", "sys_enter_connect")?;
     load_tracepoint(&mut ebpf, "leash_fork", "sched", "sched_process_fork")?;
+    load_tracepoint(&mut ebpf, "leash_exit", "sched", "sched_process_exit")?;
 
     // Enforcement (opt-in): attach the cgroup/connect4 denier BEFORE taking any
     // map, so map relocation still finds NET_RULES/CONFIG/WATCHED in the object.
@@ -267,9 +281,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let result = if use_tui {
-        tui::run(async_fd, child, opts.mode.label(), &policy, &mut audit).await
+        tui::run(
+            async_fd,
+            child,
+            opts.mode.label(),
+            &policy,
+            &mut audit,
+            opts.enforce,
+        )
+        .await
     } else {
-        run_plain(async_fd, child, &policy, &mut audit).await
+        run_plain(async_fd, child, &policy, &mut audit, opts.enforce).await
     };
 
     eprintln!(
@@ -286,6 +308,7 @@ async fn run_plain(
     mut child: Option<Child>,
     policy: &Policy,
     audit: &mut Audit,
+    enforce: bool,
 ) -> anyhow::Result<()> {
     println!(
         "{:<7} {:<15} {:<8} {:<6} DETAIL",
@@ -304,16 +327,13 @@ async fn run_plain(
                 while let Some(item) = ring.next() {
                     if let Some(d) = parse_event(&item).as_ref().and_then(|ev| describe(ev, policy)) {
                         if d.action != Action::Allow {
-                            let _ = audit.record(d.pid, &d.comm, d.label, &d.detail, d.action, &d.rule);
+                            let _ = audit.record(
+                                d.pid, &d.comm, d.label, &d.detail, d.action, &d.rule, d.denied(enforce),
+                            );
                         }
-                        let act = match d.action {
-                            Action::Allow => "ok",
-                            Action::Warn => "WARN",
-                            Action::Block => "BLOCK",
-                        };
                         println!(
                             "{:<7} {:<15} {:<8} {:<6} {}",
-                            d.pid, d.comm, d.label, act, d.shown()
+                            d.pid, d.comm, d.label, d.act(enforce), d.shown()
                         );
                     }
                 }
@@ -334,6 +354,7 @@ pub(crate) struct Desc {
     pub detail: String,
     pub action: Action,
     pub rule: String,
+    pub enforceable: bool,
 }
 
 impl Desc {
@@ -344,6 +365,24 @@ impl Desc {
         } else {
             format!("{}  [{}]", self.detail, self.rule)
         }
+    }
+
+    /// ACT column text, honest about enforcement: `BLOCK` = kernel-denied,
+    /// `block~` = flagged under --enforce but the rule can't be enforced,
+    /// `block` = observe-only.
+    pub fn act(&self, enforce: bool) -> &'static str {
+        match self.action {
+            Action::Allow => "ok",
+            Action::Warn => "warn",
+            Action::Block if enforce && self.enforceable => "BLOCK",
+            Action::Block if enforce => "block~",
+            Action::Block => "block",
+        }
+    }
+
+    /// Whether the kernel actually denied this event.
+    pub fn denied(&self, enforce: bool) -> bool {
+        self.action == Action::Block && enforce && self.enforceable
     }
 }
 
@@ -383,6 +422,7 @@ pub(crate) fn describe(ev: &Event, policy: &Policy) -> Option<Desc> {
         detail,
         action: verdict.action,
         rule: verdict.rule,
+        enforceable: verdict.enforceable,
     })
 }
 

@@ -33,7 +33,9 @@ impl Audit {
         self.count
     }
 
-    /// Append one record. Call only for warn/block events.
+    /// Append one record. Call only for warn/block events. `enforced` is whether
+    /// the kernel actually denied the action (vs merely flagged it).
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         pid: u32,
@@ -42,6 +44,7 @@ impl Audit {
         detail: &str,
         action: Action,
         rule: &str,
+        enforced: bool,
     ) -> Result<()> {
         let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let line = serde_json::json!({
@@ -50,6 +53,7 @@ impl Audit {
             "comm": comm,
             "event": event,
             "action": action.as_str(),
+            "enforced": enforced,
             "detail": detail,
             "rule": rule,
         });

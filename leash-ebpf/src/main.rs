@@ -319,6 +319,15 @@ fn handle_fork(ctx: &TracePointContext) -> Result<(), i64> {
     Ok(())
 }
 
+/// Drop a task from WATCHED when it exits, so the set can't grow unbounded and a
+/// reused pid can't be wrongly treated as still-watched.
+#[tracepoint]
+pub fn leash_exit(_ctx: TracePointContext) -> u32 {
+    let tid = bpf_get_current_pid_tgid() as u32; // exiting task's tid (== tgid for the leader)
+    let _ = WATCHED.remove(&tid);
+    0
+}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

@@ -48,6 +48,10 @@ impl Action {
 pub struct Verdict {
     pub action: Action,
     pub rule: String,
+    /// For a `block`: will the kernel actually deny it under `--enforce`? File/
+    /// exec globs that don't reduce to a basename/dir are observe-only (the feed
+    /// flags them, but they are NOT enforced). Network blocks are always true.
+    pub enforceable: bool,
 }
 
 // ── raw YAML shape ──────────────────────────────────────────────────────────
@@ -89,6 +93,8 @@ struct PathRule {
     pattern: String,
     matcher: GlobMatcher,
     action: Action,
+    /// `action == block` AND the pattern reduces to a kernel-enforceable key.
+    enforceable: bool,
 }
 
 enum NetMatch {
@@ -139,24 +145,33 @@ impl Policy {
     pub fn from_yaml_str(text: &str) -> Result<Policy> {
         let raw: RawPolicy = serde_yaml::from_str(text).context("invalid policy YAML")?;
 
-        let compile_paths = |rules: Vec<PathRuleRaw>| -> Result<Vec<PathRule>> {
+        // `dir_capable` files support the `**/dir/**` parent-directory form; exec
+        // rules are basename-only.
+        let compile_paths = |rules: Vec<PathRuleRaw>, dir_capable: bool| -> Result<Vec<PathRule>> {
             rules
                 .into_iter()
                 .map(|r| {
                     let matcher = Glob::new(&r.pattern)
                         .with_context(|| format!("bad glob `{}`", r.pattern))?
                         .compile_matcher();
+                    let enforceable = r.action == Action::Block
+                        && if dir_capable {
+                            file_key(&r.pattern).is_some()
+                        } else {
+                            last_segment(&r.pattern).and_then(name_key).is_some()
+                        };
                     Ok(PathRule {
                         pattern: r.pattern,
                         matcher,
                         action: r.action,
+                        enforceable,
                     })
                 })
                 .collect()
         };
 
-        let files = compile_paths(raw.files)?;
-        let exec = compile_paths(raw.exec)?;
+        let files = compile_paths(raw.files, true)?;
+        let exec = compile_paths(raw.exec, false)?;
 
         // Network: cidr rules compile directly; domain rules resolve (best effort)
         // at load time, expanding to one Ip rule per resolved address, preserving
@@ -244,15 +259,26 @@ impl Policy {
             if r.action != Action::Block {
                 continue;
             }
-            if let Some(stripped) = r.pattern.strip_suffix("/**") {
-                if let Some(k) = last_segment(stripped).and_then(name_key) {
+            if let Some((is_dir, k)) = file_key(&r.pattern) {
+                if is_dir {
                     dirs.push(k);
+                } else {
+                    names.push(k);
                 }
-            } else if let Some(k) = last_segment(&r.pattern).and_then(name_key) {
-                names.push(k);
             }
         }
         (names, dirs)
+    }
+
+    /// Patterns of `block` file/exec rules that CANNOT be kernel-enforced (glob
+    /// segments). The feed flags these distinctly and startup warns about them.
+    pub fn observe_only_blocks(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .chain(&self.exec)
+            .filter(|r| r.action == Action::Block && !r.enforceable)
+            .map(|r| r.pattern.clone())
+            .collect()
     }
 
     /// Exec block rules compiled to exact basenames for the LSM bprm_check matcher.
@@ -273,17 +299,20 @@ impl Policy {
     }
 
     pub fn eval_connect(&self, ip: Ipv4Addr) -> Verdict {
+        // Network blocks are always kernel-enforced (LPM trie + CONFIG default).
         for r in &self.network {
             if r.matches(ip) {
                 return Verdict {
                     action: r.action,
                     rule: r.label.clone(),
+                    enforceable: true,
                 };
             }
         }
         Verdict {
             action: self.default_action,
             rule: "default".to_string(),
+            enforceable: true,
         }
     }
 }
@@ -294,18 +323,32 @@ fn eval_path(rules: &[PathRule], path: &str, default: Action) -> Verdict {
             return Verdict {
                 action: r.action,
                 rule: r.pattern.clone(),
+                enforceable: r.enforceable,
             };
         }
     }
+    // A default block on files/exec is NOT kernel-enforced (LSM has no default-deny).
     Verdict {
         action: default,
         rule: "default".to_string(),
+        enforceable: false,
     }
 }
 
 /// Last non-empty `/`-separated segment of a glob pattern.
 fn last_segment(p: &str) -> Option<&str> {
     p.rsplit('/').find(|s| !s.is_empty())
+}
+
+/// If a file glob reduces to a kernel-enforceable exact match, return
+/// `(is_parent_dir, key)`: `**/dir/**` → `(true, dir)`; `**/name` or `/abs/name`
+/// → `(false, name)`. Glob-y patterns return `None` (observe-only).
+fn file_key(pattern: &str) -> Option<(bool, [u8; NAME_LEN])> {
+    if let Some(stripped) = pattern.strip_suffix("/**") {
+        last_segment(stripped).and_then(name_key).map(|k| (true, k))
+    } else {
+        last_segment(pattern).and_then(name_key).map(|k| (false, k))
+    }
 }
 
 /// A literal path segment -> NUL-padded fixed key, or `None` if it contains glob
@@ -433,6 +476,23 @@ exec:
         let execs = p.exec_enforcement();
         assert!(execs.contains(&key("nc"))); // **/nc block
         assert!(!execs.contains(&key("curl"))); // curl is warn, not block
+    }
+
+    #[test]
+    fn enforceable_flag_and_observe_only() {
+        let p = policy();
+        assert!(p.eval_file("/x/.env").enforceable); // reduces to name .env
+        assert!(p.eval_file("/x/.ssh/id").enforceable); // dir .ssh
+                                                        // **/.env.* has a glob segment: block requested but NOT kernel-enforceable
+        let v = p.eval_file("/x/.env.local");
+        assert_eq!(v.action, Action::Block);
+        assert!(!v.enforceable);
+        // network blocks are always enforceable
+        assert!(p.eval_connect("1.1.1.1".parse().unwrap()).enforceable);
+
+        let oo = p.observe_only_blocks();
+        assert!(oo.contains(&"**/.env.*".to_string()));
+        assert!(!oo.contains(&"**/.env".to_string()));
     }
 
     #[test]
