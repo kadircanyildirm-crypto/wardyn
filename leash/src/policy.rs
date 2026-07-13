@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Policy engine (M2).
 //!
 //! Loads `policy.yaml`, compiles it into ordered matchers, and evaluates each

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Leash eBPF programs.
 //!
 //! Observation (tracepoints) streams a structured [`Event`] per exec/open/connect
@@ -175,7 +176,7 @@ fn emit_connect(ctx: &TracePointContext) -> Result<(), i64> {
     let family: u16 = unsafe { bpf_probe_read_user(uaddr as *const u16) }?;
     let mut daddr = 0u32;
     let mut daddr6 = [0u8; 16];
-    let mut dport = 0u16;
+    let dport;
     if family == AF_INET {
         let sa: SockAddrIn = unsafe { bpf_probe_read_user(uaddr as *const SockAddrIn) }?;
         daddr = sa.addr;
@@ -279,6 +280,25 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         Ok(DENY)
     } else {
         Ok(ALLOW)
+    }
+}
+
+// UDP is connectionless — connect() may never fire, so gate sendmsg too. The
+// destination is in the same bpf_sock_addr fields, so reuse the connect logic.
+
+#[cgroup_sock_addr(sendmsg4)]
+pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
+    match try_connect4(&ctx) {
+        Ok(v) => v,
+        Err(_) => ALLOW,
+    }
+}
+
+#[cgroup_sock_addr(sendmsg6)]
+pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
+    match try_connect6(&ctx) {
+        Ok(v) => v,
+        Err(_) => ALLOW,
     }
 }
 

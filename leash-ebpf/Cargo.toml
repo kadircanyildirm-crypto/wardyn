@@ -3,6 +3,12 @@ name = "leash-ebpf"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Leash's eBPF programs (tracepoints + cgroup/LSM hooks). Built for the BPF target by leash's build script; not a standalone crate."
+# Compiled for bpfel by leash/build.rs (aya-build), never published to crates.io.
+publish = false
 
 [dependencies]
 aya-ebpf = { workspace = true }

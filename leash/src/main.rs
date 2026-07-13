@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Leash userspace.
 //!
 //! Usage:
@@ -273,7 +274,7 @@ async fn main() -> anyhow::Result<()> {
     if opts.enforce {
         let cg = std::fs::File::open("/sys/fs/cgroup")
             .context("open /sys/fs/cgroup (cgroup v2 required for network enforcement)")?;
-        for name in ["connect4", "connect6"] {
+        for name in ["connect4", "connect6", "sendmsg4", "sendmsg6"] {
             let prog: &mut CgroupSockAddr = ebpf
                 .program_mut(name)
                 .with_context(|| format!("{name} program not found"))?
