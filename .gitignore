@@ -4,3 +4,4 @@
 # Leash runtime output
 /audit-*.jsonl
 *.o
+typescript
