@@ -1,5 +1,5 @@
-//! Live ratatui terminal UI: a scrolling event feed with per-type colours and a
-//! counter header. Used when stdout is a real terminal.
+//! Live ratatui terminal UI: a scrolling event feed coloured by policy verdict
+//! (allow = grey, warn = yellow, block = red/bold) with a counter header.
 use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
@@ -21,6 +21,8 @@ use ratatui::{Frame, Terminal};
 use tokio::io::unix::AsyncFd;
 use tokio::process::Child;
 
+use crate::audit::Audit;
+use crate::policy::{Action, Policy};
 use crate::{describe, parse_event, wait_for, Desc};
 
 const MAX_ROWS: usize = 4096;
@@ -31,6 +33,8 @@ struct App {
     exec: u64,
     open: u64,
     connect: u64,
+    warn: u64,
+    block: u64,
 }
 
 impl App {
@@ -41,6 +45,8 @@ impl App {
             exec: 0,
             open: 0,
             connect: 0,
+            warn: 0,
+            block: 0,
         }
     }
 
@@ -50,6 +56,11 @@ impl App {
             kind::OPEN => self.open += 1,
             kind::CONNECT => self.connect += 1,
             _ => {}
+        }
+        match d.action {
+            Action::Warn => self.warn += 1,
+            Action::Block => self.block += 1,
+            Action::Allow => {}
         }
         self.rows.push_back(d);
         while self.rows.len() > MAX_ROWS {
@@ -67,7 +78,6 @@ impl App {
             ])
             .split(f.area());
 
-        // header with counters
         let header = Paragraph::new(Line::from(vec![
             Span::styled(
                 " 🐕 leash ",
@@ -77,55 +87,67 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {}    ", self.target)),
-            Span::styled(format!("exec {}", self.exec), Style::default().fg(Color::Cyan)),
-            Span::raw("   "),
-            Span::styled(format!("open {}", self.open), Style::default().fg(Color::Yellow)),
-            Span::raw("   "),
+            Span::styled(format!("exec {}", self.exec), Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(format!("open {}", self.open), Style::default().fg(Color::Gray)),
+            Span::raw("  "),
             Span::styled(
                 format!("connect {}", self.connect),
-                Style::default().fg(Color::Magenta),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::raw("    "),
+            Span::styled(
+                format!("⚠ warn {}", self.warn),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("⛔ block {}", self.block),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
         ]))
         .block(Block::default().borders(Borders::ALL).title(" Leash "));
         f.render_widget(header, chunks[0]);
 
-        // event table — show the last rows that fit
-        let visible = chunks[1].height.saturating_sub(2) as usize; // borders + header row
+        let visible = chunks[1].height.saturating_sub(2) as usize;
         let start = self.rows.len().saturating_sub(visible);
         let rows = self.rows.iter().skip(start).map(|d| {
-            let color = match d.kind {
-                kind::EXEC => Color::Cyan,
-                kind::OPEN => Color::Yellow,
-                kind::CONNECT => Color::Magenta,
-                _ => Color::White,
+            let (fg, modifier) = match d.action {
+                Action::Block => (Color::Red, Modifier::BOLD),
+                Action::Warn => (Color::Yellow, Modifier::empty()),
+                Action::Allow => (Color::Gray, Modifier::empty()),
+            };
+            let act = match d.action {
+                Action::Block => "BLOCK",
+                Action::Warn => "warn",
+                Action::Allow => "ok",
             };
             Row::new(vec![
                 Cell::from(d.pid.to_string()),
                 Cell::from(d.comm.clone()),
-                Cell::from(Span::styled(
-                    d.label,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )),
-                Cell::from(d.detail.clone()),
+                Cell::from(d.label),
+                Cell::from(act),
+                Cell::from(d.shown()),
             ])
+            .style(Style::default().fg(fg).add_modifier(modifier))
         });
         let table = Table::new(
             rows,
             [
+                Constraint::Length(7),
+                Constraint::Length(15),
                 Constraint::Length(8),
-                Constraint::Length(16),
-                Constraint::Length(9),
+                Constraint::Length(6),
                 Constraint::Min(10),
             ],
         )
         .header(
-            Row::new(vec!["PID", "COMM", "EVENT", "DETAIL"])
+            Row::new(vec!["PID", "COMM", "EVENT", "ACT", "DETAIL"])
                 .style(Style::default().add_modifier(Modifier::BOLD)),
         )
         .block(Block::default().borders(Borders::ALL));
         f.render_widget(table, chunks[1]);
 
-        // footer
         let footer = Paragraph::new(Line::from(vec![
             Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" quit"),
@@ -134,8 +156,7 @@ impl App {
     }
 }
 
-/// Restore the terminal from the alternate screen even if we panic mid-draw, so
-/// a crash never leaves the user's shell in raw mode.
+/// Restore the terminal even if we panic mid-draw.
 fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -149,6 +170,8 @@ pub async fn run(
     mut async_fd: AsyncFd<RingBuf<MapData>>,
     mut child: Option<Child>,
     target: String,
+    policy: &Policy,
+    audit: &mut Audit,
 ) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -179,16 +202,16 @@ pub async fn run(
                 let mut guard = guard?;
                 let ring = guard.get_inner_mut();
                 while let Some(item) = ring.next() {
-                    if let Some(d) = parse_event(&item).as_ref().and_then(describe) {
+                    if let Some(d) = parse_event(&item).as_ref().and_then(|ev| describe(ev, policy)) {
+                        if d.action != Action::Allow {
+                            let _ = audit.record(d.pid, &d.comm, d.label, &d.detail, d.action, &d.rule);
+                        }
                         app.push(d);
                     }
                 }
                 guard.clear_ready();
             }
-            _ = wait_for(&mut child), if child.is_some() => {
-                // target finished — draw the final frame, then exit.
-                quit = true;
-            }
+            _ = wait_for(&mut child), if child.is_some() => quit = true,
         }
     }
 

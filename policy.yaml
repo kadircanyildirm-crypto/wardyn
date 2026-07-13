@@ -4,10 +4,10 @@
 # Actions: allow | warn | block
 version: 1
 
-default_action: warn
+default_action: allow
 
 # ── File access ────────────────────────────────────────────────
-# `match` is a glob against the absolute path being opened.
+# `match` is a glob (** spans directories) against the absolute path opened.
 files:
   - { match: "**/.env", action: block }
   - { match: "**/.env.*", action: block }
@@ -17,10 +17,10 @@ files:
   - { match: "/etc/shadow", action: block }
   - { match: "**/.npmrc", action: warn }
   - { match: "**/.git/config", action: warn }
-  - { match: "**", action: allow } # everything else: fine to read
+  - { match: "**", action: allow } # everything else: reading is fine
 
 # ── Outbound network ───────────────────────────────────────────
-# Match by `cidr` (IP range) or `domain` (resolved to an IP set at load time).
+# Match by `cidr` (IP range) or `domain` (resolved to IPs at load time).
 network:
   - { cidr: "127.0.0.0/8", action: allow } # loopback
   - { cidr: "10.0.0.0/8", action: allow } # private LAN

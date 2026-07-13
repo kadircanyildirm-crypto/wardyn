@@ -5,8 +5,8 @@ eBPF and enforces — in real time, at the syscall boundary — what it may read
 connect to. It catches the agent reading your `.env` or dialing an unknown IP, and can
 *block* it before the operation completes.
 
-> ⚠️ **Status: early development.** M1 (observe) in progress. See [ROADMAP](#roadmap) —
-> nothing here is production-ready yet.
+> ⚠️ **Status: early development.** M1 (observe) + M2 (policy / warn) done; M3 (block)
+> is next. See [Roadmap](#roadmap) — not production-ready yet.
 
 ```
 $ leash run -- claude "refactor the auth module"
@@ -44,8 +44,8 @@ See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the hook map and enforcement de
 
 ## Roadmap
 
-- [ ] **M1 — Observe:** live tree of exec/open/connect events.
-- [ ] **M2 — Policy:** compile `policy.yaml`, flag violations, JSONL audit log.
+- [x] **M1 — Observe:** live tree of exec/open/connect events, scoped to a subtree.
+- [x] **M2 — Policy:** `policy.yaml` (glob + CIDR), allow/warn/block verdicts, JSONL audit log.
 - [ ] **M3 — Block:** deny network (cgroup) + file/exec (LSM).
 - [ ] **M4 — Ship:** demo GIF, presets, devcontainer.
 
