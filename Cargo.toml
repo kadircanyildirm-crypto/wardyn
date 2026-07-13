@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["leash", "leash-common", "leash-ebpf"]
+# leash-ebpf is built for the BPF target by leash/build.rs (aya-build), not by a
+# normal host `cargo build`, so keep it out of the default set.
+default-members = ["leash", "leash-common"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+aya = { version = "0.13" }
+aya-log = { version = "0.2" }
+aya-ebpf = { version = "0.1" }
+aya-log-ebpf = { version = "0.1" }
+leash-common = { path = "leash-common" }
+anyhow = "1"

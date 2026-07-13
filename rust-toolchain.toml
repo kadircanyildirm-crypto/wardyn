@@ -1,0 +1,5 @@
+# The eBPF crate is compiled with `-Z build-std=core` for the bpfel target, which
+# needs nightly + rust-src. Userspace also builds fine on nightly.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

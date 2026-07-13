@@ -1,0 +1,41 @@
+# Leash policy — what the watched process tree is allowed to do.
+# Each section is an ordered list; the FIRST matching rule wins.
+# If nothing matches, `default_action` applies.
+# Actions: allow | warn | block
+version: 1
+
+default_action: warn
+
+# ── File access ────────────────────────────────────────────────
+# `match` is a glob against the absolute path being opened.
+files:
+  - { match: "**/.env", action: block }
+  - { match: "**/.env.*", action: block }
+  - { match: "**/.ssh/**", action: block }
+  - { match: "**/.aws/credentials", action: block }
+  - { match: "**/.config/gcloud/**", action: block }
+  - { match: "/etc/shadow", action: block }
+  - { match: "**/.npmrc", action: warn }
+  - { match: "**/.git/config", action: warn }
+  - { match: "**", action: allow } # everything else: fine to read
+
+# ── Outbound network ───────────────────────────────────────────
+# Match by `cidr` (IP range) or `domain` (resolved to an IP set at load time).
+network:
+  - { cidr: "127.0.0.0/8", action: allow } # loopback
+  - { cidr: "10.0.0.0/8", action: allow } # private LAN
+  - { cidr: "172.16.0.0/12", action: allow }
+  - { cidr: "192.168.0.0/16", action: allow }
+  - { domain: "api.anthropic.com", action: allow }
+  - { domain: "registry.npmjs.org", action: allow }
+  - { domain: "github.com", action: allow }
+  - { cidr: "0.0.0.0/0", action: block } # deny all other egress
+
+# ── Process execution ──────────────────────────────────────────
+# `match` is a glob against the executable path being exec'd.
+exec:
+  - { match: "**/nc", action: block } # netcat / reverse shells
+  - { match: "**/ncat", action: block }
+  - { match: "**/curl", action: warn }
+  - { match: "**/wget", action: warn }
+  - { match: "**", action: allow }

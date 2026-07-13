@@ -1,0 +1,22 @@
+[package]
+name = "leash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+leash-common = { workspace = true }
+anyhow = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+aya-build = "0.2"
+anyhow = { workspace = true }
+
+[[bin]]
+name = "leash"
+path = "src/main.rs"

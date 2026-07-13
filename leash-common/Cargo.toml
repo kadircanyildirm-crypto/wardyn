@@ -1,0 +1,12 @@
+[package]
+name = "leash-common"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Shared, dependency-free types crossing the kernel<->user boundary.
+# no_std so the eBPF crate can use it; also compiles fine under std.
+[dependencies]
+
+[lib]
+path = "src/lib.rs"

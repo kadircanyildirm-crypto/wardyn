@@ -1,0 +1,16 @@
+[package]
+name = "leash-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+leash-common = { workspace = true }
+
+# The compiled object is named after this bin target; leash/src/main.rs includes
+# it as concat!(env!("OUT_DIR"), "/leash").
+[[bin]]
+name = "leash"
+path = "src/main.rs"
