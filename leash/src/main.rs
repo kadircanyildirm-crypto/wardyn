@@ -86,6 +86,14 @@ fn parse_args() -> anyhow::Result<Opts> {
 
     while let Some(a) = it.peek() {
         match a.as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("leash {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--plain" => {
                 plain = true;
                 it.next();
@@ -148,6 +156,67 @@ fn load_tracepoint(
     Ok(())
 }
 
+/// The kernel the LSM struct offsets in leash-ebpf were derived for.
+const OFFSETS_KERNEL: &str = "6.8";
+
+fn print_usage() {
+    println!(
+        "leash — a kernel-level leash for AI coding agents\n\n\
+         USAGE:\n  \
+         leash [OPTIONS] run -- <cmd> [args...]   watch that command's subtree\n  \
+         leash [OPTIONS] [--all]                  watch system-wide\n\n\
+         OPTIONS:\n  \
+         --enforce         deny blocked file reads / execs / egress (default: observe)\n  \
+         --plain           force the plain line printer (no TUI)\n  \
+         --policy <path>   policy file (default: ./policy.yaml, else embedded)\n  \
+         --audit <path>    JSONL audit log (default: ./leash-audit.jsonl)\n  \
+         -h, --help        print this help\n  \
+         -V, --version     print version"
+    );
+}
+
+/// Warn (fail-safe) if the running kernel isn't the one the LSM file/exec byte
+/// offsets were derived for — a mismatch means those reads may be wrong and
+/// file/exec enforcement could silently fail. Network egress is unaffected.
+fn warn_if_untested_kernel() {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mm = release
+        .trim()
+        .split('.')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(".");
+    if !mm.is_empty() && mm != OFFSETS_KERNEL {
+        eprintln!(
+            "leash: warning: kernel {} — the LSM file/exec offsets were derived for {}; file/exec \
+             enforcement may silently fail on a different kernel (network egress is unaffected). \
+             Regenerate with scripts/kernel-offsets.sh.",
+            release.trim(),
+            OFFSETS_KERNEL
+        );
+    }
+}
+
+/// Load + attach the BPF-LSM file/exec deniers. Kept separate so a kernel without
+/// BPF LSM degrades gracefully to network-only enforcement instead of aborting.
+fn attach_lsm(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+    let btf = Btf::from_sys_fs().context("loading kernel BTF")?;
+    for (name, hook) in [
+        ("file_open", "file_open"),
+        ("bprm_check", "bprm_check_security"),
+    ] {
+        let prog: &mut Lsm = ebpf
+            .program_mut(name)
+            .with_context(|| format!("{name} program not found"))?
+            .try_into()?;
+        prog.load(hook, &btf)
+            .with_context(|| format!("loading lsm/{hook}"))?;
+        prog.attach()
+            .with_context(|| format!("attaching lsm/{hook}"))?;
+    }
+    Ok(())
+}
+
 /// Await the child's exit if there is one; otherwise never resolve.
 pub(crate) async fn wait_for(child: &mut Option<Child>) -> std::process::ExitStatus {
     match child {
@@ -159,6 +228,10 @@ pub(crate) async fn wait_for(child: &mut Option<Child>) -> std::process::ExitSta
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let opts = parse_args()?;
+    // eBPF load/attach needs privilege; fail early with a clear message.
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("leash must run as root — it loads eBPF programs (try: sudo leash ...)");
+    }
     let use_tui = !opts.plain && std::io::stdout().is_terminal();
     if !use_tui {
         env_logger::builder()
@@ -169,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
     let policy = Policy::load(opts.policy_path.as_deref())?;
     info!("policy loaded: {}", policy.summary());
     if opts.enforce {
+        warn_if_untested_kernel();
         // Be honest up front: block rules that can't reduce to a kernel-checkable
         // basename/dir are flagged in the feed but never actually denied.
         for pat in policy.observe_only_blocks() {
@@ -210,29 +284,17 @@ async fn main() -> anyhow::Result<()> {
         }
         _cgroup = Some(cg);
 
-        // Files: LSM file_open denier (needs kernel BTF to resolve the hook).
-        let btf = Btf::from_sys_fs().context("loading kernel BTF")?;
-        let lprog: &mut Lsm = ebpf
-            .program_mut("file_open")
-            .context("file_open program not found")?
-            .try_into()?;
-        lprog
-            .load("file_open", &btf)
-            .context("loading lsm/file_open")?;
-        lprog.attach().context("attaching lsm/file_open")?;
-
-        let bprog: &mut Lsm = ebpf
-            .program_mut("bprm_check")
-            .context("bprm_check program not found")?
-            .try_into()?;
-        bprog
-            .load("bprm_check_security", &btf)
-            .context("loading lsm/bprm_check_security")?;
-        bprog
-            .attach()
-            .context("attaching lsm/bprm_check_security")?;
-
-        info!("enforcement ON — deny blocked egress (cgroup) + secret-file opens + blocked execs (LSM)");
+        // Files/exec: BPF-LSM deniers. Non-fatal — if the kernel lacks BPF LSM,
+        // keep the (already-attached) network enforcement rather than aborting.
+        match attach_lsm(&mut ebpf) {
+            Ok(()) => info!(
+                "enforcement ON — egress (cgroup) + secret-file reads + blocked execs (LSM) denied"
+            ),
+            Err(e) => eprintln!(
+                "leash: warning: BPF LSM enforcement unavailable ({e:#}) — file/exec blocking is \
+                 OFF (network egress blocking is still active). Enable it via scripts/enable-bpf-lsm.sh."
+            ),
+        }
     }
 
     let mut config: Array<_, u32> = Array::try_from(ebpf.take_map("CONFIG").context("CONFIG")?)?;
