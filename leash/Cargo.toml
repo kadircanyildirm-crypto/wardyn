@@ -9,7 +9,7 @@ aya = { workspace = true }
 aya-log = { workspace = true }
 leash-common = { workspace = true }
 anyhow = { workspace = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt", "signal", "net", "process"] }
 log = "0.4"
 env_logger = "0.11"
 
