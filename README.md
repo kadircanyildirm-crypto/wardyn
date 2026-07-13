@@ -115,6 +115,28 @@ Ready-made presets live in [`policies/`](./policies).
 
 ## How it works
 
+```
+   leash run -- <agent>
+          │  spawn + watch (WATCHED map, sched_process_fork follows the subtree)
+          ▼
+  ┌───────────────────────────── watched process tree ─────────────────────────┐
+  │      exec                    file open                    connect           │
+  └────────┬────────────────────────┬───────────────────────────┬──────────────┘
+           ▼                         ▼                           ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  KERNEL (eBPF)                                                           │
+  │   observe:  tp/execve          tp/openat          tp/connect  ──────┐    │
+  │   enforce:  LSM bprm_check      LSM file_open      cgroup/connect4   │    │
+  │             └─ -EPERM ─┘        └─ -EPERM ─┘       └─ deny ─┘        │    │
+  │        ▲ compiled policy (basenames · dirs · CIDR LPM-trie)         │    │
+  └────────┼────────────────────────────────────────────────────── ring│buf ─┘
+           │ maps                                                       ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  USERSPACE   policy.yaml ─▶ allow / warn / block                         │
+  │              └─▶ live coloured TUI      └─▶ JSONL audit log              │
+  └─────────────────────────────────────────────────────────────────────────┘
+```
+
 - **Observation** — tracepoints on `execve` / `openat` / `connect` stream a
   structured event per action into a ring buffer; userspace evaluates the policy,
   colours the feed, and writes the audit log.
