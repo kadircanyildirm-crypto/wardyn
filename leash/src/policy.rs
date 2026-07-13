@@ -7,12 +7,12 @@
 //! This is the single source of truth for policy in warn-mode. Kernel-side
 //! *enforcement* (M3) will reuse these same rules to deny inline via cgroup/LSM
 //! hooks; keeping evaluation here (and unit-tested) pins the semantics first.
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use globset::{Glob, GlobMatcher};
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use leash_common::NAME_LEN;
 use serde::Deserialize;
 
@@ -98,8 +98,10 @@ struct PathRule {
 }
 
 enum NetMatch {
-    Cidr(Ipv4Net),
-    Ip(Ipv4Addr),
+    V4Cidr(Ipv4Net),
+    V4Ip(Ipv4Addr),
+    V6Cidr(Ipv6Net),
+    V6Ip(Ipv6Addr),
 }
 
 struct NetRule {
@@ -109,10 +111,18 @@ struct NetRule {
 }
 
 impl NetRule {
-    fn matches(&self, ip: Ipv4Addr) -> bool {
+    fn matches_v4(&self, ip: Ipv4Addr) -> bool {
         match &self.which {
-            NetMatch::Cidr(net) => net.contains(&ip),
-            NetMatch::Ip(a) => *a == ip,
+            NetMatch::V4Cidr(net) => net.contains(&ip),
+            NetMatch::V4Ip(a) => *a == ip,
+            _ => false,
+        }
+    }
+    fn matches_v6(&self, ip: Ipv6Addr) -> bool {
+        match &self.which {
+            NetMatch::V6Cidr(net) => net.contains(&ip),
+            NetMatch::V6Ip(a) => *a == ip,
+            _ => false,
         }
     }
 }
@@ -180,11 +190,14 @@ impl Policy {
         for r in raw.network {
             match (&r.cidr, &r.domain) {
                 (Some(cidr), _) => {
-                    let net: Ipv4Net =
-                        cidr.parse().with_context(|| format!("bad cidr `{cidr}`"))?;
+                    let net: IpNet = cidr.parse().with_context(|| format!("bad cidr `{cidr}`"))?;
+                    let which = match net {
+                        IpNet::V4(n) => NetMatch::V4Cidr(n),
+                        IpNet::V6(n) => NetMatch::V6Cidr(n),
+                    };
                     network.push(NetRule {
                         label: format!("cidr:{cidr}"),
-                        which: NetMatch::Cidr(net),
+                        which,
                         action: r.action,
                     });
                 }
@@ -194,9 +207,13 @@ impl Policy {
                         log::warn!("policy: could not resolve domain `{domain}` (rule ignored)");
                     }
                     for ip in ips {
+                        let which = match ip {
+                            IpAddr::V4(v4) => NetMatch::V4Ip(v4),
+                            IpAddr::V6(v6) => NetMatch::V6Ip(v6),
+                        };
                         network.push(NetRule {
                             label: format!("domain:{domain}"),
-                            which: NetMatch::Ip(ip),
+                            which,
                             action: r.action,
                         });
                     }
@@ -236,15 +253,33 @@ impl Policy {
         self.network
             .iter()
             .rev()
-            .map(|r| {
+            .filter_map(|r| {
                 let (plen, data) = match &r.which {
-                    NetMatch::Cidr(net) => (
+                    NetMatch::V4Cidr(net) => (
                         net.prefix_len() as u32,
                         u32::from_le_bytes(net.network().octets()),
                     ),
-                    NetMatch::Ip(a) => (32u32, u32::from_le_bytes(a.octets())),
+                    NetMatch::V4Ip(a) => (32u32, u32::from_le_bytes(a.octets())),
+                    _ => return None,
                 };
-                (plen, data, r.action.code())
+                Some((plen, data, r.action.code()))
+            })
+            .collect()
+    }
+
+    /// IPv6 network rules as `(prefix_len, address bytes (network order), action
+    /// code)` for the v6 LPM trie.
+    pub fn net_entries6(&self) -> Vec<(u32, [u8; 16], u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter_map(|r| {
+                let (plen, data) = match &r.which {
+                    NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V6Ip(a) => (128u32, a.octets()),
+                    _ => return None,
+                };
+                Some((plen, data, r.action.code()))
             })
             .collect()
     }
@@ -301,7 +336,24 @@ impl Policy {
     pub fn eval_connect(&self, ip: Ipv4Addr) -> Verdict {
         // Network blocks are always kernel-enforced (LPM trie + CONFIG default).
         for r in &self.network {
-            if r.matches(ip) {
+            if r.matches_v4(ip) {
+                return Verdict {
+                    action: r.action,
+                    rule: r.label.clone(),
+                    enforceable: true,
+                };
+            }
+        }
+        Verdict {
+            action: self.default_action,
+            rule: "default".to_string(),
+            enforceable: true,
+        }
+    }
+
+    pub fn eval_connect6(&self, ip: Ipv6Addr) -> Verdict {
+        for r in &self.network {
+            if r.matches_v6(ip) {
                 return Verdict {
                     action: r.action,
                     rule: r.label.clone(),
@@ -367,14 +419,9 @@ fn name_key(seg: &str) -> Option<[u8; NAME_LEN]> {
 }
 
 /// Best-effort A-record lookup; returns the IPv4 addresses for `domain`.
-fn resolve_domain(domain: &str) -> Vec<Ipv4Addr> {
+fn resolve_domain(domain: &str) -> Vec<IpAddr> {
     match (domain, 0u16).to_socket_addrs() {
-        Ok(addrs) => addrs
-            .filter_map(|sa| match sa.ip() {
-                IpAddr::V4(v4) => Some(v4),
-                IpAddr::V6(_) => None,
-            })
-            .collect(),
+        Ok(addrs) => addrs.map(|sa| sa.ip()).collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -396,6 +443,8 @@ files:
 network:
   - { cidr: "127.0.0.0/8", action: allow }
   - { cidr: "192.168.0.0/16", action: allow }
+  - { cidr: "::1/128", action: allow }
+  - { cidr: "2001:db8::/32", action: block }
   - { cidr: "0.0.0.0/0", action: block }
 exec:
   - { match: "**/nc", action: block }
@@ -445,6 +494,24 @@ exec:
         assert_eq!(
             p.eval_connect("8.8.8.8".parse().unwrap()).action,
             Action::Block
+        );
+    }
+
+    #[test]
+    fn network_v6_matching() {
+        let p = policy();
+        assert_eq!(
+            p.eval_connect6("::1".parse().unwrap()).action,
+            Action::Allow
+        );
+        assert_eq!(
+            p.eval_connect6("2001:db8::5".parse().unwrap()).action,
+            Action::Block
+        );
+        // unmatched v6 -> default (allow in P); the v4 0.0.0.0/0 rule does not apply
+        assert_eq!(
+            p.eval_connect6("2606:4700::1".parse().unwrap()).action,
+            Action::Allow
         );
     }
 

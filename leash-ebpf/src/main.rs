@@ -19,7 +19,7 @@ use aya_ebpf::{
     maps::{lpm_trie::Key, Array, HashMap, LpmTrie, RingBuf},
     programs::{LsmContext, SockAddrContext, TracePointContext},
 };
-use leash_common::{action, kind, Event, NameKey, COMM_LEN, NAME_LEN, PATH_LEN};
+use leash_common::{action, kind, Event, Ip6Key, NameKey, COMM_LEN, NAME_LEN, PATH_LEN};
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -34,6 +34,10 @@ static CONFIG: Array<u32> = Array::with_max_entries(4, 0);
 /// Blocked-CIDR -> action code (longest-prefix), keyed by IPv4 in network order.
 #[map]
 static NET_RULES: LpmTrie<u32, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Same, for IPv6 (keyed by the 16-byte address in network order).
+#[map]
+static NET_RULES6: LpmTrie<Ip6Key, u32> = LpmTrie::with_max_entries(1024, 0);
 
 /// Blocked file basenames (e.g. `.env`, `shadow`) — exact match, NUL-padded.
 #[map]
@@ -68,12 +72,22 @@ const DENTRY_PARENT_OFF: usize = 24;
 const BPRM_FILE_OFF: usize = 64;
 
 const AF_INET: u16 = 2;
+const AF_INET6: u16 = 10;
 
 #[repr(C)]
 struct SockAddrIn {
     family: u16,
-    port: u16,
-    addr: u32,
+    port: u16, // network byte order
+    addr: u32, // network byte order
+}
+
+#[repr(C)]
+struct SockAddrIn6 {
+    family: u16,
+    port: u16, // network byte order
+    flowinfo: u32,
+    addr: [u8; 16], // network byte order
+                    // sin6_scope_id omitted — not needed
 }
 
 #[inline(always)]
@@ -128,8 +142,9 @@ fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -
         (*e).ppid = 0;
         (*e).uid = bpf_get_current_uid_gid() as u32;
         (*e).daddr = 0;
+        (*e).daddr6 = [0u8; 16];
         (*e).dport = 0;
-        (*e)._pad = 0;
+        (*e).family = 0;
         (*e).comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
         let dst = core::slice::from_raw_parts_mut((*e).path.as_mut_ptr(), PATH_LEN);
         (*e).path_len = match bpf_probe_read_user_str_bytes(filename, dst) {
@@ -154,10 +169,23 @@ fn emit_connect(ctx: &TracePointContext) -> Result<(), i64> {
     if !in_scope(pid) {
         return Ok(());
     }
-    let uaddr = unsafe { ctx.read_at::<u64>(CONNECT_USERVADDR_OFFSET) }? as *const SockAddrIn;
-    let sa = unsafe { bpf_probe_read_user(uaddr) }?;
-    if sa.family != AF_INET {
-        return Ok(());
+    let uaddr = unsafe { ctx.read_at::<u64>(CONNECT_USERVADDR_OFFSET) }? as *const u8;
+    // The family is the first u16 of any sockaddr. Read the address BEFORE
+    // reserving so a failed read can't leak the ring-buffer entry.
+    let family: u16 = unsafe { bpf_probe_read_user(uaddr as *const u16) }?;
+    let mut daddr = 0u32;
+    let mut daddr6 = [0u8; 16];
+    let mut dport = 0u16;
+    if family == AF_INET {
+        let sa: SockAddrIn = unsafe { bpf_probe_read_user(uaddr as *const SockAddrIn) }?;
+        daddr = sa.addr;
+        dport = u16::from_be(sa.port);
+    } else if family == AF_INET6 {
+        let sa: SockAddrIn6 = unsafe { bpf_probe_read_user(uaddr as *const SockAddrIn6) }?;
+        daddr6 = sa.addr;
+        dport = u16::from_be(sa.port);
+    } else {
+        return Ok(()); // not IP (AF_UNIX, etc.)
     }
 
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
@@ -172,9 +200,10 @@ fn emit_connect(ctx: &TracePointContext) -> Result<(), i64> {
         (*e).uid = bpf_get_current_uid_gid() as u32;
         (*e).comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
         (*e).path_len = 0;
-        (*e).daddr = sa.addr;
-        (*e).dport = u16::from_be(sa.port);
-        (*e)._pad = 0;
+        (*e).daddr = daddr;
+        (*e).daddr6 = daddr6;
+        (*e).dport = dport;
+        (*e).family = family;
     }
     entry.submit(0);
     Ok(())
@@ -204,6 +233,46 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     let ip = unsafe { (*ctx.sock_addr).user_ip4 }; // network byte order
     let action = NET_RULES
         .get(&Key::new(32, ip))
+        .copied()
+        .unwrap_or_else(|| cfg(CFG_NET_DEFAULT));
+    if action == action::BLOCK {
+        Ok(DENY)
+    } else {
+        Ok(ALLOW)
+    }
+}
+
+#[cgroup_sock_addr(connect6)]
+pub fn connect6(ctx: SockAddrContext) -> i32 {
+    match try_connect6(&ctx) {
+        Ok(v) => v,
+        Err(_) => ALLOW,
+    }
+}
+
+fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
+    if cfg(CFG_ENFORCE) == 0 {
+        return Ok(ALLOW);
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if !is_watched(pid) {
+        return Ok(ALLOW);
+    }
+    // user_ip6 is [u32; 4] in network order. Read each word DIRECTLY from the
+    // context; taking &user_ip6 and indexing it is a "modified ctx ptr" the
+    // verifier rejects. Combine on the stack, then reinterpret as 16 bytes.
+    let sa = ctx.sock_addr;
+    let w = unsafe {
+        [
+            (*sa).user_ip6[0],
+            (*sa).user_ip6[1],
+            (*sa).user_ip6[2],
+            (*sa).user_ip6[3],
+        ]
+    };
+    let ip6: [u8; 16] = unsafe { core::mem::transmute(w) };
+    let action = NET_RULES6
+        .get(&Key::new(128, Ip6Key(ip6)))
         .copied()
         .unwrap_or_else(|| cfg(CFG_NET_DEFAULT));
     if action == action::BLOCK {

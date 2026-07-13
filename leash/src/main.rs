@@ -21,7 +21,7 @@ mod policy;
 mod tui;
 
 use std::io::IsTerminal as _;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context as _};
@@ -44,6 +44,16 @@ use crate::policy::{Action, Policy};
 #[derive(Clone, Copy)]
 struct NameKey([u8; NAME_LEN]);
 unsafe impl aya::Pod for NameKey {}
+
+/// Userspace mirror of `leash_common::Ip6Key` (16-byte v6 address), `Pod` so aya
+/// can use it as the v6 LPM-trie key.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ip6Key([u8; 16]);
+unsafe impl aya::Pod for Ip6Key {}
+
+/// AF_INET6, matching the eBPF side.
+const AF_INET6: u16 = 10;
 
 pub(crate) enum Mode {
     All,
@@ -187,15 +197,17 @@ async fn main() -> anyhow::Result<()> {
     // Kept in `_cgroup` for the program's lifetime.
     let mut _cgroup = None;
     if opts.enforce {
-        let prog: &mut CgroupSockAddr = ebpf
-            .program_mut("connect4")
-            .context("connect4 program not found")?
-            .try_into()?;
-        prog.load()?;
         let cg = std::fs::File::open("/sys/fs/cgroup")
             .context("open /sys/fs/cgroup (cgroup v2 required for network enforcement)")?;
-        prog.attach(&cg, CgroupAttachMode::Single)
-            .context("attaching connect4 to the cgroup")?;
+        for name in ["connect4", "connect6"] {
+            let prog: &mut CgroupSockAddr = ebpf
+                .program_mut(name)
+                .with_context(|| format!("{name} program not found"))?
+                .try_into()?;
+            prog.load()?;
+            prog.attach(&cg, CgroupAttachMode::Single)
+                .with_context(|| format!("attaching {name} to the cgroup"))?;
+        }
         _cgroup = Some(cg);
 
         // Files: LSM file_open denier (needs kernel BTF to resolve the hook).
@@ -234,6 +246,12 @@ async fn main() -> anyhow::Result<()> {
         for (plen, data, act) in policy.net_entries() {
             net.insert(&Key::new(plen, data), act, 0)
                 .context("populating NET_RULES")?;
+        }
+        let mut net6: LpmTrie<_, Ip6Key, u32> =
+            LpmTrie::try_from(ebpf.take_map("NET_RULES6").context("NET_RULES6")?)?;
+        for (plen, data, act) in policy.net_entries6() {
+            net6.insert(&Key::new(plen, Ip6Key(data)), act, 0)
+                .context("populating NET_RULES6")?;
         }
     }
 
@@ -407,9 +425,13 @@ pub(crate) fn describe(ev: &Event, policy: &Policy) -> Option<Desc> {
             ("open", d, v)
         }
         kind::CONNECT => {
-            let ip = Ipv4Addr::from(ev.daddr.to_ne_bytes());
-            let d = format!("{}:{}", ip, ev.dport);
-            let v = policy.eval_connect(ip);
+            let (d, v) = if ev.family == AF_INET6 {
+                let ip = Ipv6Addr::from(ev.daddr6);
+                (format!("[{ip}]:{}", ev.dport), policy.eval_connect6(ip))
+            } else {
+                let ip = Ipv4Addr::from(ev.daddr.to_ne_bytes());
+                (format!("{ip}:{}", ev.dport), policy.eval_connect(ip))
+            };
             ("connect", d, v)
         }
         _ => return None,

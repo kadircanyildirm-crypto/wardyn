@@ -60,11 +60,14 @@ pub struct Event {
     /// Number of valid bytes in `path`.
     pub path_len: u32,
 
-    /// For CONNECT: destination IPv4 address, network byte order. Unused otherwise.
+    /// For CONNECT: destination IPv4 address, network byte order (family AF_INET).
     pub daddr: u32,
+    /// For CONNECT: destination IPv6 address, network byte order (family AF_INET6).
+    pub daddr6: [u8; 16],
     /// For CONNECT: destination port, host byte order.
     pub dport: u16,
-    pub _pad: u16,
+    /// Address family for CONNECT: AF_INET (2) or AF_INET6 (10); 0 otherwise.
+    pub family: u16,
 }
 
 impl Event {
@@ -80,8 +83,15 @@ impl Event {
             path: [0; PATH_LEN],
             path_len: 0,
             daddr: 0,
+            daddr6: [0; 16],
             dport: 0,
-            _pad: 0,
+            family: 0,
         }
     }
 }
+
+/// A 16-byte IPv6 address (network byte order), used as the LPM-trie key for v6
+/// network rules. Layout-compatible with the userspace mirror.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Ip6Key(pub [u8; 16]);
