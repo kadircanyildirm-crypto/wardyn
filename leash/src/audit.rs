@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! JSONL audit log (M2). One JSON object per line for each policy violation
 //! (warn/block), flushed immediately so the file is tail-able live.
 use std::fs::File;
