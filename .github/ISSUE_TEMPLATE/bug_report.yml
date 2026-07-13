@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a problem with Leash (observation, policy, or enforcement)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! For **security vulnerabilities**, please do not use
+        this form — see [SECURITY.md](../blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did Leash do instead?
+      placeholder: e.g. "leash --enforce did not block a read of .env"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact command(s), and the policy if it's not the default.
+      placeholder: |
+        1. sudo leash --enforce run -- bash
+        2. cat .env
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel & distro
+      description: Output of `uname -a`.
+    validations:
+      required: true
+  - type: dropdown
+    id: bpf-lsm
+    attributes:
+      label: Was BPF LSM enabled?
+      description: Check `cat /sys/kernel/security/lsm` for `bpf`.
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Leash version / commit
+      description: Output of `leash --version`, or the git SHA you built from.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output / audit log
+      description: Startup warnings, the feed line(s), or `leash-audit.jsonl` entries.
+      render: shell

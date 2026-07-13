@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: CI only needs to read the repo.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -30,7 +39,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       # Builds userspace + the eBPF object (via aya-build). Does not load it —
       # GitHub runners have no BPF LSM — so runtime enforcement is tested manually.
