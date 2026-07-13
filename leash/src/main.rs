@@ -195,7 +195,16 @@ async fn main() -> anyhow::Result<()> {
         lprog.load("file_open", &btf).context("loading lsm/file_open")?;
         lprog.attach().context("attaching lsm/file_open")?;
 
-        info!("enforcement ON — blocked egress denied (cgroup) + secret-file opens denied (LSM)");
+        let bprog: &mut Lsm = ebpf
+            .program_mut("bprm_check")
+            .context("bprm_check program not found")?
+            .try_into()?;
+        bprog
+            .load("bprm_check_security", &btf)
+            .context("loading lsm/bprm_check_security")?;
+        bprog.attach().context("attaching lsm/bprm_check_security")?;
+
+        info!("enforcement ON — deny blocked egress (cgroup) + secret-file opens + blocked execs (LSM)");
     }
 
     let mut config: Array<_, u32> = Array::try_from(ebpf.take_map("CONFIG").context("CONFIG")?)?;
@@ -223,6 +232,11 @@ async fn main() -> anyhow::Result<()> {
             BpfHashMap::try_from(ebpf.take_map("BLOCK_DIRS").context("BLOCK_DIRS")?)?;
         for k in dirs {
             bd.insert(NameKey(k), 1u8, 0).context("populating BLOCK_DIRS")?;
+        }
+        let mut be: BpfHashMap<_, NameKey, u8> =
+            BpfHashMap::try_from(ebpf.take_map("BLOCK_EXEC").context("BLOCK_EXEC")?)?;
+        for k in policy.exec_enforcement() {
+            be.insert(NameKey(k), 1u8, 0).context("populating BLOCK_EXEC")?;
         }
     }
 

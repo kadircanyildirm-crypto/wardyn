@@ -43,6 +43,10 @@ static BLOCK_NAMES: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 #[map]
 static BLOCK_DIRS: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 
+/// Blocked executable basenames (e.g. `nc`, `ncat`) — exact match.
+#[map]
+static BLOCK_EXEC: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
+
 const CFG_WATCH_ALL: u32 = 0;
 const CFG_ENFORCE: u32 = 1;
 const CFG_NET_DEFAULT: u32 = 2;
@@ -60,6 +64,8 @@ const FILE_DENTRY_OFF: usize = 160;
 const DENTRY_NAME_OFF: usize = 40;
 // dentry.d_parent(24):
 const DENTRY_PARENT_OFF: usize = 24;
+// linux_binprm.file (the executable being exec'd):
+const BPRM_FILE_OFF: usize = 64;
 
 const AF_INET: u16 = 2;
 
@@ -263,6 +269,36 @@ fn read_name(dentry: *const u8, buf: &mut [u8; NAME_LEN]) -> Result<(), i64> {
     let name_ptr: *const u8 = unsafe { bpf_probe_read_kernel(name_pp) }?;
     let _ = unsafe { bpf_probe_read_kernel_str_bytes(name_ptr, buf) };
     Ok(())
+}
+
+// ── exec enforcement: deny running blocked programs ─────────────────────────
+
+#[lsm(hook = "bprm_check_security")]
+pub fn bprm_check(ctx: LsmContext) -> i32 {
+    match try_bprm_check(&ctx) {
+        Ok(v) => v,
+        Err(_) => OK,
+    }
+}
+
+fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
+    if cfg(CFG_ENFORCE) == 0 {
+        return Ok(OK);
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if !is_watched(pid) {
+        return Ok(OK);
+    }
+    // linux_binprm* -> file -> f_path.dentry -> d_name.name (the exec basename)
+    let bprm: *const u8 = unsafe { ctx.arg(0) };
+    let file = read_ptr(bprm, BPRM_FILE_OFF)?;
+    let dentry = read_ptr(file, FILE_DENTRY_OFF)?;
+    let mut name = [0u8; NAME_LEN];
+    read_name(dentry, &mut name)?;
+    if unsafe { BLOCK_EXEC.get(&NameKey(name)).is_some() } {
+        return Ok(EPERM);
+    }
+    Ok(OK)
 }
 
 // ── fork: adopt children of watched processes ───────────────────────────────

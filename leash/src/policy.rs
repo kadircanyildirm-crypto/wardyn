@@ -255,6 +255,15 @@ impl Policy {
         (names, dirs)
     }
 
+    /// Exec block rules compiled to exact basenames for the LSM bprm_check matcher.
+    pub fn exec_enforcement(&self) -> Vec<[u8; NAME_LEN]> {
+        self.exec
+            .iter()
+            .filter(|r| r.action == Action::Block)
+            .filter_map(|r| last_segment(&r.pattern).and_then(name_key))
+            .collect()
+    }
+
     pub fn eval_file(&self, path: &str) -> Verdict {
         eval_path(&self.files, path, self.default_action)
     }
@@ -405,6 +414,10 @@ exec:
         assert!(names.contains(&key("shadow"))); // /etc/shadow
         assert!(dirs.contains(&key(".ssh"))); // **/.ssh/**
         assert!(!names.contains(&key(".env.*"))); // glob segment -> not enforced
+
+        let execs = p.exec_enforcement();
+        assert!(execs.contains(&key("nc"))); // **/nc block
+        assert!(!execs.contains(&key("curl"))); // curl is warn, not block
     }
 
     #[test]
