@@ -32,8 +32,9 @@ $ sudo leash --enforce run -- claude "refactor the auth module"
 ```
 
 > ⚠️ **Status: early development.** M1–M3 done: observe + policy + **kernel-level
-> enforcement** for files, execs and network. M4 (demo GIF, presets) in progress.
-> Not production-ready — see [Roadmap](#roadmap).
+> enforcement** for files, execs and network (TCP + UDP, IPv4 + IPv6). M4 (demo
+> GIF, devcontainer, packaging) in progress. Not production-ready — see
+> [Roadmap](#roadmap).
 
 ## Why
 
@@ -52,7 +53,7 @@ For the process subtree you launch (`leash run -- <cmd>`, followed across `fork`
 |---|---|---|---|
 | **exec** — programs run | ✅ path + comm | ⛔ deny blocked binaries | `tracepoint/execve` + LSM `bprm_check_security` |
 | **file** — files opened | ✅ path | ⛔ deny secret reads (`.env`, `.ssh/*`) | `tracepoint/openat` + LSM `file_open` |
-| **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs | `tracepoint/connect` + `cgroup/connect4` |
+| **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs (TCP + UDP, IPv4/IPv6) | `tracepoint/connect` + `cgroup/connect4·6` + `sendmsg4·6` |
 
 Every action is checked against a [`policy.yaml`](#policy) → `allow` / `warn` /
 `block`, shown live (coloured) and written to a JSONL audit log.
@@ -142,9 +143,10 @@ Ready-made presets live in [`policies/`](./policies).
   colours the feed, and writes the audit log.
 - **Scoping** — `WATCHED` is seeded with the launched pid; a `sched_process_fork`
   hook adopts children in-kernel, so the whole subtree is followed race-free.
-- **Enforcement** — separate programs deny inline: `cgroup/connect4` returns *deny*
-  for blocked egress; BPF-LSM `file_open` / `bprm_check_security` return `-EPERM`
-  for blocked reads / execs. All gated on `WATCHED` + an `enforce` flag.
+- **Enforcement** — separate programs deny inline: `cgroup/connect4·6` +
+  `sendmsg4·6` return *deny* for blocked egress (TCP connect and UDP sendmsg, IPv4
+  & IPv6); BPF-LSM `file_open` / `bprm_check_security` return `-EPERM` for blocked
+  reads / execs. All gated on `WATCHED` + an `enforce` flag.
 
 Full design, hook map, and the eBPF-verifier war stories are in
 **[ARCHITECTURE.md](./ARCHITECTURE.md)**.
@@ -165,9 +167,27 @@ Full design, hook map, and the eBPF-verifier war stories are in
 
 - [x] **M1 — Observe:** live tree of exec/open/connect, scoped to a subtree.
 - [x] **M2 — Policy:** `policy.yaml` (glob + CIDR), allow/warn/block, JSONL audit.
-- [x] **M3 — Block:** deny egress (cgroup) + secret reads & blocked execs (LSM).
-- [ ] **M4 — Ship:** demo GIF, more presets, devcontainer, IPv6 egress.
+- [x] **M3 — Block:** deny egress (cgroup — TCP + UDP, IPv4 + IPv6) + secret reads
+  & blocked execs (LSM).
+- [ ] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓, presets ✓)_
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) for the dev
+setup (nightly + `bpf-linker`, Linux/VM) and the checks CI runs. Please be kind;
+we follow a [Code of Conduct](./CODE_OF_CONDUCT.md).
+
+## Security
+
+Leash runs as root and loads eBPF into the kernel. Found a vulnerability? Please
+report it **privately** — see [SECURITY.md](./SECURITY.md), not the public issue
+tracker. The threat model and known limitations are documented there too.
 
 ## License
 
-Dual-licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE), at your option.
+Dual-licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE), at
+your option, with per-file [SPDX](https://spdx.dev/) identifiers.
+
+Unless you explicitly state otherwise, any contribution you intentionally submit
+for inclusion in the work, as defined in the Apache-2.0 license, shall be
+dual-licensed as above, without any additional terms or conditions.
