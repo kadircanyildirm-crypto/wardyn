@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # Rust dependencies (Cargo workspace)
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Bundle low-risk minor/patch bumps into one PR to cut noise.
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+    labels:
+      - dependencies
+      - rust
+
+  # GitHub Actions used by our workflows
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - github-actions
