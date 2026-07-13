@@ -1,0 +1,39 @@
+# Strict preset — deny-all egress, block a broad set of secrets and reverse-shell
+# tools. Use with:
+#   sudo leash --enforce --policy policies/strict.yaml run -- <agent>
+version: 1
+default_action: allow
+
+files:
+  - { match: "**/.env", action: block }
+  - { match: "**/.env.*", action: block }
+  - { match: "**/.ssh/**", action: block }
+  - { match: "**/.aws/**", action: block }
+  - { match: "**/.config/gcloud/**", action: block }
+  - { match: "**/.kube/config", action: block }
+  - { match: "**/.docker/config.json", action: block }
+  - { match: "**/.netrc", action: block }
+  - { match: "**/.npmrc", action: block }
+  - { match: "**/.pypirc", action: block }
+  - { match: "/etc/shadow", action: block }
+  - { match: "**/.git/config", action: warn }
+  - { match: "**", action: allow }
+
+network:
+  - { cidr: "127.0.0.0/8", action: allow }
+  - { cidr: "10.0.0.0/8", action: allow }
+  - { cidr: "172.16.0.0/12", action: allow }
+  - { cidr: "192.168.0.0/16", action: allow }
+  - { domain: "github.com", action: allow }
+  - { domain: "api.anthropic.com", action: allow }
+  - { domain: "registry.npmjs.org", action: allow }
+  - { cidr: "0.0.0.0/0", action: block } # deny everything else
+
+exec:
+  - { match: "**/nc", action: block }
+  - { match: "**/ncat", action: block }
+  - { match: "**/socat", action: block }
+  - { match: "**/telnet", action: block }
+  - { match: "**/curl", action: warn }
+  - { match: "**/wget", action: warn }
+  - { match: "**", action: allow }

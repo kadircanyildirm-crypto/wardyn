@@ -82,9 +82,24 @@ compiled by `leash`'s `build.rs` via `aya-build`.
 
 Dev target: **Ubuntu 24.04 VM with BPF LSM enabled** — full observe + full block in one place.
 
+## Enforcement (implemented)
+
+Gated on `WATCHED` membership + `CONFIG[enforce]`, so it only ever touches the
+launched subtree, and only under `--enforce`:
+
+- **Network** — `cgroup/connect4` looks the destination IPv4 up in the `NET_RULES`
+  LPM trie (compiled from `policy.network`) and returns *deny* for a `block` verdict.
+- **File** — LSM `file_open` reads `file->f_path.dentry->d_name` (basename) and its
+  parent-dir name at fixed kernel offsets, and returns `-EPERM` if either is in the
+  `BLOCK_NAMES` / `BLOCK_DIRS` set. aya-ebpf 0.1 has no `bpf_d_path`/`bpf_loop`, so
+  matching is exact basename/dir rather than full-path glob (fail-safe; the richer
+  observation feed still uses full globs). Offsets: `scripts/kernel-offsets.sh`.
+- **Exec** — LSM `bprm_check_security` applies the same basename match to
+  `linux_binprm->file` against `BLOCK_EXEC`.
+
 ## Roadmap
 
-- **M1 — Observe:** exec + openat + connect for the watched tree → live TUI. (no enforcement)
-- **M2 — Policy/warn:** compile `policy.yaml`, flag violations red in the TUI, JSONL audit log.
-- **M3 — Block:** network via cgroup/connect; file+exec via LSM. The demo GIF.
-- **M4 — Polish:** README + 30s GIF, `--dry-run`, prebuilt policy presets, CI devcontainer.
+- [x] **M1 — Observe:** exec + openat + connect for the watched tree → live TUI.
+- [x] **M2 — Policy/warn:** `policy.yaml` compiled to matchers, violations coloured, JSONL audit.
+- [x] **M3 — Block:** network via cgroup/connect + file & exec via LSM.
+- [ ] **M4 — Ship:** demo GIF, presets, `--dry-run`, IPv6 egress, CI devcontainer.

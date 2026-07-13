@@ -1,0 +1,27 @@
+# Permissive preset — never blocks; flags sensitive access as `warn` so you can
+# see what an agent touches before locking it down. A safe first run:
+#   sudo leash --policy policies/permissive.yaml run -- <agent>
+# (drop --enforce, or keep it: nothing here is `block`, so nothing is denied)
+version: 1
+default_action: allow
+
+files:
+  - { match: "**/.env", action: warn }
+  - { match: "**/.env.*", action: warn }
+  - { match: "**/.ssh/**", action: warn }
+  - { match: "**/.aws/**", action: warn }
+  - { match: "**/.config/gcloud/**", action: warn }
+  - { match: "/etc/shadow", action: warn }
+  - { match: "**", action: allow }
+
+network:
+  - { cidr: "127.0.0.0/8", action: allow }
+  - { cidr: "10.0.0.0/8", action: allow }
+  - { cidr: "172.16.0.0/12", action: allow }
+  - { cidr: "192.168.0.0/16", action: allow }
+  - { cidr: "0.0.0.0/0", action: warn } # flag external egress, don't block
+
+exec:
+  - { match: "**/nc", action: warn }
+  - { match: "**/ncat", action: warn }
+  - { match: "**", action: allow }
