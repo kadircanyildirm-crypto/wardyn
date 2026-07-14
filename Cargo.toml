@@ -14,7 +14,7 @@ repository = "https://github.com/kadircanyildirm-crypto/wardyn"
 homepage = "https://github.com/kadircanyildirm-crypto/wardyn"
 
 [workspace.dependencies]
-aya = { version = "0.13" }
+aya = { version = "0.14" }
 aya-log = { version = "0.2" }
 aya-ebpf = { version = "0.1" }
 aya-log-ebpf = { version = "0.1" }
