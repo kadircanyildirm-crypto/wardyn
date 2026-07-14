@@ -6,7 +6,7 @@ tree with eBPF and enforces — in real time, at the syscall boundary — what i
 or dialing an unknown IP, and can *block* it before the operation completes.
 
 [![CI](https://github.com/kadircanyildirm-crypto/leash/actions/workflows/ci.yml/badge.svg)](https://github.com/kadircanyildirm-crypto/leash/actions/workflows/ci.yml)
-![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)
+![license](https://img.shields.io/badge/license-AGPL--3.0-blue)
 ![built with Rust + aya](https://img.shields.io/badge/built%20with-Rust%20%2B%20aya-orange?logo=rust)
 ![eBPF](https://img.shields.io/badge/eBPF-tracepoints%20%C2%B7%20cgroup%20%C2%B7%20LSM-6f42c1)
 ![status](https://img.shields.io/badge/status-early%20development-yellow)
@@ -185,9 +185,16 @@ tracker. The threat model and known limitations are documented there too.
 
 ## License
 
-Dual-licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE), at
-your option, with per-file [SPDX](https://spdx.dev/) identifiers.
+Licensed under the **[GNU Affero General Public License v3.0 or later](./LICENSE)**
+(AGPL-3.0-or-later), with per-file [SPDX](https://spdx.dev/) identifiers.
+
+Copyright (C) 2026 Kadir Can Yildirim.
+
+This is a strong copyleft licence: you may use, study, modify and redistribute
+Leash, but any distributed derivative — **including one offered to others over a
+network** — must be released under the AGPL and make its complete source
+available. You must preserve the copyright and licence notices.
 
 Unless you explicitly state otherwise, any contribution you intentionally submit
-for inclusion in the work, as defined in the Apache-2.0 license, shall be
-dual-licensed as above, without any additional terms or conditions.
+for inclusion in the work shall be licensed as above, without any additional
+terms or conditions.

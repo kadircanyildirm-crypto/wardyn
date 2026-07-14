@@ -3,8 +3,8 @@
 Thanks for your interest in Leash! It's an eBPF watchdog for AI coding agents,
 written in Rust. Contributions — bug reports, docs, presets, code — are welcome.
 
-By contributing you agree that your work is licensed under the project's dual
-[MIT](./LICENSE-MIT) / [Apache-2.0](./LICENSE-APACHE) license.
+By contributing you agree that your work is licensed under the project's
+[AGPL-3.0-or-later](./LICENSE) license.
 
 ## Ground rules
 

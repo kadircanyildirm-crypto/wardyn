@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Types shared between the eBPF programs (`leash-ebpf`) and userspace (`leash`).
 //!
 //! `#![no_std]` so it links into the eBPF object; it also compiles under std,
