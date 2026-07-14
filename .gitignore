@@ -1,7 +1,7 @@
 /target
 **/*.rs.bk
 *.pdb
-# Leash runtime output
+# Wardyn runtime output
 /audit-*.jsonl
 *.o
 typescript
