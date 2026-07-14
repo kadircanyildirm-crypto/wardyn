@@ -1,4 +1,4 @@
-# Leash policy — what the watched process tree is allowed to do.
+# Wardyn policy — what the watched process tree is allowed to do.
 # Each section is an ordered list; the FIRST matching rule wins.
 # If nothing matches, `default_action` applies.
 # Actions: allow | warn | block

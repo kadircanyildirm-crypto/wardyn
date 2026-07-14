@@ -1,0 +1,22 @@
+[package]
+name = "wardyn-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Wardyn's eBPF programs (tracepoints + cgroup/LSM hooks). Built for the BPF target by wardyn's build script; not a standalone crate."
+# Compiled for bpfel by wardyn/build.rs (aya-build), never published to crates.io.
+publish = false
+
+[dependencies]
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+wardyn-common = { workspace = true }
+
+# The compiled object is named after this bin target; wardyn/src/main.rs includes
+# it as concat!(env!("OUT_DIR"), "/wardyn").
+[[bin]]
+name = "wardyn"
+path = "src/main.rs"

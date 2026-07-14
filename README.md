@@ -1,24 +1,24 @@
-# 🐕 Leash
+# 🐕 Wardyn
 
-**A kernel-level leash for AI coding agents.** Leash watches an agent's process
+**A kernel-level warden for AI coding agents.** Wardyn watches an agent's process
 tree with eBPF and enforces — in real time, at the syscall boundary — what it may
 **read**, **run**, and **connect to**. It catches the agent reading your `.env`
 or dialing an unknown IP, and can *block* it before the operation completes.
 
-[![CI](https://github.com/kadircanyildirm-crypto/leash/actions/workflows/ci.yml/badge.svg)](https://github.com/kadircanyildirm-crypto/leash/actions/workflows/ci.yml)
+[![CI](https://github.com/kadircanyildirm-crypto/wardyn/actions/workflows/ci.yml/badge.svg)](https://github.com/kadircanyildirm-crypto/wardyn/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-AGPL--3.0-blue)
 ![built with Rust + aya](https://img.shields.io/badge/built%20with-Rust%20%2B%20aya-orange?logo=rust)
 ![eBPF](https://img.shields.io/badge/eBPF-tracepoints%20%C2%B7%20cgroup%20%C2%B7%20LSM-6f42c1)
 ![status](https://img.shields.io/badge/status-early%20development-yellow)
 
-<!-- Demo GIF: record with docs/RECORDING.md, drop it at docs/leash-demo.gif, then
+<!-- Demo GIF: record with docs/RECORDING.md, drop it at docs/wardyn-demo.gif, then
      uncomment this:
-<p align="center"><img src="docs/leash-demo.gif" width="820"
-  alt="Leash blocking an agent from reading .env and dialing an unknown IP"></p>
+<p align="center"><img src="docs/wardyn-demo.gif" width="820"
+  alt="Wardyn blocking an agent from reading .env and dialing an unknown IP"></p>
 -->
 
 ```console
-$ sudo leash --enforce run -- claude "refactor the auth module"
+$ sudo wardyn --enforce run -- claude "refactor the auth module"
 
   PID    COMM     EVENT    ACT     DETAIL
   40218  claude   exec     ok      /usr/bin/node
@@ -28,7 +28,7 @@ $ sudo leash --enforce run -- claude "refactor the auth module"
   40244  curl     connect  ⛔BLOCK  185.220.101.7:443          [cidr:0.0.0.0/0]
   40250  node     open     ⛔BLOCK  /home/me/project/.env      [**/.env]
 
-  leash: 3 policy violation(s) logged to leash-audit.jsonl
+  wardyn: 3 policy violation(s) logged to wardyn-audit.jsonl
 ```
 
 > ⚠️ **Status: early development.** M1–M3 done: observe + policy + **kernel-level
@@ -42,12 +42,12 @@ You hand an autonomous agent a shell. It should build your project — not exfil
 `~/.ssh`, POST your `.env` to an unknown host, or spawn a reverse shell. Userspace
 guards (seccomp wrappers, `LD_PRELOAD`, ptrace) are bypassable and race-prone.
 
-Leash runs in the **kernel**: the watched process can't see it, can't unload it,
-and Leash denies the syscall itself — synchronously, before it completes.
+Wardyn runs in the **kernel**: the watched process can't see it, can't unload it,
+and Wardyn denies the syscall itself — synchronously, before it completes.
 
 ## What it does
 
-For the process subtree you launch (`leash run -- <cmd>`, followed across `fork`):
+For the process subtree you launch (`wardyn run -- <cmd>`, followed across `fork`):
 
 | Axis | Observe | Enforce (`--enforce`) | eBPF hook |
 |---|---|---|---|
@@ -60,12 +60,12 @@ Every action is checked against a [`policy.yaml`](#policy) → `allow` / `warn` 
 
 **Surgically scoped & safe:** enforcement only ever touches the subtree you
 launched, and only with `--enforce`. The rest of the system is never affected —
-`leash --enforce run -- agent` can block the agent from `8.8.8.8` while every other
+`wardyn --enforce run -- agent` can block the agent from `8.8.8.8` while every other
 process on the host reaches it fine.
 
 ## Quickstart
 
-Leash needs Linux with **BTF**, **cgroup v2**, and — for file/exec blocking —
+Wardyn needs Linux with **BTF**, **cgroup v2**, and — for file/exec blocking —
 **BPF LSM** enabled. On macOS/Windows, run it in a Linux VM.
 
 ```bash
@@ -79,10 +79,10 @@ sudo ./scripts/enable-bpf-lsm.sh && sudo reboot
 cargo build --release      # userspace + eBPF, via aya-build
 
 # 4. observe (no blocking) — watch an agent's whole subtree
-sudo ./target/release/leash run -- bash
+sudo ./target/release/wardyn run -- bash
 
 # 5. enforce — actually block policy violations
-sudo ./target/release/leash --enforce run -- bash scripts/demo.sh
+sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh
 ```
 
 Renders a live TUI when attached to a terminal; pipe it (or pass `--plain`) for a
@@ -117,7 +117,7 @@ Ready-made presets live in [`policies/`](./policies).
 ## How it works
 
 ```
-   leash run -- <agent>
+   wardyn run -- <agent>
           │  spawn + watch (WATCHED map, sched_process_fork follows the subtree)
           ▼
   ┌───────────────────────────── watched process tree ─────────────────────────┐
@@ -179,7 +179,7 @@ we follow a [Code of Conduct](./CODE_OF_CONDUCT.md).
 
 ## Security
 
-Leash runs as root and loads eBPF into the kernel. Found a vulnerability? Please
+Wardyn runs as root and loads eBPF into the kernel. Found a vulnerability? Please
 report it **privately** — see [SECURITY.md](./SECURITY.md), not the public issue
 tracker. The threat model and known limitations are documented there too.
 
@@ -191,7 +191,7 @@ Licensed under the **[GNU Affero General Public License v3.0 or later](./LICENSE
 Copyright (C) 2026 Kadir Can Yildirim.
 
 This is a strong copyleft licence: you may use, study, modify and redistribute
-Leash, but any distributed derivative — **including one offered to others over a
+Wardyn, but any distributed derivative — **including one offered to others over a
 network** — must be released under the AGPL and make its complete source
 available. You must preserve the copyright and licence notices.
 

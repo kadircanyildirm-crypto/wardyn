@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Leash eBPF programs.
+//! Wardyn eBPF programs.
 //!
 //! Observation (tracepoints) streams a structured [`Event`] per exec/open/connect
 //! for the watched subtree. Enforcement (M3, gated on `CONFIG[ENFORCE]` and only
@@ -20,7 +20,7 @@ use aya_ebpf::{
     maps::{lpm_trie::Key, Array, HashMap, LpmTrie, RingBuf},
     programs::{LsmContext, SockAddrContext, TracePointContext},
 };
-use leash_common::{action, kind, Event, Ip6Key, NameKey, COMM_LEN, NAME_LEN, PATH_LEN};
+use wardyn_common::{action, kind, Event, Ip6Key, NameKey, COMM_LEN, NAME_LEN, PATH_LEN};
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -118,13 +118,13 @@ fn in_scope(pid: u32) -> bool {
 // ── exec + open observation ─────────────────────────────────────────────────
 
 #[tracepoint]
-pub fn leash_execve(ctx: TracePointContext) -> u32 {
+pub fn wardyn_execve(ctx: TracePointContext) -> u32 {
     let _ = emit_path_event(&ctx, kind::EXEC, EXECVE_FILENAME_OFFSET);
     0
 }
 
 #[tracepoint]
-pub fn leash_openat(ctx: TracePointContext) -> u32 {
+pub fn wardyn_openat(ctx: TracePointContext) -> u32 {
     let _ = emit_path_event(&ctx, kind::OPEN, OPENAT_FILENAME_OFFSET);
     0
 }
@@ -133,13 +133,13 @@ pub fn leash_openat(ctx: TracePointContext) -> u32 {
 // them too — without these tracepoints the kernel could deny an open/exec that
 // never showed up in the feed. Same filename slot as openat (2nd syscall arg).
 #[tracepoint]
-pub fn leash_openat2(ctx: TracePointContext) -> u32 {
+pub fn wardyn_openat2(ctx: TracePointContext) -> u32 {
     let _ = emit_path_event(&ctx, kind::OPEN, OPENAT_FILENAME_OFFSET);
     0
 }
 
 #[tracepoint]
-pub fn leash_execveat(ctx: TracePointContext) -> u32 {
+pub fn wardyn_execveat(ctx: TracePointContext) -> u32 {
     let _ = emit_path_event(&ctx, kind::EXEC, EXECVEAT_FILENAME_OFFSET);
     0
 }
@@ -179,7 +179,7 @@ fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -
 // ── connect observation ─────────────────────────────────────────────────────
 
 #[tracepoint]
-pub fn leash_connect(ctx: TracePointContext) -> u32 {
+pub fn wardyn_connect(ctx: TracePointContext) -> u32 {
     let _ = emit_connect(&ctx, CONNECT_USERVADDR_OFFSET);
     0
 }
@@ -189,7 +189,7 @@ pub fn leash_connect(ctx: TracePointContext) -> u32 {
 // invisibly. (sendmsg's destination hides behind a msghdr indirection aya-ebpf
 // 0.1 can't easily walk, so that path stays enforce-only for now.)
 #[tracepoint]
-pub fn leash_sendto(ctx: TracePointContext) -> u32 {
+pub fn wardyn_sendto(ctx: TracePointContext) -> u32 {
     let _ = emit_connect(&ctx, SENDTO_UADDR_OFFSET);
     0
 }
@@ -422,7 +422,7 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
 // ── fork: adopt children of watched processes ───────────────────────────────
 
 #[tracepoint]
-pub fn leash_fork(ctx: TracePointContext) -> u32 {
+pub fn wardyn_fork(ctx: TracePointContext) -> u32 {
     let _ = handle_fork(&ctx);
     0
 }
@@ -445,7 +445,7 @@ fn handle_fork(ctx: &TracePointContext) -> Result<(), i64> {
 /// thread's tid could otherwise collide with an unrelated watched process's tgid
 /// and evict it by mistake.
 #[tracepoint]
-pub fn leash_exit(_ctx: TracePointContext) -> u32 {
+pub fn wardyn_exit(_ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;

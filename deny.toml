@@ -3,7 +3,7 @@
 # See https://embarkstudios.github.io/cargo-deny/
 
 [graph]
-# Only the targets Leash actually builds for.
+# Only the targets Wardyn actually builds for.
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -24,7 +24,7 @@ version = 2
 # Don't warn about pre-allowed licenses that no current dependency happens to use;
 # the list is intentionally broad so a future permissive dep doesn't break CI.
 unused-allowed-license = "allow"
-# Leash itself is AGPL-3.0; its dependencies remain permissive (that direction is
+# Wardyn itself is AGPL-3.0; its dependencies remain permissive (that direction is
 # compatible). Both must be on the allow list so `cargo deny` passes.
 allow = [
     "AGPL-3.0-or-later",

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Leash userspace.
+//! Wardyn userspace.
 //!
 //! Usage:
-//!   leash [OPTIONS] run -- <cmd> [args...]   watch that command's subtree
-//!   leash [OPTIONS] [--all]                  watch system-wide
+//!   wardyn [OPTIONS] run -- <cmd> [args...]   watch that command's subtree
+//!   wardyn [OPTIONS] [--all]                  watch system-wide
 //!
 //! Options:
 //!   --enforce          deny blocked file reads / execs / egress (default: observe)
 //!   --plain            force the plain line printer (no TUI)
 //!   --policy <path>    policy file (default: ./policy.yaml, else embedded)
-//!   --audit <path>     JSONL audit log (default: ./leash-audit.jsonl)
+//!   --audit <path>     JSONL audit log (default: ./wardyn-audit.jsonl)
 //!
 //! Renders a live ratatui TUI when stdout is a terminal, else a plain table.
 //! Each event is evaluated against the policy (allow/warn/block); violations are
@@ -30,23 +30,23 @@ use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{Array, HashMap as BpfHashMap, MapData, RingBuf};
 use aya::programs::{CgroupAttachMode, CgroupSockAddr, Lsm, TracePoint};
 use aya::Btf;
-use leash_common::{kind, Event, NAME_LEN, PATH_LEN};
 use log::info;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
+use wardyn_common::{kind, Event, NAME_LEN, PATH_LEN};
 
 use crate::audit::Audit;
 use crate::policy::{Action, Policy, Verdict};
 
-/// Userspace mirror of `leash_common::NameKey` (identical C layout) carrying a
+/// Userspace mirror of `wardyn_common::NameKey` (identical C layout) carrying a
 /// `Pod` impl so aya can use it as a hash-map key. The `Pod` impl can't live on
-/// the leash_common type (orphan rule), hence this local copy.
+/// the wardyn_common type (orphan rule), hence this local copy.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NameKey([u8; NAME_LEN]);
 unsafe impl aya::Pod for NameKey {}
 
-/// Userspace mirror of `leash_common::Ip6Key` (16-byte v6 address), `Pod` so aya
+/// Userspace mirror of `wardyn_common::Ip6Key` (16-byte v6 address), `Pod` so aya
 /// can use it as the v6 LPM-trie key.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -83,7 +83,7 @@ fn parse_args() -> anyhow::Result<Opts> {
     let mut plain = false;
     let mut enforce = false;
     let mut policy_path = None;
-    let mut audit_path = PathBuf::from("leash-audit.jsonl");
+    let mut audit_path = PathBuf::from("wardyn-audit.jsonl");
 
     while let Some(a) = it.peek() {
         match a.as_str() {
@@ -92,7 +92,7 @@ fn parse_args() -> anyhow::Result<Opts> {
                 std::process::exit(0);
             }
             "--version" | "-V" => {
-                println!("leash {}", env!("CARGO_PKG_VERSION"));
+                println!("wardyn {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--plain" => {
@@ -119,12 +119,12 @@ fn parse_args() -> anyhow::Result<Opts> {
         None => Mode::All,
         Some("--all") | Some("watch") => {
             // Options are only recognised BEFORE the mode; a flag here (e.g.
-            // `leash --all --enforce`) would otherwise be silently dropped and
+            // `wardyn --all --enforce`) would otherwise be silently dropped and
             // the user would get observe-only despite asking to enforce.
             if let Some(extra) = it.next() {
                 bail!(
                     "unexpected argument `{extra}` after `--all` — put options such as \
-                     --enforce BEFORE the mode: leash --enforce run -- <cmd>"
+                     --enforce BEFORE the mode: wardyn --enforce run -- <cmd>"
                 );
             }
             Mode::All
@@ -135,12 +135,12 @@ fn parse_args() -> anyhow::Result<Opts> {
                 rest.remove(0);
             }
             if rest.is_empty() {
-                bail!("usage: leash run -- <command> [args...]");
+                bail!("usage: wardyn run -- <command> [args...]");
             }
             Mode::Run(rest)
         }
         Some(other) => {
-            bail!("unknown argument `{other}`; usage: leash [--plain] [--policy P] [--audit P] [run -- <cmd> | --all]")
+            bail!("unknown argument `{other}`; usage: wardyn [--plain] [--policy P] [--audit P] [run -- <cmd> | --all]")
         }
     };
 
@@ -175,26 +175,26 @@ fn load_tracepoint(
 fn load_tracepoint_optional(ebpf: &mut aya::Ebpf, name: &str, category: &str, tp: &str) {
     if let Err(e) = load_tracepoint(ebpf, name, category, tp) {
         eprintln!(
-            "leash: warning: could not attach {category}:{tp} ({e:#}) — opens/execs/sends via \
+            "wardyn: warning: could not attach {category}:{tp} ({e:#}) — opens/execs/sends via \
              this syscall variant won't appear in the feed (enforcement is unaffected)."
         );
     }
 }
 
-/// The kernel the LSM struct offsets in leash-ebpf were derived for.
+/// The kernel the LSM struct offsets in wardyn-ebpf were derived for.
 const OFFSETS_KERNEL: &str = "6.8";
 
 fn print_usage() {
     println!(
-        "leash — a kernel-level leash for AI coding agents\n\n\
+        "wardyn — a kernel-level wardyn for AI coding agents\n\n\
          USAGE:\n  \
-         leash [OPTIONS] run -- <cmd> [args...]   watch that command's subtree\n  \
-         leash [OPTIONS] [--all]                  watch system-wide\n\n\
+         wardyn [OPTIONS] run -- <cmd> [args...]   watch that command's subtree\n  \
+         wardyn [OPTIONS] [--all]                  watch system-wide\n\n\
          OPTIONS:\n  \
          --enforce         deny blocked file reads / execs / egress (default: observe)\n  \
          --plain           force the plain line printer (no TUI)\n  \
          --policy <path>   policy file (default: ./policy.yaml, else embedded)\n  \
-         --audit <path>    JSONL audit log (default: ./leash-audit.jsonl)\n  \
+         --audit <path>    JSONL audit log (default: ./wardyn-audit.jsonl)\n  \
          -h, --help        print this help\n  \
          -V, --version     print version"
     );
@@ -213,7 +213,7 @@ fn warn_if_untested_kernel() {
         .join(".");
     if !mm.is_empty() && mm != OFFSETS_KERNEL {
         eprintln!(
-            "leash: warning: kernel {} — the LSM file/exec offsets were derived for {}; file/exec \
+            "wardyn: warning: kernel {} — the LSM file/exec offsets were derived for {}; file/exec \
              enforcement may silently fail on a different kernel (network egress is unaffected). \
              Regenerate with scripts/kernel-offsets.sh.",
             release.trim(),
@@ -260,13 +260,13 @@ async fn main() -> anyhow::Result<()> {
     // silently does nothing. (System-wide blocking is out of scope by design.)
     if opts.enforce && matches!(opts.mode, Mode::All) {
         bail!(
-            "--enforce requires `run -- <cmd>`: leash only enforces on the subtree it launches, \
-             not system-wide. Re-run as: leash --enforce run -- <cmd>"
+            "--enforce requires `run -- <cmd>`: wardyn only enforces on the subtree it launches, \
+             not system-wide. Re-run as: wardyn --enforce run -- <cmd>"
         );
     }
     // eBPF load/attach needs privilege; fail early with a clear message.
     if unsafe { libc::geteuid() } != 0 {
-        bail!("leash must run as root — it loads eBPF programs (try: sudo leash ...)");
+        bail!("wardyn must run as root — it loads eBPF programs (try: sudo wardyn ...)");
     }
     let use_tui = !opts.plain && std::io::stdout().is_terminal();
     if !use_tui {
@@ -283,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
         // basename/dir are flagged in the feed but never actually denied.
         for pat in policy.observe_only_blocks() {
             eprintln!(
-                "leash: warning: policy `{pat}` (block) can't be kernel-enforced \
+                "wardyn: warning: policy `{pat}` (block) can't be kernel-enforced \
                  (only basename/dir file rules and CIDRs are) — it will be flagged, not denied"
             );
         }
@@ -292,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
         // its immediate parent dir. Say so, so the over-reach is intentional.
         for (pat, reach) in policy.overbroad_block_keys() {
             eprintln!(
-                "leash: warning: policy `{pat}` (block) enforces on {reach} — the kernel matches \
+                "wardyn: warning: policy `{pat}` (block) enforces on {reach} — the kernel matches \
                  by basename/dir only, so it will also deny paths the glob wouldn't."
             );
         }
@@ -301,25 +301,25 @@ async fn main() -> anyhow::Result<()> {
 
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
-        "/leash"
+        "/wardyn"
     )))
     .context("loading eBPF object")?;
 
-    load_tracepoint(&mut ebpf, "leash_execve", "syscalls", "sys_enter_execve")?;
-    load_tracepoint(&mut ebpf, "leash_openat", "syscalls", "sys_enter_openat")?;
-    load_tracepoint(&mut ebpf, "leash_connect", "syscalls", "sys_enter_connect")?;
-    load_tracepoint(&mut ebpf, "leash_fork", "sched", "sched_process_fork")?;
-    load_tracepoint(&mut ebpf, "leash_exit", "sched", "sched_process_exit")?;
+    load_tracepoint(&mut ebpf, "wardyn_execve", "syscalls", "sys_enter_execve")?;
+    load_tracepoint(&mut ebpf, "wardyn_openat", "syscalls", "sys_enter_openat")?;
+    load_tracepoint(&mut ebpf, "wardyn_connect", "syscalls", "sys_enter_connect")?;
+    load_tracepoint(&mut ebpf, "wardyn_fork", "sched", "sched_process_fork")?;
+    load_tracepoint(&mut ebpf, "wardyn_exit", "sched", "sched_process_exit")?;
     // Cover the syscall variants the LSM/cgroup hooks also enforce on, so a
     // denial can't happen off-feed. Optional: absent on older kernels.
-    load_tracepoint_optional(&mut ebpf, "leash_openat2", "syscalls", "sys_enter_openat2");
+    load_tracepoint_optional(&mut ebpf, "wardyn_openat2", "syscalls", "sys_enter_openat2");
     load_tracepoint_optional(
         &mut ebpf,
-        "leash_execveat",
+        "wardyn_execveat",
         "syscalls",
         "sys_enter_execveat",
     );
-    load_tracepoint_optional(&mut ebpf, "leash_sendto", "syscalls", "sys_enter_sendto");
+    load_tracepoint_optional(&mut ebpf, "wardyn_sendto", "syscalls", "sys_enter_sendto");
 
     // Enforcement (opt-in): attach the cgroup/connect4 denier BEFORE taking any
     // map, so map relocation still finds NET_RULES/CONFIG/WATCHED in the object.
@@ -346,7 +346,7 @@ async fn main() -> anyhow::Result<()> {
                 "enforcement ON — egress (cgroup) + secret-file reads + blocked execs (LSM) denied"
             ),
             Err(e) => eprintln!(
-                "leash: warning: BPF LSM enforcement unavailable ({e:#}) — file/exec blocking is \
+                "wardyn: warning: BPF LSM enforcement unavailable ({e:#}) — file/exec blocking is \
                  OFF (network egress blocking is still active). Enable it via scripts/enable-bpf-lsm.sh."
             ),
         }
@@ -412,7 +412,7 @@ async fn main() -> anyhow::Result<()> {
         }
         // Self was only seeded so the fork hook would adopt the child at spawn
         // time; the child (and its subtree via fork) is tracked in its own right
-        // now, so drop leash's own pid — otherwise leash would police itself
+        // now, so drop wardyn's own pid — otherwise wardyn would police itself
         // (its own opens/execs/connects) under --enforce and add noise to the feed.
         let _ = watched.remove(&std::process::id());
         child = Some(spawned);
@@ -435,7 +435,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     eprintln!(
-        "leash: {} policy violation(s) logged to {}",
+        "wardyn: {} policy violation(s) logged to {}",
         audit.count(),
         audit.path()
     );

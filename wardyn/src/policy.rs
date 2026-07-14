@@ -15,10 +15,10 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use globset::{Glob, GlobMatcher};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use leash_common::NAME_LEN;
 use serde::Deserialize;
+use wardyn_common::NAME_LEN;
 
-/// The three policy verdicts. Wire values match `leash_common::action`.
+/// The three policy verdicts. Wire values match `wardyn_common::action`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
@@ -36,7 +36,7 @@ impl Action {
         }
     }
 
-    /// Wire value shared with the eBPF side (`leash_common::action`).
+    /// Wire value shared with the eBPF side (`wardyn_common::action`).
     pub fn code(self) -> u32 {
         match self {
             Action::Allow => 0,
@@ -146,7 +146,7 @@ pub struct Policy {
     kern_execs: BTreeSet<String>,
 }
 
-/// The default policy, embedded so `leash` runs out of the box with no file.
+/// The default policy, embedded so `wardyn` runs out of the box with no file.
 const DEFAULT_POLICY: &str = include_str!("../../policy.yaml");
 
 impl Policy {
