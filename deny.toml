@@ -24,8 +24,10 @@ version = 2
 # Don't warn about pre-allowed licenses that no current dependency happens to use;
 # the list is intentionally broad so a future permissive dep doesn't break CI.
 unused-allowed-license = "allow"
-# Permissive licenses acceptable for a dual MIT/Apache-2.0 project.
+# Leash itself is AGPL-3.0; its dependencies remain permissive (that direction is
+# compatible). Both must be on the allow list so `cargo deny` passes.
 allow = [
+    "AGPL-3.0-or-later",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

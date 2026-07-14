@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Compile the `leash-ebpf` crate for the BPF target (via aya-build, using the
 //! nightly toolchain) and place the object in OUT_DIR, where src/main.rs picks it
 //! up with include_bytes_aligned!.
