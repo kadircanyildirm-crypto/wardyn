@@ -15,7 +15,7 @@ aya = { workspace = true }
 wardyn-common = { workspace = true }
 anyhow = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt", "signal", "net", "process", "time"] }
-ratatui = "0.29"
+ratatui = "0.30"
 log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
