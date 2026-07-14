@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "A kernel-level wardyn for AI coding agents — eBPF watches every file, exec, and network connection an agent makes, and blocks policy violations in real time."
+description = "A kernel-level warden for AI coding agents — eBPF watches every file, exec, and network connection an agent makes, and blocks policy violations in real time."
 keywords = ["ebpf", "security", "sandbox", "bpf", "agent"]
 categories = ["command-line-utilities", "development-tools", "os::linux-apis"]
 

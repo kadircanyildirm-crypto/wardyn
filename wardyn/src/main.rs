@@ -186,7 +186,7 @@ const OFFSETS_KERNEL: &str = "6.8";
 
 fn print_usage() {
     println!(
-        "wardyn — a kernel-level wardyn for AI coding agents\n\n\
+        "wardyn — a kernel-level warden for AI coding agents\n\n\
          USAGE:\n  \
          wardyn [OPTIONS] run -- <cmd> [args...]   watch that command's subtree\n  \
          wardyn [OPTIONS] [--all]                  watch system-wide\n\n\
