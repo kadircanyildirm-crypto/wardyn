@@ -17,6 +17,6 @@ homepage = "https://github.com/kadircanyildirm-crypto/wardyn"
 aya = { version = "0.13" }
 aya-log = { version = "0.2" }
 aya-ebpf = { version = "0.1" }
-aya-log-ebpf = { version = "0.1" }
+aya-log-ebpf = { version = "0.2" }
 wardyn-common = { path = "wardyn-common" }
 anyhow = "1"
