@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use aya::maps::{MapData, RingBuf};
-use leash_common::kind;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::{
     event::{self, Event as CtEvent, KeyCode, KeyModifiers},
@@ -21,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 use tokio::io::unix::AsyncFd;
 use tokio::process::Child;
+use wardyn_common::kind;
 
 use crate::audit::Audit;
 use crate::policy::{Action, Policy};
@@ -88,7 +88,7 @@ impl App {
 
         let header = Paragraph::new(Line::from(vec![
             Span::styled(
-                " 🐕 leash ",
+                " 🐕 wardyn ",
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -127,7 +127,7 @@ impl App {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
         ]))
-        .block(Block::default().borders(Borders::ALL).title(" Leash "));
+        .block(Block::default().borders(Borders::ALL).title(" Wardyn "));
         f.render_widget(header, chunks[0]);
 
         let visible = chunks[1].height.saturating_sub(2) as usize;

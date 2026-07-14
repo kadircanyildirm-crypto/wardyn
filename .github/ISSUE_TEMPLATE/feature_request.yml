@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest an idea or improvement for Leash
+description: Suggest an idea or improvement for Wardyn
 labels: ["enhancement"]
 body:
   - type: textarea
@@ -13,7 +13,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: What you'd like Leash to do. New policy axis, hook, output, etc.
+      description: What you'd like Wardyn to do. New policy axis, hook, output, etc.
     validations:
       required: true
   - type: textarea

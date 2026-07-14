@@ -1,6 +1,6 @@
-# Contributing to Leash
+# Contributing to Wardyn
 
-Thanks for your interest in Leash! It's an eBPF watchdog for AI coding agents,
+Thanks for your interest in Wardyn! It's an eBPF watchdog for AI coding agents,
 written in Rust. Contributions — bug reports, docs, presets, code — are welcome.
 
 By contributing you agree that your work is licensed under the project's
@@ -15,7 +15,7 @@ By contributing you agree that your work is licensed under the project's
 
 ## Development setup
 
-Leash loads eBPF programs, so building and running it needs Linux. On
+Wardyn loads eBPF programs, so building and running it needs Linux. On
 macOS/Windows, use a Linux VM (see [`scripts/setup-vm.sh`](./scripts/setup-vm.sh)).
 
 Requirements:
@@ -30,7 +30,7 @@ Requirements:
 ./scripts/setup-vm.sh          # toolchain + bpf-linker (one-time)
 cargo build                    # builds userspace + the eBPF object (via aya-build)
 cargo test                     # policy-engine unit tests (no root needed)
-sudo ./target/debug/leash run -- bash    # smoke-test observation
+sudo ./target/debug/wardyn run -- bash    # smoke-test observation
 ```
 
 ## Before you open a PR
@@ -48,11 +48,11 @@ Keep the build **warning-free**, including the eBPF crate.
 
 ## What to know about the codebase
 
-- `leash/` — userspace: arg parsing, policy loading, map population, ring-buffer
+- `wardyn/` — userspace: arg parsing, policy loading, map population, ring-buffer
   drain, TUI / plain feed, JSONL audit log.
-- `leash-ebpf/` — the eBPF programs (tracepoints for observation; cgroup + LSM
+- `wardyn-ebpf/` — the eBPF programs (tracepoints for observation; cgroup + LSM
   hooks for enforcement). `#![no_std]`, verifier-constrained — read the comments.
-- `leash-common/` — dependency-free types shared across the kernel/user boundary.
+- `wardyn-common/` — dependency-free types shared across the kernel/user boundary.
 - `policy.rs` is the single source of truth for policy semantics and is
   **unit-tested**. If you change how rules resolve, add or update a test there.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the toolchain to build Leash (aya eBPF, pure Rust) on Ubuntu 24.04.
+# Install the toolchain to build Wardyn (aya eBPF, pure Rust) on Ubuntu 24.04.
 #   ./setup-vm.sh
 set -euo pipefail
 

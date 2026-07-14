@@ -1,12 +1,12 @@
-# Leash — Architecture
+# Wardyn — Architecture
 
-**Leash** watches an AI coding agent's process tree from the Linux kernel using eBPF,
+**Wardyn** watches an AI coding agent's process tree from the Linux kernel using eBPF,
 and enforces a policy on what that tree may read, execute, and connect to — in real time,
 at the syscall/LSM boundary, *before* the action completes.
 
 > Threat model: you run an autonomous agent (Claude Code, an MCP tool, a CI job) that can
 > execute arbitrary code. You want it to build your project — not read `~/.ssh`, exfiltrate
-> `.env` to an unknown IP, or spawn a reverse shell. Leash is the seatbelt.
+> `.env` to an unknown IP, or spawn a reverse shell. Wardyn is the seatbelt.
 
 ## Why the kernel
 
@@ -32,14 +32,14 @@ Two independent enforcement paths on purpose:
 
 ## Process-tree tracking
 
-Leash is scoped to *one* agent invocation, not the whole host:
+Wardyn is scoped to *one* agent invocation, not the whole host:
 
-1. Userspace launches the target: `leash run -- claude ...`, capturing the child PID as the **root**.
+1. Userspace launches the target: `wardyn run -- claude ...`, capturing the child PID as the **root**.
 2. eBPF keeps a `watched: HashMap<pid, ()>` seeded with the root.
 3. On `sched_process_fork`, if the parent is watched, the child is added.
 4. Every observe/enforce hook first checks `watched.contains(pid)` — unwatched processes are ignored.
 
-This makes Leash safe to run on a shared machine: it only constrains the subtree you launched.
+This makes Wardyn safe to run on a shared machine: it only constrains the subtree you launched.
 
 ## Event flow
 
@@ -67,12 +67,12 @@ ordered list; **first match wins**; `default_action` is the fallback. Actions: `
 ## Crate layout
 
 ```
-leash-common/   no_std, #[repr(C)] event & verdict structs shared kernel↔user
-leash-ebpf/     no_std no_main; the eBPF programs (target bpfel-unknown-none)
-leash/          userspace: loader, RingBuf reader, policy compiler, ratatui TUI, audit log
+wardyn-common/   no_std, #[repr(C)] event & verdict structs shared kernel↔user
+wardyn-ebpf/     no_std no_main; the eBPF programs (target bpfel-unknown-none)
+wardyn/          userspace: loader, RingBuf reader, policy compiler, ratatui TUI, audit log
 ```
 Built with [aya](https://aya-rs.dev) (pure-Rust eBPF — no libbpf/C toolchain). eBPF crate is
-compiled by `leash`'s `build.rs` via `aya-build`.
+compiled by `wardyn`'s `build.rs` via `aya-build`.
 
 ## Platform matrix
 
@@ -88,7 +88,7 @@ Dev target: **Ubuntu 24.04 VM with BPF LSM enabled** — full observe + full blo
 
 Gated on `WATCHED` membership + `CONFIG[enforce]`, so it only ever touches the
 launched subtree, and only under `--enforce`. Because `WATCHED` is seeded only in
-`run` mode, `--enforce` requires `leash run -- <cmd>`; `--enforce --all` is refused
+`run` mode, `--enforce` requires `wardyn run -- <cmd>`; `--enforce --all` is refused
 (system-wide blocking is out of scope, and would otherwise enforce *nothing* while
 claiming to).
 

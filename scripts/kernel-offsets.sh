@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Print the kernel struct field offsets that leash-ebpf hardcodes for the LSM
+# Print the kernel struct field offsets that wardyn-ebpf hardcodes for the LSM
 # file_open matcher (FILE_DENTRY_OFF etc.). aya-ebpf 0.1 ships opaque kernel
 # structs and no bpf_d_path, so the matcher reads dentry fields at fixed offsets.
 # Re-run on a new kernel; if these differ, update the *_OFF consts in
-# leash-ebpf/src/main.rs. Needs `dwarves` (pahole) and kernel BTF.
+# wardyn-ebpf/src/main.rs. Needs `dwarves` (pahole) and kernel BTF.
 set -euo pipefail
 V=/sys/kernel/btf/vmlinux
 echo "kernel: $(uname -r)"

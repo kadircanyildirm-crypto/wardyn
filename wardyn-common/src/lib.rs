@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Types shared between the eBPF programs (`leash-ebpf`) and userspace (`leash`).
+//! Types shared between the eBPF programs (`wardyn-ebpf`) and userspace (`wardyn`).
 //!
 //! `#![no_std]` so it links into the eBPF object; it also compiles under std,
 //! so userspace uses the exact same layout. Every type crossing the boundary is

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enable the BPF LSM so Leash can *block* file opens and exec (LSM file_open /
+# Enable the BPF LSM so Wardyn can *block* file opens and exec (LSM file_open /
 # bprm_check_security). Network blocking (cgroup/connect) does NOT need this.
 #
 # Ubuntu ships CONFIG_BPF_LSM=y but does not activate bpf in the LSM stack by
@@ -25,11 +25,11 @@ echo "Target: lsm=$WANT"
 # Undo any earlier direct edit to /etc/default/grub (older versions of this script).
 [[ -f /etc/default/grub.bak ]] && cp /etc/default/grub.bak /etc/default/grub
 
-cat > /etc/default/grub.d/99-leash-lsm.cfg <<EOF
-# Added by Leash: activate the BPF LSM (see scripts/enable-bpf-lsm.sh)
+cat > /etc/default/grub.d/99-wardyn-lsm.cfg <<EOF
+# Added by Wardyn: activate the BPF LSM (see scripts/enable-bpf-lsm.sh)
 GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT lsm=${WANT}"
 EOF
-echo "Wrote /etc/default/grub.d/99-leash-lsm.cfg"
+echo "Wrote /etc/default/grub.d/99-wardyn-lsm.cfg"
 
 update-grub
 echo

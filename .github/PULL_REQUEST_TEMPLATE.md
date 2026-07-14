@@ -1,4 +1,4 @@
-<!-- Thanks for contributing to Leash! -->
+<!-- Thanks for contributing to Wardyn! -->
 
 ## What & why
 

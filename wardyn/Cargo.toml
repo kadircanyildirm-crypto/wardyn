@@ -1,18 +1,18 @@
 [package]
-name = "leash"
+name = "wardyn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "A kernel-level leash for AI coding agents — eBPF watches every file, exec, and network connection an agent makes, and blocks policy violations in real time."
+description = "A kernel-level wardyn for AI coding agents — eBPF watches every file, exec, and network connection an agent makes, and blocks policy violations in real time."
 keywords = ["ebpf", "security", "sandbox", "bpf", "agent"]
 categories = ["command-line-utilities", "development-tools", "os::linux-apis"]
 
 [dependencies]
 aya = { workspace = true }
-leash-common = { workspace = true }
+wardyn-common = { workspace = true }
 anyhow = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt", "signal", "net", "process", "time"] }
 ratatui = "0.29"
@@ -32,5 +32,5 @@ aya-build = "0.2"
 anyhow = { workspace = true }
 
 [[bin]]
-name = "leash"
+name = "wardyn"
 path = "src/main.rs"

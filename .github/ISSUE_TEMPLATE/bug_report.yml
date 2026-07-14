@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a problem with Leash (observation, policy, or enforcement)
+description: Report a problem with Wardyn (observation, policy, or enforcement)
 labels: ["bug"]
 body:
   - type: markdown
@@ -11,8 +11,8 @@ body:
     id: what-happened
     attributes:
       label: What happened?
-      description: What did you expect, and what did Leash do instead?
-      placeholder: e.g. "leash --enforce did not block a read of .env"
+      description: What did you expect, and what did Wardyn do instead?
+      placeholder: e.g. "wardyn --enforce did not block a read of .env"
     validations:
       required: true
   - type: textarea
@@ -21,7 +21,7 @@ body:
       label: Steps to reproduce
       description: The exact command(s), and the policy if it's not the default.
       placeholder: |
-        1. sudo leash --enforce run -- bash
+        1. sudo wardyn --enforce run -- bash
         2. cat .env
       render: shell
     validations:
@@ -47,13 +47,13 @@ body:
   - type: input
     id: version
     attributes:
-      label: Leash version / commit
-      description: Output of `leash --version`, or the git SHA you built from.
+      label: Wardyn version / commit
+      description: Output of `wardyn --version`, or the git SHA you built from.
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
       label: Relevant output / audit log
-      description: Startup warnings, the feed line(s), or `leash-audit.jsonl` entries.
+      description: Startup warnings, the feed line(s), or `wardyn-audit.jsonl` entries.
       render: shell

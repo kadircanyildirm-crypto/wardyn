@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Generates a clean allow / warn / block mix so the Leash TUI (and audit log)
-# have something to show. Runs ~9s and exits (Leash auto-quits when it does).
+# Generates a clean allow / warn / block mix so the Wardyn TUI (and audit log)
+# have something to show. Runs ~9s and exits (Wardyn auto-quits when it does).
 #
-#   sudo /path/to/leash run -- bash scripts/demo.sh
+#   sudo /path/to/wardyn run -- bash scripts/demo.sh
 set -u
 
-DEMO="${HOME}/leash-demo"
+DEMO="${HOME}/wardyn-demo"
 mkdir -p "$DEMO" "${HOME}/.ssh"
 echo "SECRET_API_KEY=sk-demo-not-real"      > "$DEMO/.env"
 echo "//registry.npmjs.org/:_authToken=xx" > "${HOME}/.npmrc"

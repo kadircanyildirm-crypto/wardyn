@@ -1,22 +1,22 @@
 [workspace]
 resolver = "2"
-members = ["leash", "leash-common", "leash-ebpf"]
-# leash-ebpf is built for the BPF target by leash/build.rs (aya-build), not by a
+members = ["wardyn", "wardyn-common", "wardyn-ebpf"]
+# wardyn-ebpf is built for the BPF target by wardyn/build.rs (aya-build), not by a
 # normal host `cargo build`, so keep it out of the default set.
-default-members = ["leash", "leash-common"]
+default-members = ["wardyn", "wardyn-common"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 authors = ["kadircanyildirm-crypto"]
-repository = "https://github.com/kadircanyildirm-crypto/leash"
-homepage = "https://github.com/kadircanyildirm-crypto/leash"
+repository = "https://github.com/kadircanyildirm-crypto/wardyn"
+homepage = "https://github.com/kadircanyildirm-crypto/wardyn"
 
 [workspace.dependencies]
 aya = { version = "0.13" }
 aya-log = { version = "0.2" }
 aya-ebpf = { version = "0.1" }
 aya-log-ebpf = { version = "0.1" }
-leash-common = { path = "leash-common" }
+wardyn-common = { path = "wardyn-common" }
 anyhow = "1"

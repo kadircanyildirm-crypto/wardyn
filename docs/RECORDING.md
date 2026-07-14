@@ -1,7 +1,7 @@
 # Recording the demo GIF
 
-The README references `docs/leash-demo.gif`. Record it **inside the Leash VM** (a
-real terminal, so the TUI renders), then drop the file at `docs/leash-demo.gif`
+The README references `docs/wardyn-demo.gif`. Record it **inside the Wardyn VM** (a
+real terminal, so the TUI renders), then drop the file at `docs/wardyn-demo.gif`
 and uncomment the `<img>` in `README.md`.
 
 A good ~20s script: launch an agent-like workload under `--enforce` and let the
@@ -9,7 +9,7 @@ viewer watch `.env` / `.ssh` reads and unknown-IP connects turn red.
 
 ```bash
 # in the VM, a real terminal:
-sudo ./target/release/leash --enforce run -- bash scripts/demo.sh
+sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh
 ```
 
 ## Option A — asciinema + agg (crisp, small)
@@ -18,8 +18,8 @@ sudo ./target/release/leash --enforce run -- bash scripts/demo.sh
 sudo apt-get install -y asciinema
 cargo install --git https://github.com/asciinema/agg   # or grab a release binary
 
-asciinema rec demo.cast -c 'sudo ./target/release/leash --enforce run -- bash scripts/demo.sh'
-agg --font-size 22 --theme monokai demo.cast docs/leash-demo.gif
+asciinema rec demo.cast -c 'sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh'
+agg --font-size 22 --theme monokai demo.cast docs/wardyn-demo.gif
 ```
 
 ## Option B — VHS (scripted, deterministic)
@@ -28,11 +28,11 @@ agg --font-size 22 --theme monokai demo.cast docs/leash-demo.gif
 `.tape` script — reproducible, no manual timing. A starting `demo.tape`:
 
 ```tape
-Output docs/leash-demo.gif
+Output docs/wardyn-demo.gif
 Set FontSize 22
 Set Width 1200
 Set Height 700
-Type "sudo ./target/release/leash --enforce run -- bash scripts/demo.sh"
+Type "sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh"
 Enter
 Sleep 10s
 ```

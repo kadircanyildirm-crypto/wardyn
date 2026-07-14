@@ -38,15 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--enforce --all` claimed enforcement but denied nothing** (the deny hooks gate
   on `WATCHED`, which is empty outside `run` mode). `--enforce` now requires
   `run -- <cmd>`; the combination is refused instead of silently no-op.
-- **Options after the mode keyword were silently dropped** (`leash --all --enforce`
+- **Options after the mode keyword were silently dropped** (`wardyn --all --enforce`
   ran observe-only). A flag following `--all` is now a hard error.
 - **Trailing ring-buffer events were lost** when the child exited: both the TUI and
   plain loops now drain the ring one final time, so a secret read immediately before
   exit is still shown and audited.
-- **`leash_exit` used the thread id, not the tgid**, so a worker thread's exit could
+- **`wardyn_exit` used the thread id, not the tgid**, so a worker thread's exit could
   evict an unrelated watched process (pid/tgid share one number space). It now acts
   only on the leader's exit and removes by tgid.
-- **leash policed itself** under `--enforce`: its own pid was seeded into `WATCHED`
+- **wardyn policed itself** under `--enforce`: its own pid was seeded into `WATCHED`
   to bootstrap fork-adoption and never removed. It is now dropped once the child is
   tracked, keeping enforcement scoped to the agent subtree.
 - Corrected the `ARCHITECTURE.md` hook map (observe hooks are the `sys_enter_*`
@@ -73,4 +73,4 @@ First working milestones (M1–M3):
   network-only enforcement when BPF LSM is unavailable.
 - Ready-made policy presets (`policies/permissive.yaml`, `policies/strict.yaml`).
 
-[Unreleased]: https://github.com/kadircanyildirm-crypto/leash/compare/main...HEAD
+[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/main...HEAD

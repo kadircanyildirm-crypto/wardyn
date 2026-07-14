@@ -1,4 +1,4 @@
-# Leash task runner. Install `just`: https://github.com/casey/just
+# Wardyn task runner. Install `just`: https://github.com/casey/just
 # Run `just` with no args to list recipes.
 set shell := ["bash", "-uc"]
 
@@ -11,15 +11,15 @@ build:
 
 # Observe an agent's subtree — no blocking.
 run *args:
-    sudo ./target/release/leash run -- {{ args }}
+    sudo ./target/release/wardyn run -- {{ args }}
 
 # Enforce the policy on an agent's subtree (blocks violations).
 enforce *args:
-    sudo ./target/release/leash --enforce run -- {{ args }}
+    sudo ./target/release/wardyn --enforce run -- {{ args }}
 
 # Run the bundled demo (a clean allow / warn / block mix).
 demo:
-    sudo ./target/release/leash --enforce run -- bash scripts/demo.sh
+    sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh
 
 # Policy unit tests.
 test:

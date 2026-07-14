@@ -1,6 +1,6 @@
 # Permissive preset — never blocks; flags sensitive access as `warn` so you can
 # see what an agent touches before locking it down. A safe first run:
-#   sudo leash --policy policies/permissive.yaml run -- <agent>
+#   sudo wardyn --policy policies/permissive.yaml run -- <agent>
 # (drop --enforce, or keep it: nothing here is `block`, so nothing is denied)
 version: 1
 default_action: allow
