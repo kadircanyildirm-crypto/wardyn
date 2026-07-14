@@ -154,12 +154,27 @@ the receipt never claims a denial the kernel didn't make. Known gap: UDP
 `sendmsg()` destinations are enforce-only (not observed), so those denials can't
 be receipted.
 
+### Approve-once exceptions (TUI)
+
+Under `--enforce`, `a` in the TUI offers to allow the most recent kernel denial.
+The confirm prompt states the TRUE blast radius — the kernel matches bare
+basenames / addresses, so the honest unit is "ANY file named `.env`" or "ALL
+egress to 1.1.1.1", never "just this file" — and `y` applies the exception to
+the kernel map (remove the block key / insert a most-specific LPM allow) and to
+the userspace mirror in the same breath, so the feed never keeps claiming a
+denial the kernel stopped making (such rows show `excep`, with the granted key
+in the rule column). The grant lands in the audit log (an override is part of
+the security record) and in the agent's receipt as an `exception` record ("you
+may retry"), closing the deny → report → approve → retry loop without
+restarting the agent. The trust boundary is the keyboard: only a human at the
+terminal can grant. Exceptions live for this run only; nothing is persisted.
+
 ## Roadmap
 
 - [x] **M1 — Observe:** exec + openat + connect for the watched tree → live TUI.
 - [x] **M2 — Policy/warn:** `policy.yaml` compiled to matchers, violations coloured, JSONL audit.
 - [x] **M3 — Block:** network via cgroup/connect + file & exec via LSM.
 - [ ] **M4 — Ship:** demo GIF, presets, `--dry-run`, IPv6 egress, CI devcontainer.
-- [ ] **M5 — Agent feedback:** denial receipts ✓ (`WARDYN_DENIALS`); next:
-  approve-once exceptions from the TUI, persistent overrides kept outside the
-  watched tree's reach.
+- [ ] **M5 — Agent feedback:** denial receipts ✓ (`WARDYN_DENIALS`);
+  approve-once exceptions from the TUI ✓; next: persistent overrides kept
+  outside the watched tree's reach.

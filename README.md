@@ -90,7 +90,9 @@ sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh
 
 Renders a live TUI when attached to a terminal; pipe it (or pass `--plain`) for a
 plain table. `--policy <file>`, `--audit <file>` and `--denials <file>` override
-the defaults.
+the defaults. In the TUI, `q` quits; under `--enforce`, `a` grants an
+approve-once exception for the last denial (with a y/n confirm that names the
+true scope).
 
 ## Policy
 
@@ -149,6 +151,15 @@ even scribble on) it, but enforcement lives in kernel maps and root-owned policy
 it cannot reach. Only real kernel denials are receipted — warns and
 observe-only `block~` flags never appear. `--denials <path>` overrides the
 default location (`/tmp/wardyn-denials-<pid>.jsonl`).
+
+The loop closes from your side too: in the enforcing TUI, `a` offers to allow
+the most recent denial. The confirm prompt states the **real blast radius** —
+"ALL egress to 1.1.1.1", "ANY file named `.env`" — because the kernel matches
+bare names and addresses, and wardyn won't pretend an exception is narrower
+than it is. On `y` the kernel map and the feed's mirror update together, and an
+`exception` record lands in the agent's receipt: *you may retry*. Deny →
+report → approve → retry, without restarting the agent. Exceptions last for
+the run only.
 
 ## How it works
 
@@ -209,8 +220,8 @@ Full design, hook map, and the eBPF-verifier war stories are in
   & blocked execs (LSM).
 - [ ] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓, presets ✓)_
 - [ ] **M5 — Agent feedback:** the agent learns what was denied and why, instead
-  of flailing at a bare `EPERM`. _(denial receipts ✓)_ Next: approve-once
-  exceptions from the TUI, persistent overrides kept outside the watched tree's
+  of flailing at a bare `EPERM`. _(denial receipts ✓, approve-once exceptions
+  from the TUI ✓)_ Next: persistent overrides kept outside the watched tree's
   reach.
 
 ## Contributing

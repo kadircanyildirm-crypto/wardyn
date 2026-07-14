@@ -39,10 +39,10 @@ use aya::Btf;
 use log::info;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
-use wardyn_common::{kind, Event, NAME_LEN, PATH_LEN};
+use wardyn_common::{action, kind, Event, NAME_LEN, PATH_LEN};
 
 use crate::audit::Audit;
-use crate::policy::{Action, Policy, Verdict};
+use crate::policy::{Action, DenialKey, Exceptions, Policy, Verdict};
 use crate::receipt::Receipt;
 
 /// Userspace mirror of `wardyn_common::NameKey` (identical C layout) carrying a
@@ -68,6 +68,102 @@ const CFG_HS_NONCE: u32 = 3;
 const CFG_HS_TGID: u32 = 4;
 const CFG_FORK_PARENT_OFF: u32 = 5;
 const CFG_FORK_CHILD_OFF: u32 = 6;
+
+/// The live kernel enforcement maps, held for the whole run (not dropped after
+/// population) so the TUI can grant approve-once exceptions while the target
+/// is still running: remove a block key, or insert a most-specific allow route.
+pub(crate) struct KernelMaps {
+    names: BpfHashMap<MapData, NameKey, u8>,
+    dirs: BpfHashMap<MapData, NameKey, u8>,
+    execs: BpfHashMap<MapData, NameKey, u8>,
+    net4: LpmTrie<MapData, u32, u32>,
+    net6: LpmTrie<MapData, Ip6Key, u32>,
+}
+
+impl KernelMaps {
+    /// Take the enforcement maps from the loaded object and compile the policy
+    /// into them. Must run AFTER all program attaches (map relocation).
+    fn load(ebpf: &mut aya::Ebpf, policy: &Policy) -> anyhow::Result<KernelMaps> {
+        let mut net4: LpmTrie<_, u32, u32> =
+            LpmTrie::try_from(ebpf.take_map("NET_RULES").context("NET_RULES")?)?;
+        for (plen, data, act) in policy.net_entries() {
+            net4.insert(&Key::new(plen, data), act, 0)
+                .context("populating NET_RULES")?;
+        }
+        let mut net6: LpmTrie<_, Ip6Key, u32> =
+            LpmTrie::try_from(ebpf.take_map("NET_RULES6").context("NET_RULES6")?)?;
+        for (plen, data, act) in policy.net_entries6() {
+            net6.insert(&Key::new(plen, Ip6Key(data)), act, 0)
+                .context("populating NET_RULES6")?;
+        }
+        let (name_keys, dir_keys) = policy.file_enforcement();
+        let mut names: BpfHashMap<_, NameKey, u8> =
+            BpfHashMap::try_from(ebpf.take_map("BLOCK_NAMES").context("BLOCK_NAMES")?)?;
+        for k in name_keys {
+            names
+                .insert(NameKey(k), 1u8, 0)
+                .context("populating BLOCK_NAMES")?;
+        }
+        let mut dirs: BpfHashMap<_, NameKey, u8> =
+            BpfHashMap::try_from(ebpf.take_map("BLOCK_DIRS").context("BLOCK_DIRS")?)?;
+        for k in dir_keys {
+            dirs.insert(NameKey(k), 1u8, 0)
+                .context("populating BLOCK_DIRS")?;
+        }
+        let mut execs: BpfHashMap<_, NameKey, u8> =
+            BpfHashMap::try_from(ebpf.take_map("BLOCK_EXEC").context("BLOCK_EXEC")?)?;
+        for k in policy.exec_enforcement() {
+            execs
+                .insert(NameKey(k), 1u8, 0)
+                .context("populating BLOCK_EXEC")?;
+        }
+        Ok(KernelMaps {
+            names,
+            dirs,
+            execs,
+            net4,
+            net6,
+        })
+    }
+
+    /// Make the kernel stop denying `key` for the rest of this run. File/exec
+    /// exceptions remove the basename/dir from the block map; network
+    /// exceptions insert a most-specific allow (/32 or /128) that outranks any
+    /// blocking CIDR in the LPM trie.
+    pub(crate) fn apply_exception(&mut self, key: &DenialKey) -> anyhow::Result<()> {
+        fn drop_name(map: &mut BpfHashMap<MapData, NameKey, u8>, name: &str) -> anyhow::Result<()> {
+            let bytes = policy::name_key(name).context("name not kernel-mappable")?;
+            map.remove(&NameKey(bytes)).context("removing block key")
+        }
+        match key {
+            DenialKey::FileName(n) => drop_name(&mut self.names, n),
+            DenialKey::FileDir(d) => drop_name(&mut self.dirs, d),
+            DenialKey::Exec(n) => drop_name(&mut self.execs, n),
+            DenialKey::Net4(ip) => self
+                .net4
+                .insert(
+                    &Key::new(32, u32::from_le_bytes(ip.octets())),
+                    action::ALLOW,
+                    0,
+                )
+                .context("inserting /32 allow"),
+            DenialKey::Net6(ip) => self
+                .net6
+                .insert(&Key::new(128, Ip6Key(ip.octets())), action::ALLOW, 0)
+                .context("inserting /128 allow"),
+        }
+    }
+}
+
+/// Everything the event loops need to evaluate, record, and (from the TUI)
+/// grant exceptions — bundled so signatures stay sane.
+pub(crate) struct RunCtx<'a> {
+    pub policy: &'a Policy,
+    pub audit: &'a mut Audit,
+    pub receipt: Option<&'a mut Receipt>,
+    pub maps: &'a mut KernelMaps,
+    pub enforce: bool,
+}
 
 pub(crate) enum Mode {
     All,
@@ -468,42 +564,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    {
-        let mut net: LpmTrie<_, u32, u32> =
-            LpmTrie::try_from(ebpf.take_map("NET_RULES").context("NET_RULES")?)?;
-        for (plen, data, act) in policy.net_entries() {
-            net.insert(&Key::new(plen, data), act, 0)
-                .context("populating NET_RULES")?;
-        }
-        let mut net6: LpmTrie<_, Ip6Key, u32> =
-            LpmTrie::try_from(ebpf.take_map("NET_RULES6").context("NET_RULES6")?)?;
-        for (plen, data, act) in policy.net_entries6() {
-            net6.insert(&Key::new(plen, Ip6Key(data)), act, 0)
-                .context("populating NET_RULES6")?;
-        }
-    }
-
-    {
-        let (names, dirs) = policy.file_enforcement();
-        let mut bn: BpfHashMap<_, NameKey, u8> =
-            BpfHashMap::try_from(ebpf.take_map("BLOCK_NAMES").context("BLOCK_NAMES")?)?;
-        for k in names {
-            bn.insert(NameKey(k), 1u8, 0)
-                .context("populating BLOCK_NAMES")?;
-        }
-        let mut bd: BpfHashMap<_, NameKey, u8> =
-            BpfHashMap::try_from(ebpf.take_map("BLOCK_DIRS").context("BLOCK_DIRS")?)?;
-        for k in dirs {
-            bd.insert(NameKey(k), 1u8, 0)
-                .context("populating BLOCK_DIRS")?;
-        }
-        let mut be: BpfHashMap<_, NameKey, u8> =
-            BpfHashMap::try_from(ebpf.take_map("BLOCK_EXEC").context("BLOCK_EXEC")?)?;
-        for k in policy.exec_enforcement() {
-            be.insert(NameKey(k), 1u8, 0)
-                .context("populating BLOCK_EXEC")?;
-        }
-    }
+    // Kept alive for the whole run so the TUI can grant exceptions into them.
+    let mut kernel_maps = KernelMaps::load(&mut ebpf, &policy)?;
 
     let ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("EVENTS")?)?;
     let async_fd = AsyncFd::new(ring)?;
@@ -544,27 +606,17 @@ async fn main() -> anyhow::Result<()> {
         info!("watching exec/open/connect system-wide; Ctrl-C to stop");
     }
 
+    let mut ctx = RunCtx {
+        policy: &policy,
+        audit: &mut audit,
+        receipt: receipt.as_mut(),
+        maps: &mut kernel_maps,
+        enforce: opts.enforce,
+    };
     let result = if use_tui {
-        tui::run(
-            async_fd,
-            child,
-            opts.mode.label(),
-            &policy,
-            &mut audit,
-            receipt.as_mut(),
-            opts.enforce,
-        )
-        .await
+        tui::run(async_fd, child, opts.mode.label(), &mut ctx).await
     } else {
-        run_plain(
-            async_fd,
-            child,
-            &policy,
-            &mut audit,
-            receipt.as_mut(),
-            opts.enforce,
-        )
-        .await
+        run_plain(async_fd, child, &mut ctx).await
     };
 
     eprintln!(
@@ -583,13 +635,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Plain line-printer used when stdout is not a terminal (pipes, CI, `--plain`).
+/// No interactivity, so no exceptions can be granted here.
 async fn run_plain(
     mut async_fd: AsyncFd<RingBuf<MapData>>,
     mut child: Option<Child>,
-    policy: &Policy,
-    audit: &mut Audit,
-    mut receipt: Option<&mut Receipt>,
-    enforce: bool,
+    ctx: &mut RunCtx<'_>,
 ) -> anyhow::Result<()> {
     println!(
         "{:<7} {:<15} {:<8} {:<6} DETAIL",
@@ -605,6 +655,8 @@ async fn run_plain(
             d.shown()
         );
     }
+    let enforce = ctx.enforce;
+    let exceptions = Exceptions::default();
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -614,7 +666,7 @@ async fn run_plain(
             }
             guard = async_fd.readable_mut() => {
                 let mut guard = guard?;
-                drain(guard.get_inner_mut(), policy, audit, receipt.as_deref_mut(), enforce, |d| print(d, enforce));
+                drain(guard.get_inner_mut(), ctx, &exceptions, |d| print(d, enforce));
                 guard.clear_ready();
             }
         }
@@ -622,9 +674,7 @@ async fn run_plain(
     // The exit/Ctrl-C branch can win the select while events still sit in the
     // ring (e.g. a secret read immediately before the child exits). Sweep once
     // more so those final events are shown and audited, not dropped.
-    drain(async_fd.get_mut(), policy, audit, receipt, enforce, |d| {
-        print(d, enforce)
-    });
+    drain(async_fd.get_mut(), ctx, &exceptions, |d| print(d, enforce));
     Ok(())
 }
 
@@ -639,12 +689,19 @@ pub(crate) struct Desc {
     pub action: Action,
     pub rule: String,
     pub enforceable: bool,
+    /// The kernel key this event was denied on, when it was — the unit an
+    /// approve-once exception operates at (offered by the TUI on `a`).
+    pub denial_key: Option<DenialKey>,
+    /// The operator granted an exception covering this event: the kernel
+    /// allowed it even though the policy objects (or used to).
+    pub excepted: bool,
 }
 
 impl Desc {
-    /// Detail annotated with the matched rule when it's a violation.
+    /// Detail annotated with the matched rule when it's a violation (or an
+    /// exception, where the rule string carries the granted key).
     pub fn shown(&self) -> String {
-        if self.action == Action::Allow {
+        if self.action == Action::Allow && !self.excepted {
             self.detail.clone()
         } else {
             format!("{}  [{}]", self.detail, self.rule)
@@ -653,8 +710,11 @@ impl Desc {
 
     /// ACT column text, honest about enforcement: `BLOCK` = kernel-denied,
     /// `block~` = flagged under --enforce but the rule can't be enforced,
-    /// `block` = observe-only.
+    /// `block` = observe-only, `excep` = allowed by an operator exception.
     pub fn act(&self, enforce: bool) -> &'static str {
+        if self.excepted {
+            return "excep";
+        }
         match self.action {
             Action::Allow => "ok",
             Action::Warn => "warn",
@@ -677,19 +737,18 @@ impl Desc {
 /// the buffer, so a plain `next()` loop drains them.
 pub(crate) fn drain(
     ring: &mut RingBuf<MapData>,
-    policy: &Policy,
-    audit: &mut Audit,
-    mut receipt: Option<&mut Receipt>,
-    enforce: bool,
+    ctx: &mut RunCtx<'_>,
+    exceptions: &Exceptions,
     mut sink: impl FnMut(Desc),
 ) {
+    let enforce = ctx.enforce;
     while let Some(item) = ring.next() {
         if let Some(d) = parse_event(&item)
             .as_ref()
-            .and_then(|ev| describe(ev, policy, enforce))
+            .and_then(|ev| describe(ev, ctx.policy, enforce, exceptions))
         {
             if d.action != Action::Allow {
-                let _ = audit.record(
+                let _ = ctx.audit.record(
                     d.pid,
                     &d.comm,
                     d.label,
@@ -701,7 +760,7 @@ pub(crate) fn drain(
                 // The receipt is the agent's view: only what the kernel really
                 // denied belongs there — not warns, not unenforced `block~`.
                 if d.denied(enforce) {
-                    if let Some(r) = receipt.as_deref_mut() {
+                    if let Some(r) = ctx.receipt.as_deref_mut() {
                         let _ = r.record(d.pid, &d.comm, d.label, &d.detail, &d.rule);
                     }
                 }
@@ -719,27 +778,66 @@ pub(crate) fn parse_event(bytes: &[u8]) -> Option<Event> {
     Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const Event) })
 }
 
-pub(crate) fn describe(ev: &Event, policy: &Policy, enforce: bool) -> Option<Desc> {
-    let (label, detail, verdict) = match ev.kind {
+pub(crate) fn describe(
+    ev: &Event,
+    policy: &Policy,
+    enforce: bool,
+    exc: &Exceptions,
+) -> Option<Desc> {
+    let (label, detail, verdict, denial_key, excepted) = match ev.kind {
         kind::EXEC => {
             let d = event_path(ev);
-            let v = reconcile(policy.eval_exec(&d), enforce, policy.kernel_exec_denial(&d));
-            ("exec", d, v)
+            let (v, key, ex) = reconcile(
+                policy.eval_exec(&d),
+                enforce,
+                policy.kernel_exec_denial(&d),
+                exc,
+            );
+            ("exec", d, v, key, ex)
         }
         kind::OPEN => {
             let d = event_path(ev);
-            let v = reconcile(policy.eval_file(&d), enforce, policy.kernel_file_denial(&d));
-            ("open", d, v)
+            let (v, key, ex) = reconcile(
+                policy.eval_file(&d),
+                enforce,
+                policy.kernel_file_denial(&d),
+                exc,
+            );
+            ("open", d, v, key, ex)
         }
         kind::CONNECT => {
-            let (d, v) = if ev.family == AF_INET6 {
+            let (d, mut v, ip_key) = if ev.family == AF_INET6 {
                 let ip = Ipv6Addr::from(ev.daddr6);
-                (format!("[{ip}]:{}", ev.dport), policy.eval_connect6(ip))
+                (
+                    format!("[{ip}]:{}", ev.dport),
+                    policy.eval_connect6(ip),
+                    DenialKey::Net6(ip),
+                )
             } else {
                 let ip = Ipv4Addr::from(ev.daddr.to_ne_bytes());
-                (format!("{ip}:{}", ev.dport), policy.eval_connect(ip))
+                (
+                    format!("{ip}:{}", ev.dport),
+                    policy.eval_connect(ip),
+                    DenialKey::Net4(ip),
+                )
             };
-            ("connect", d, v)
+            // Network exceptions: the /32 (/128) allow the operator granted
+            // outranks the blocking CIDR in the kernel trie — mirror that.
+            let mut key = None;
+            let mut ex = false;
+            if v.action == Action::Block {
+                if enforce && exc.contains(&ip_key) {
+                    ex = true;
+                    v = Verdict {
+                        action: Action::Allow,
+                        rule: format!("{} → excepted {ip_key}", v.rule),
+                        enforceable: true,
+                    };
+                } else {
+                    key = Some(ip_key);
+                }
+            }
+            ("connect", d, v, key, ex)
         }
         _ => return None,
     };
@@ -752,27 +850,49 @@ pub(crate) fn describe(ev: &Event, policy: &Policy, enforce: bool) -> Option<Des
         action: verdict.action,
         rule: verdict.rule,
         enforceable: verdict.enforceable,
+        denial_key,
+        excepted,
     })
 }
 
 /// Reconcile the glob verdict against what the kernel's coarse basename/dir
 /// matcher will *actually* do under `--enforce`, so the feed never disagrees
 /// with the syscall's real outcome. `kernel_denial` is `Some(key)` when the LSM
-/// hook would return `-EPERM` for this exact path.
+/// hook would deny this exact path — unless the operator granted that key as an
+/// exception, in which case the kernel allows it again.
 ///
-/// Without enforcement the glob verdict stands (observe-only). With it, two
-/// divergences are corrected:
+/// Returns `(verdict, denial_key, excepted)`: `denial_key` is the key the TUI
+/// can offer to except (only when the kernel really denies), `excepted` marks
+/// rows covered by an already-granted exception.
+///
+/// Without enforcement the glob verdict stands (observe-only). With it, the
+/// corrected divergences are:
 ///   - glob said allow/warn but the kernel denies (a `block` glob reduced to a
 ///     bare basename over-blocks, e.g. `/etc/shadow` → any `shadow`): promote
 ///     to an enforced block so the row isn't a green `ok` for a denied open.
 ///   - glob said an *enforceable* block but the kernel won't deny this path
 ///     (e.g. `**/.ssh/**` matches a deep file whose immediate parent isn't
 ///     `.ssh`): demote to `block~` so we don't claim a `BLOCK` that never fired.
-fn reconcile(mut v: Verdict, enforce: bool, kernel_denial: Option<String>) -> Verdict {
+///   - the key is excepted: same demotion, but marked `excep` with the granted
+///     key in the rule, so the override is visible instead of a confusing
+///     `block~`.
+fn reconcile(
+    mut v: Verdict,
+    enforce: bool,
+    kernel_denial: Option<DenialKey>,
+    exc: &Exceptions,
+) -> (Verdict, Option<DenialKey>, bool) {
     if !enforce {
-        return v;
+        return (v, None, false);
     }
     match kernel_denial {
+        Some(key) if exc.contains(&key) => {
+            if v.action == Action::Block && v.enforceable {
+                v.enforceable = false;
+            }
+            v.rule = format!("{} → excepted {key}", v.rule);
+            (v, None, true)
+        }
         Some(key) => {
             if !(v.action == Action::Block && v.enforceable) {
                 v = Verdict {
@@ -781,14 +901,15 @@ fn reconcile(mut v: Verdict, enforce: bool, kernel_denial: Option<String>) -> Ve
                     enforceable: true,
                 };
             }
+            (v, Some(key), false)
         }
         None => {
             if v.action == Action::Block && v.enforceable {
                 v.enforceable = false;
             }
+            (v, None, false)
         }
     }
-    v
 }
 
 /// Byte offset of `field` in a tracefs event format file, e.g.
@@ -863,7 +984,43 @@ fn event_path(ev: &Event) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_format_offset;
+    use super::{parse_format_offset, reconcile};
+    use crate::policy::{Action, DenialKey, Exceptions, Verdict};
+
+    fn block(rule: &str, enforceable: bool) -> Verdict {
+        Verdict {
+            action: Action::Block,
+            rule: rule.into(),
+            enforceable,
+        }
+    }
+
+    #[test]
+    fn reconcile_offers_key_then_honours_exception() {
+        let mut exc = Exceptions::default();
+        let key = DenialKey::FileName(".env".into());
+        // Pre-grant: enforced BLOCK, key offered for the TUI to except.
+        let (v, k, ex) = reconcile(block("**/.env", true), true, Some(key.clone()), &exc);
+        assert_eq!(v.action, Action::Block);
+        assert!(v.enforceable && !ex);
+        assert_eq!(k, Some(key.clone()));
+        // Post-grant: kernel no longer denies — never claim a BLOCK; mark the
+        // override and stop offering the key.
+        exc.grant(key.clone());
+        let (v, k, ex) = reconcile(block("**/.env", true), true, Some(key), &exc);
+        assert!(ex && !v.enforceable && k.is_none());
+        assert!(v.rule.contains("excepted name=.env"));
+    }
+
+    #[test]
+    fn reconcile_without_enforce_is_passthrough() {
+        let exc = Exceptions::default();
+        let key = DenialKey::FileName(".env".into());
+        let (v, k, ex) = reconcile(block("**/.env", true), false, Some(key), &exc);
+        assert_eq!(v.action, Action::Block);
+        assert!(v.enforceable, "observe mode leaves the verdict untouched");
+        assert!(k.is_none() && !ex);
+    }
 
     /// Old layout (kernel 6.8): inline `char comm[16]` fields.
     const FORK_6_8: &str = "\

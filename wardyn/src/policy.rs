@@ -8,7 +8,8 @@
 //! This is the single source of truth for policy in warn-mode. Kernel-side
 //! *enforcement* (M3) will reuse these same rules to deny inline via cgroup/LSM
 //! hooks; keeping evaluation here (and unit-tested) pins the semantics first.
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
 
@@ -54,6 +55,70 @@ pub struct Verdict {
     /// exec globs that don't reduce to a basename/dir are observe-only (the feed
     /// flags them, but they are NOT enforced). Network blocks are always true.
     pub enforceable: bool,
+}
+
+/// The exact key the kernel's coarse matcher denies on — and therefore the
+/// exact unit an approve-once exception operates at. An exception can't be
+/// narrower than what the kernel matches, so this type is also the honest
+/// vocabulary for telling the operator what they are about to allow.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DenialKey {
+    /// LSM `file_open`: basename match (BLOCK_NAMES), e.g. `.env`.
+    FileName(String),
+    /// LSM `file_open`: immediate parent-dir match (BLOCK_DIRS), e.g. `.ssh`.
+    FileDir(String),
+    /// LSM `bprm_check`: exec basename match (BLOCK_EXEC), e.g. `nc`.
+    Exec(String),
+    /// cgroup connect/sendmsg: destination address (NET_RULES LPM trie).
+    Net4(Ipv4Addr),
+    Net6(Ipv6Addr),
+}
+
+impl DenialKey {
+    /// What granting this key REALLY allows, phrased for the confirm prompt.
+    /// The kernel matches by bare name / address, so the honest scope is
+    /// always broader than the single event the operator is looking at.
+    pub fn blast_radius(&self) -> String {
+        match self {
+            DenialKey::FileName(n) => format!("opening ANY file named `{n}` (any directory)"),
+            DenialKey::FileDir(d) => {
+                format!("opening ANY file directly inside a directory named `{d}`")
+            }
+            DenialKey::Exec(n) => format!("executing ANY program named `{n}` (any path)"),
+            DenialKey::Net4(ip) => format!("ALL egress to {ip} (any port/protocol)"),
+            DenialKey::Net6(ip) => format!("ALL egress to [{ip}] (any port/protocol)"),
+        }
+    }
+}
+
+impl fmt::Display for DenialKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DenialKey::FileName(n) => write!(f, "name={n}"),
+            DenialKey::FileDir(d) => write!(f, "dir={d}"),
+            DenialKey::Exec(n) => write!(f, "exec={n}"),
+            DenialKey::Net4(ip) => write!(f, "ip={ip}"),
+            DenialKey::Net6(ip) => write!(f, "ip=[{ip}]"),
+        }
+    }
+}
+
+/// Approve-once exceptions granted from the TUI — the userspace overlay that
+/// keeps the feed honest about keys the kernel no longer denies. The kernel
+/// maps are updated separately; `contains` must be consulted wherever the
+/// kernel matcher is mirrored, or the feed would keep claiming denials.
+#[derive(Default)]
+pub struct Exceptions(HashSet<DenialKey>);
+
+impl Exceptions {
+    /// Returns false if the key was already granted.
+    pub fn grant(&mut self, key: DenialKey) -> bool {
+        self.0.insert(key)
+    }
+
+    pub fn contains(&self, key: &DenialKey) -> bool {
+        self.0.contains(key)
+    }
 }
 
 // ── raw YAML shape ──────────────────────────────────────────────────────────
@@ -340,24 +405,24 @@ impl Policy {
     /// name `shadow` and therefore denies `/srv/app/shadow` too. Consult this
     /// (not just the glob) before reporting a verdict, otherwise the feed says
     /// `ok` for an open the kernel actually turned into `-EPERM`.
-    pub fn kernel_file_denial(&self, path: &str) -> Option<String> {
+    pub fn kernel_file_denial(&self, path: &str) -> Option<DenialKey> {
         let mut segs = path.rsplit('/').filter(|s| !s.is_empty());
         let name = segs.next()?;
         if self.kern_names.contains(name) {
-            return Some(format!("name={name}"));
+            return Some(DenialKey::FileName(name.to_string()));
         }
         let dir = segs.next()?;
         if self.kern_dirs.contains(dir) {
-            return Some(format!("dir={dir}"));
+            return Some(DenialKey::FileDir(dir.to_string()));
         }
         None
     }
 
     /// Same, for the LSM `bprm_check_security` hook (exec basenames).
-    pub fn kernel_exec_denial(&self, path: &str) -> Option<String> {
+    pub fn kernel_exec_denial(&self, path: &str) -> Option<DenialKey> {
         let name = last_segment(path)?;
         if self.kern_execs.contains(name) {
-            return Some(format!("name={name}"));
+            return Some(DenialKey::Exec(name.to_string()));
         }
         None
     }
@@ -510,8 +575,9 @@ fn file_key(pattern: &str) -> Option<(bool, [u8; NAME_LEN])> {
 }
 
 /// A literal path segment -> NUL-padded fixed key, or `None` if it contains glob
-/// metacharacters (those can't be enforced as an exact name).
-fn name_key(seg: &str) -> Option<[u8; NAME_LEN]> {
+/// metacharacters (those can't be enforced as an exact name). Also used by the
+/// exception path in main.rs to address the kernel block maps.
+pub(crate) fn name_key(seg: &str) -> Option<[u8; NAME_LEN]> {
     if seg == "**" || seg.chars().any(|c| matches!(c, '*' | '?' | '[' | ']')) {
         return None;
     }
@@ -685,8 +751,8 @@ exec:
         // ANYWHERE, even where the glob-based eval says allow.
         assert_eq!(p.eval_file("/home/u/shadow").action, Action::Allow);
         assert_eq!(
-            p.kernel_file_denial("/home/u/shadow").as_deref(),
-            Some("name=shadow")
+            p.kernel_file_denial("/home/u/shadow"),
+            Some(DenialKey::FileName("shadow".into()))
         );
         // `**/.ssh/**` keys on the parent dir `.ssh` — only the IMMEDIATE parent
         // is checked, so a deep file the glob still matches is NOT denied.
@@ -697,11 +763,34 @@ exec:
         assert_eq!(p.kernel_file_denial("/home/u/.ssh/sub/deep/id"), None);
         // A file directly in `.ssh` IS denied by the kernel.
         assert_eq!(
-            p.kernel_file_denial("/home/u/.ssh/id_ed25519").as_deref(),
-            Some("dir=.ssh")
+            p.kernel_file_denial("/home/u/.ssh/id_ed25519"),
+            Some(DenialKey::FileDir(".ssh".into()))
         );
         // `.env.*` is a glob segment: never a kernel key, so never denied here.
         assert_eq!(p.kernel_file_denial("/home/u/.env.local"), None);
+    }
+
+    #[test]
+    fn denial_key_display_and_blast_radius_are_honest() {
+        let k = DenialKey::FileName(".env".into());
+        assert_eq!(k.to_string(), "name=.env");
+        assert!(k.blast_radius().contains("ANY file named `.env`"));
+        let d = DenialKey::FileDir(".ssh".into());
+        assert_eq!(d.to_string(), "dir=.ssh");
+        assert!(d.blast_radius().contains("directory named `.ssh`"));
+        let n = DenialKey::Net4("1.1.1.1".parse().unwrap());
+        assert_eq!(n.to_string(), "ip=1.1.1.1");
+        assert!(n.blast_radius().contains("ALL egress to 1.1.1.1"));
+    }
+
+    #[test]
+    fn exceptions_grant_once() {
+        let mut exc = Exceptions::default();
+        let key = DenialKey::Exec("nc".into());
+        assert!(!exc.contains(&key));
+        assert!(exc.grant(key.clone()));
+        assert!(exc.contains(&key));
+        assert!(!exc.grant(key), "second grant reports already-granted");
     }
 
     #[test]
@@ -735,12 +824,12 @@ network:
     fn kernel_exec_denial_matches_basename() {
         let p = policy();
         assert_eq!(
-            p.kernel_exec_denial("/usr/bin/nc").as_deref(),
-            Some("name=nc")
+            p.kernel_exec_denial("/usr/bin/nc"),
+            Some(DenialKey::Exec("nc".into()))
         );
         assert_eq!(
-            p.kernel_exec_denial("/opt/tools/nc").as_deref(),
-            Some("name=nc")
+            p.kernel_exec_denial("/opt/tools/nc"),
+            Some(DenialKey::Exec("nc".into()))
         );
         assert_eq!(p.kernel_exec_denial("/usr/bin/curl"), None); // curl is warn
     }

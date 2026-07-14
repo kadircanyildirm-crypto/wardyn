@@ -27,8 +27,10 @@ const NOTE: &str = "Wardyn is a kernel-level policy warden supervising this proc
     retry or work around a denial — report the `rule` to the human operator, who \
     can adjust policy.yaml and re-run. `rule` is the policy pattern that fired; \
     `kernel:<key>` means the kernel's coarser basename/dir matcher denied beyond \
-    the written glob. Records may lag the syscall by a few milliseconds; UDP sent \
-    via sendmsg() can be denied without a record.";
+    the written glob. A line with event=\"exception\" means the operator granted \
+    an exception: the scope in `now_allowed` is permitted for the rest of this \
+    run, and you MAY retry the operation it covers. Records may lag the syscall \
+    by a few milliseconds; UDP sent via sendmsg() can be denied without a record.";
 
 pub struct Receipt {
     writer: BufWriter<File>,
@@ -91,6 +93,18 @@ impl Receipt {
         Ok(())
     }
 
+    /// Tell the agent the operator granted an exception: the denied operation
+    /// may now be retried. Not counted — `count()` stays denials-only.
+    pub fn record_exception(&mut self, key: &str, now_allowed: &str) -> Result<()> {
+        self.write_line(&serde_json::json!({
+            "ts": now(),
+            "event": "exception",
+            "key": key,
+            "now_allowed": now_allowed,
+            "note": "You may retry the operation this covers.",
+        }))
+    }
+
     /// One JSON object per line, flushed immediately: the agent reads this the
     /// moment its syscall fails, not at exit.
     fn write_line(&mut self, value: &serde_json::Value) -> Result<()> {
@@ -129,6 +143,26 @@ mod tests {
         assert_eq!(lines[1]["event"], "open");
         assert_eq!(lines[1]["detail"], "/home/u/.env");
         assert_eq!(lines[1]["rule"], "**/.env");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn exception_records_tell_the_agent_to_retry() {
+        let path =
+            std::env::temp_dir().join(format!("wardyn-receipt-exc-{}.jsonl", std::process::id()));
+        {
+            let mut r = Receipt::create(&path, "t", "p").unwrap();
+            r.record(1, "curl", "connect", "1.1.1.1:443", "cidr:0.0.0.0/0")
+                .unwrap();
+            r.record_exception("ip=1.1.1.1", "ALL egress to 1.1.1.1 (any port/protocol)")
+                .unwrap();
+            assert_eq!(r.count(), 1, "exceptions are not counted as denials");
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["event"], "exception");
+        assert_eq!(last["key"], "ip=1.1.1.1");
+        assert!(last["note"].as_str().unwrap().contains("retry"));
         std::fs::remove_file(&path).ok();
     }
 

@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule fired and report it to its operator instead of retrying, reaching for
   `sudo`, or coding around the block. `--denials <path>` overrides the location;
   only real kernel denials are receipted (never warns or observe-only `block~`).
+- **Approve-once exceptions from the TUI (M5).** Under `--enforce`, `a` offers
+  to allow the most recent kernel denial; the confirm prompt states the true
+  blast radius (the kernel matches bare basenames/addresses — "ANY file named
+  `.env`", "ALL egress to 1.1.1.1" — never "just this file"). `y` updates the
+  kernel map and the feed's userspace mirror together (such rows then show
+  `excep` instead of a false `BLOCK`), records the override in the audit log,
+  and appends an `exception` record to the agent's receipt so it knows it may
+  retry. The trust boundary is the keyboard; exceptions last for the run only.
 - UDP egress enforcement: `sendmsg4` / `sendmsg6` cgroup hooks gate connectionless
   traffic alongside `connect4` / `connect6`, reusing the same policy logic.
 - Observation for the syscall variants the enforce hooks also act on:

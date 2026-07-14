@@ -69,4 +69,19 @@ impl Audit {
         self.count += 1;
         Ok(())
     }
+
+    /// Record an operator-granted exception (from the TUI). Part of the
+    /// security record — an override matters at least as much as a violation —
+    /// but not counted as one.
+    pub fn record_exception(&mut self, key: &str, now_allowed: &str) -> Result<()> {
+        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let line = serde_json::json!({
+            "ts": ts,
+            "event": "exception",
+            "key": key,
+            "now_allowed": now_allowed,
+        });
+        writeln!(self.writer, "{line}").context("writing exception record")?;
+        self.writer.flush().context("flushing audit log")
+    }
 }
