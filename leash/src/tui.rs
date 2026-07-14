@@ -24,7 +24,7 @@ use tokio::process::Child;
 
 use crate::audit::Audit;
 use crate::policy::{Action, Policy};
-use crate::{describe, parse_event, wait_for, Desc};
+use crate::{drain, wait_for, Desc};
 
 const MAX_ROWS: usize = 4096;
 
@@ -220,22 +220,18 @@ pub async fn run(
             }
             guard = async_fd.readable_mut() => {
                 let mut guard = guard?;
-                let ring = guard.get_inner_mut();
-                while let Some(item) = ring.next() {
-                    if let Some(d) = parse_event(&item).as_ref().and_then(|ev| describe(ev, policy)) {
-                        if d.action != Action::Allow {
-                            let _ = audit.record(
-                                d.pid, &d.comm, d.label, &d.detail, d.action, &d.rule, d.denied(enforce),
-                            );
-                        }
-                        app.push(d);
-                    }
-                }
+                drain(guard.get_inner_mut(), policy, audit, enforce, |d| app.push(d));
                 guard.clear_ready();
             }
             _ = wait_for(&mut child), if child.is_some() => quit = true,
         }
     }
+
+    // Final sweep before tearing the terminal down: the child-exit branch can
+    // win the select with events (a last secret read, a denied connect) still
+    // queued in the ring. Drain + one last render so they are shown and audited.
+    drain(async_fd.get_mut(), policy, audit, enforce, |d| app.push(d));
+    term.draw(|f| app.draw(f))?;
 
     disable_raw_mode()?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;

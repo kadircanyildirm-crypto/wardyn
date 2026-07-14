@@ -57,8 +57,12 @@ const CFG_ENFORCE: u32 = 1;
 const CFG_NET_DEFAULT: u32 = 2;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
+// execveat(fd, filename, ...) — filename is the 2nd arg, so one slot further in.
+const EXECVEAT_FILENAME_OFFSET: usize = 24;
 const OPENAT_FILENAME_OFFSET: usize = 24;
 const CONNECT_USERVADDR_OFFSET: usize = 24;
+// sendto(fd, buf, len, flags, dest_addr, addrlen) — dest_addr is the 5th arg.
+const SENDTO_UADDR_OFFSET: usize = 48;
 const FORK_PARENT_PID_OFFSET: usize = 24;
 const FORK_CHILD_PID_OFFSET: usize = 44;
 
@@ -125,6 +129,21 @@ pub fn leash_openat(ctx: TracePointContext) -> u32 {
     0
 }
 
+// openat2/execveat exist because the LSM file_open / bprm_check hooks fire for
+// them too — without these tracepoints the kernel could deny an open/exec that
+// never showed up in the feed. Same filename slot as openat (2nd syscall arg).
+#[tracepoint]
+pub fn leash_openat2(ctx: TracePointContext) -> u32 {
+    let _ = emit_path_event(&ctx, kind::OPEN, OPENAT_FILENAME_OFFSET);
+    0
+}
+
+#[tracepoint]
+pub fn leash_execveat(ctx: TracePointContext) -> u32 {
+    let _ = emit_path_event(&ctx, kind::EXEC, EXECVEAT_FILENAME_OFFSET);
+    0
+}
+
 fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -> Result<(), i64> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if !in_scope(pid) {
@@ -161,16 +180,26 @@ fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -
 
 #[tracepoint]
 pub fn leash_connect(ctx: TracePointContext) -> u32 {
-    let _ = emit_connect(&ctx);
+    let _ = emit_connect(&ctx, CONNECT_USERVADDR_OFFSET);
     0
 }
 
-fn emit_connect(ctx: &TracePointContext) -> Result<(), i64> {
+// UDP egress uses sendto/sendmsg, not connect — and the cgroup sendmsg hooks
+// enforce on it — so observe sendto too, or blocked datagrams would be denied
+// invisibly. (sendmsg's destination hides behind a msghdr indirection aya-ebpf
+// 0.1 can't easily walk, so that path stays enforce-only for now.)
+#[tracepoint]
+pub fn leash_sendto(ctx: TracePointContext) -> u32 {
+    let _ = emit_connect(&ctx, SENDTO_UADDR_OFFSET);
+    0
+}
+
+fn emit_connect(ctx: &TracePointContext, uaddr_off: usize) -> Result<(), i64> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if !in_scope(pid) {
         return Ok(());
     }
-    let uaddr = unsafe { ctx.read_at::<u64>(CONNECT_USERVADDR_OFFSET) }? as *const u8;
+    let uaddr = unsafe { ctx.read_at::<u64>(uaddr_off) }? as *const u8;
     // The family is the first u16 of any sockaddr. Read the address BEFORE
     // reserving so a failed read can't leak the ring-buffer entry.
     let family: u16 = unsafe { bpf_probe_read_user(uaddr as *const u16) }?;
@@ -408,12 +437,21 @@ fn handle_fork(ctx: &TracePointContext) -> Result<(), i64> {
     Ok(())
 }
 
-/// Drop a task from WATCHED when it exits, so the set can't grow unbounded and a
-/// reused pid can't be wrongly treated as still-watched.
+/// Drop a process from WATCHED when it exits, so the set can't grow unbounded
+/// and a reused pid can't be wrongly treated as still-watched.
+///
+/// `sched_process_exit` fires per-thread, but WATCHED is keyed by tgid. Only act
+/// on the thread-group leader's exit (tid == tgid) and remove by tgid — a worker
+/// thread's tid could otherwise collide with an unrelated watched process's tgid
+/// and evict it by mistake.
 #[tracepoint]
 pub fn leash_exit(_ctx: TracePointContext) -> u32 {
-    let tid = bpf_get_current_pid_tgid() as u32; // exiting task's tid (== tgid for the leader)
-    let _ = WATCHED.remove(&tid);
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    if tid == tgid {
+        let _ = WATCHED.remove(&tgid);
+    }
     0
 }
 

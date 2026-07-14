@@ -36,7 +36,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 
 use crate::audit::Audit;
-use crate::policy::{Action, Policy};
+use crate::policy::{Action, Policy, Verdict};
 
 /// Userspace mirror of `leash_common::NameKey` (identical C layout) carrying a
 /// `Pod` impl so aya can use it as a hash-map key. The `Pod` impl can't live on
@@ -116,7 +116,19 @@ fn parse_args() -> anyhow::Result<Opts> {
     }
 
     let mode = match it.next().as_deref() {
-        None | Some("--all") | Some("watch") => Mode::All,
+        None => Mode::All,
+        Some("--all") | Some("watch") => {
+            // Options are only recognised BEFORE the mode; a flag here (e.g.
+            // `leash --all --enforce`) would otherwise be silently dropped and
+            // the user would get observe-only despite asking to enforce.
+            if let Some(extra) = it.next() {
+                bail!(
+                    "unexpected argument `{extra}` after `--all` — put options such as \
+                     --enforce BEFORE the mode: leash --enforce run -- <cmd>"
+                );
+            }
+            Mode::All
+        }
         Some("run") => {
             let mut rest: Vec<String> = it.collect();
             if rest.first().is_some_and(|s| s == "--") {
@@ -155,6 +167,18 @@ fn load_tracepoint(
     prog.attach(category, tp)
         .with_context(|| format!("attaching {category}:{tp}"))?;
     Ok(())
+}
+
+/// Attach a tracepoint that may be absent on older kernels (e.g. `openat2`,
+/// 5.6+): warn and continue instead of aborting, so we don't lose the core
+/// observation feed just because one newer syscall variant isn't traceable.
+fn load_tracepoint_optional(ebpf: &mut aya::Ebpf, name: &str, category: &str, tp: &str) {
+    if let Err(e) = load_tracepoint(ebpf, name, category, tp) {
+        eprintln!(
+            "leash: warning: could not attach {category}:{tp} ({e:#}) — opens/execs/sends via \
+             this syscall variant won't appear in the feed (enforcement is unaffected)."
+        );
+    }
 }
 
 /// The kernel the LSM struct offsets in leash-ebpf were derived for.
@@ -229,6 +253,17 @@ pub(crate) async fn wait_for(child: &mut Option<Child>) -> std::process::ExitSta
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let opts = parse_args()?;
+    // Enforcement is deliberately scoped to the launched subtree (the kernel
+    // deny hooks gate on WATCHED membership, and WATCHED is only ever seeded in
+    // `run` mode). Under `--all`/bare invocation WATCHED stays empty, so nothing
+    // would actually be denied — refuse rather than claim an enforcement that
+    // silently does nothing. (System-wide blocking is out of scope by design.)
+    if opts.enforce && matches!(opts.mode, Mode::All) {
+        bail!(
+            "--enforce requires `run -- <cmd>`: leash only enforces on the subtree it launches, \
+             not system-wide. Re-run as: leash --enforce run -- <cmd>"
+        );
+    }
     // eBPF load/attach needs privilege; fail early with a clear message.
     if unsafe { libc::geteuid() } != 0 {
         bail!("leash must run as root — it loads eBPF programs (try: sudo leash ...)");
@@ -252,6 +287,15 @@ async fn main() -> anyhow::Result<()> {
                  (only basename/dir file rules and CIDRs are) — it will be flagged, not denied"
             );
         }
+        // And the converse: a block glob that reduced to a bare name enforces
+        // MORE broadly than written, because the LSM hook only sees a basename +
+        // its immediate parent dir. Say so, so the over-reach is intentional.
+        for (pat, reach) in policy.overbroad_block_keys() {
+            eprintln!(
+                "leash: warning: policy `{pat}` (block) enforces on {reach} — the kernel matches \
+                 by basename/dir only, so it will also deny paths the glob wouldn't."
+            );
+        }
     }
     let mut audit = Audit::create(&opts.audit_path)?;
 
@@ -266,6 +310,16 @@ async fn main() -> anyhow::Result<()> {
     load_tracepoint(&mut ebpf, "leash_connect", "syscalls", "sys_enter_connect")?;
     load_tracepoint(&mut ebpf, "leash_fork", "sched", "sched_process_fork")?;
     load_tracepoint(&mut ebpf, "leash_exit", "sched", "sched_process_exit")?;
+    // Cover the syscall variants the LSM/cgroup hooks also enforce on, so a
+    // denial can't happen off-feed. Optional: absent on older kernels.
+    load_tracepoint_optional(&mut ebpf, "leash_openat2", "syscalls", "sys_enter_openat2");
+    load_tracepoint_optional(
+        &mut ebpf,
+        "leash_execveat",
+        "syscalls",
+        "sys_enter_execveat",
+    );
+    load_tracepoint_optional(&mut ebpf, "leash_sendto", "syscalls", "sys_enter_sendto");
 
     // Enforcement (opt-in): attach the cgroup/connect4 denier BEFORE taking any
     // map, so map relocation still finds NET_RULES/CONFIG/WATCHED in the object.
@@ -356,6 +410,11 @@ async fn main() -> anyhow::Result<()> {
             let _ = watched.insert(pid, 1u8, 0);
             info!("watching `{}` (pid {pid}) and its subtree", argv.join(" "));
         }
+        // Self was only seeded so the fork hook would adopt the child at spawn
+        // time; the child (and its subtree via fork) is tracked in its own right
+        // now, so drop leash's own pid — otherwise leash would police itself
+        // (its own opens/execs/connects) under --enforce and add noise to the feed.
+        let _ = watched.remove(&std::process::id());
         child = Some(spawned);
     } else {
         info!("watching exec/open/connect system-wide; Ctrl-C to stop");
@@ -395,6 +454,16 @@ async fn run_plain(
         "{:<7} {:<15} {:<8} {:<6} DETAIL",
         "PID", "COMM", "EVENT", "ACT"
     );
+    fn print(d: Desc, enforce: bool) {
+        println!(
+            "{:<7} {:<15} {:<8} {:<6} {}",
+            d.pid,
+            d.comm,
+            d.label,
+            d.act(enforce),
+            d.shown()
+        );
+    }
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -404,24 +473,17 @@ async fn run_plain(
             }
             guard = async_fd.readable_mut() => {
                 let mut guard = guard?;
-                let ring = guard.get_inner_mut();
-                while let Some(item) = ring.next() {
-                    if let Some(d) = parse_event(&item).as_ref().and_then(|ev| describe(ev, policy)) {
-                        if d.action != Action::Allow {
-                            let _ = audit.record(
-                                d.pid, &d.comm, d.label, &d.detail, d.action, &d.rule, d.denied(enforce),
-                            );
-                        }
-                        println!(
-                            "{:<7} {:<15} {:<8} {:<6} {}",
-                            d.pid, d.comm, d.label, d.act(enforce), d.shown()
-                        );
-                    }
-                }
+                drain(guard.get_inner_mut(), policy, audit, enforce, |d| print(d, enforce));
                 guard.clear_ready();
             }
         }
     }
+    // The exit/Ctrl-C branch can win the select while events still sit in the
+    // ring (e.g. a secret read immediately before the child exits). Sweep once
+    // more so those final events are shown and audited, not dropped.
+    drain(async_fd.get_mut(), policy, audit, enforce, |d| {
+        print(d, enforce)
+    });
     Ok(())
 }
 
@@ -467,6 +529,38 @@ impl Desc {
     }
 }
 
+/// Process every event currently in the ring: audit each violation and hand the
+/// decoded [`Desc`] to `sink` for display. Shared by the live loops and their
+/// final post-exit sweep. Reads are synchronous — once the child has exited its
+/// events are already in the buffer, so a plain `next()` loop drains them.
+pub(crate) fn drain(
+    ring: &mut RingBuf<MapData>,
+    policy: &Policy,
+    audit: &mut Audit,
+    enforce: bool,
+    mut sink: impl FnMut(Desc),
+) {
+    while let Some(item) = ring.next() {
+        if let Some(d) = parse_event(&item)
+            .as_ref()
+            .and_then(|ev| describe(ev, policy, enforce))
+        {
+            if d.action != Action::Allow {
+                let _ = audit.record(
+                    d.pid,
+                    &d.comm,
+                    d.label,
+                    &d.detail,
+                    d.action,
+                    &d.rule,
+                    d.denied(enforce),
+                );
+            }
+            sink(d);
+        }
+    }
+}
+
 /// Reinterpret ring-buffer bytes as an [`Event`] (bytes aren't guaranteed aligned).
 pub(crate) fn parse_event(bytes: &[u8]) -> Option<Event> {
     if bytes.len() < core::mem::size_of::<Event>() {
@@ -475,16 +569,16 @@ pub(crate) fn parse_event(bytes: &[u8]) -> Option<Event> {
     Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const Event) })
 }
 
-pub(crate) fn describe(ev: &Event, policy: &Policy) -> Option<Desc> {
+pub(crate) fn describe(ev: &Event, policy: &Policy, enforce: bool) -> Option<Desc> {
     let (label, detail, verdict) = match ev.kind {
         kind::EXEC => {
             let d = event_path(ev);
-            let v = policy.eval_exec(&d);
+            let v = reconcile(policy.eval_exec(&d), enforce, policy.kernel_exec_denial(&d));
             ("exec", d, v)
         }
         kind::OPEN => {
             let d = event_path(ev);
-            let v = policy.eval_file(&d);
+            let v = reconcile(policy.eval_file(&d), enforce, policy.kernel_file_denial(&d));
             ("open", d, v)
         }
         kind::CONNECT => {
@@ -509,6 +603,42 @@ pub(crate) fn describe(ev: &Event, policy: &Policy) -> Option<Desc> {
         rule: verdict.rule,
         enforceable: verdict.enforceable,
     })
+}
+
+/// Reconcile the glob verdict against what the kernel's coarse basename/dir
+/// matcher will *actually* do under `--enforce`, so the feed never disagrees
+/// with the syscall's real outcome. `kernel_denial` is `Some(key)` when the LSM
+/// hook would return `-EPERM` for this exact path.
+///
+/// Without enforcement the glob verdict stands (observe-only). With it, two
+/// divergences are corrected:
+///   - glob said allow/warn but the kernel denies (a `block` glob reduced to a
+///     bare basename over-blocks, e.g. `/etc/shadow` → any `shadow`): promote
+///     to an enforced block so the row isn't a green `ok` for a denied open.
+///   - glob said an *enforceable* block but the kernel won't deny this path
+///     (e.g. `**/.ssh/**` matches a deep file whose immediate parent isn't
+///     `.ssh`): demote to `block~` so we don't claim a `BLOCK` that never fired.
+fn reconcile(mut v: Verdict, enforce: bool, kernel_denial: Option<String>) -> Verdict {
+    if !enforce {
+        return v;
+    }
+    match kernel_denial {
+        Some(key) => {
+            if !(v.action == Action::Block && v.enforceable) {
+                v = Verdict {
+                    action: Action::Block,
+                    rule: format!("kernel:{key}"),
+                    enforceable: true,
+                };
+            }
+        }
+        None => {
+            if v.action == Action::Block && v.enforceable {
+                v.enforceable = false;
+            }
+        }
+    }
+    v
 }
 
 /// NUL-terminated byte field -> lossy UTF-8 string.

@@ -8,6 +8,7 @@
 //! This is the single source of truth for policy in warn-mode. Kernel-side
 //! *enforcement* (M3) will reuse these same rules to deny inline via cgroup/LSM
 //! hooks; keeping evaluation here (and unit-tested) pins the semantics first.
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
 
@@ -112,18 +113,21 @@ struct NetRule {
 }
 
 impl NetRule {
-    fn matches_v4(&self, ip: Ipv4Addr) -> bool {
+    /// If this rule matches `ip`, the prefix length it matched at (a /32 host or
+    /// `V4Ip` is 32) — used to pick the most-specific rule, mirroring the
+    /// kernel's longest-prefix-match trie. `None` if it doesn't match.
+    fn v4_prefix(&self, ip: Ipv4Addr) -> Option<u8> {
         match &self.which {
-            NetMatch::V4Cidr(net) => net.contains(&ip),
-            NetMatch::V4Ip(a) => *a == ip,
-            _ => false,
+            NetMatch::V4Cidr(net) if net.contains(&ip) => Some(net.prefix_len()),
+            NetMatch::V4Ip(a) if *a == ip => Some(32),
+            _ => None,
         }
     }
-    fn matches_v6(&self, ip: Ipv6Addr) -> bool {
+    fn v6_prefix(&self, ip: Ipv6Addr) -> Option<u8> {
         match &self.which {
-            NetMatch::V6Cidr(net) => net.contains(&ip),
-            NetMatch::V6Ip(a) => *a == ip,
-            _ => false,
+            NetMatch::V6Cidr(net) if net.contains(&ip) => Some(net.prefix_len()),
+            NetMatch::V6Ip(a) if *a == ip => Some(128),
+            _ => None,
         }
     }
 }
@@ -133,6 +137,13 @@ pub struct Policy {
     files: Vec<PathRule>,
     exec: Vec<PathRule>,
     network: Vec<NetRule>,
+    /// Mirror of the kernel's `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_EXEC` maps.
+    /// The LSM hook can only see a dentry's basename and its parent-dir name, so
+    /// these are what it *actually* matches on — kept here so userspace can
+    /// reproduce the kernel's verdict instead of guessing from the glob.
+    kern_names: BTreeSet<String>,
+    kern_dirs: BTreeSet<String>,
+    kern_execs: BTreeSet<String>,
 }
 
 /// The default policy, embedded so `leash` runs out of the box with no file.
@@ -225,11 +236,37 @@ impl Policy {
             }
         }
 
+        // Compile the kernel-side matcher once, from the same rules, so the
+        // feed and the LSM hook can never drift apart.
+        let mut kern_names = BTreeSet::new();
+        let mut kern_dirs = BTreeSet::new();
+        for r in &files {
+            if r.action != Action::Block {
+                continue;
+            }
+            if let Some((is_dir, seg)) = file_seg(&r.pattern) {
+                if is_dir {
+                    kern_dirs.insert(seg.to_string());
+                } else {
+                    kern_names.insert(seg.to_string());
+                }
+            }
+        }
+        let kern_execs = exec
+            .iter()
+            .filter(|r| r.action == Action::Block)
+            .filter_map(|r| last_segment(&r.pattern).filter(|s| name_key(s).is_some()))
+            .map(str::to_string)
+            .collect();
+
         Ok(Policy {
             default_action: raw.default_action,
             files,
             exec,
             network,
+            kern_names,
+            kern_dirs,
+            kern_execs,
         })
     }
 
@@ -289,21 +326,78 @@ impl Policy {
     /// (e.g. `.env`, `shadow`) and exact parent-directory names (e.g. `.ssh`).
     /// Patterns that can't reduce to a literal segment stay observe/warn only.
     pub fn file_enforcement(&self) -> (Vec<[u8; NAME_LEN]>, Vec<[u8; NAME_LEN]>) {
-        let mut names = Vec::new();
-        let mut dirs = Vec::new();
+        let keys = |set: &BTreeSet<String>| -> Vec<[u8; NAME_LEN]> {
+            set.iter().filter_map(|s| name_key(s)).collect()
+        };
+        (keys(&self.kern_names), keys(&self.kern_dirs))
+    }
+
+    /// The key the LSM `file_open` hook would deny `path` on, if any — the
+    /// userspace mirror of the kernel's matcher.
+    ///
+    /// The hook sees only a basename and its parent-dir name, so it is coarser
+    /// than the glob the rule was written as: `/etc/shadow` compiles to the bare
+    /// name `shadow` and therefore denies `/srv/app/shadow` too. Consult this
+    /// (not just the glob) before reporting a verdict, otherwise the feed says
+    /// `ok` for an open the kernel actually turned into `-EPERM`.
+    pub fn kernel_file_denial(&self, path: &str) -> Option<String> {
+        let mut segs = path.rsplit('/').filter(|s| !s.is_empty());
+        let name = segs.next()?;
+        if self.kern_names.contains(name) {
+            return Some(format!("name={name}"));
+        }
+        let dir = segs.next()?;
+        if self.kern_dirs.contains(dir) {
+            return Some(format!("dir={dir}"));
+        }
+        None
+    }
+
+    /// Same, for the LSM `bprm_check_security` hook (exec basenames).
+    pub fn kernel_exec_denial(&self, path: &str) -> Option<String> {
+        let name = last_segment(path)?;
+        if self.kern_execs.contains(name) {
+            return Some(format!("name={name}"));
+        }
+        None
+    }
+
+    /// `block` rules whose kernel key is BROADER than the glob that produced it,
+    /// as `(pattern, what the kernel will really deny)`. Only `**/name` and
+    /// `**/dir/**` survive the reduction intact; anything more specific
+    /// (`/etc/shadow`, `**/.aws/credentials`) loses its directory context and
+    /// over-blocks. Startup prints these so the over-reach is never a surprise.
+    pub fn overbroad_block_keys(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
         for r in &self.files {
             if r.action != Action::Block {
                 continue;
             }
-            if let Some((is_dir, k)) = file_key(&r.pattern) {
-                if is_dir {
-                    dirs.push(k);
+            if let Some((is_dir, seg)) = file_seg(&r.pattern) {
+                let (exact, reach) = if is_dir {
+                    (
+                        format!("**/{seg}/**"),
+                        format!("any file under a dir named `{seg}`"),
+                    )
                 } else {
-                    names.push(k);
+                    (format!("**/{seg}"), format!("any file named `{seg}`"))
+                };
+                if r.pattern != exact {
+                    out.push((r.pattern.clone(), reach));
                 }
             }
         }
-        (names, dirs)
+        for r in &self.exec {
+            if r.action != Action::Block {
+                continue;
+            }
+            if let Some(seg) = last_segment(&r.pattern) {
+                if name_key(seg).is_some() && r.pattern != format!("**/{seg}") {
+                    out.push((r.pattern.clone(), format!("any program named `{seg}`")));
+                }
+            }
+        }
+        out
     }
 
     /// Patterns of `block` file/exec rules that CANNOT be kernel-enforced (glob
@@ -319,11 +413,7 @@ impl Policy {
 
     /// Exec block rules compiled to exact basenames for the LSM bprm_check matcher.
     pub fn exec_enforcement(&self) -> Vec<[u8; NAME_LEN]> {
-        self.exec
-            .iter()
-            .filter(|r| r.action == Action::Block)
-            .filter_map(|r| last_segment(&r.pattern).and_then(name_key))
-            .collect()
+        self.kern_execs.iter().filter_map(|s| name_key(s)).collect()
     }
 
     pub fn eval_file(&self, path: &str) -> Verdict {
@@ -335,37 +425,47 @@ impl Policy {
     }
 
     pub fn eval_connect(&self, ip: Ipv4Addr) -> Verdict {
-        // Network blocks are always kernel-enforced (LPM trie + CONFIG default).
-        for r in &self.network {
-            if r.matches_v4(ip) {
-                return Verdict {
-                    action: r.action,
-                    rule: r.label.clone(),
-                    enforceable: true,
-                };
-            }
-        }
-        Verdict {
-            action: self.default_action,
-            rule: "default".to_string(),
-            enforceable: true,
-        }
+        self.net_verdict(
+            self.network
+                .iter()
+                .filter_map(|r| Some((r, r.v4_prefix(ip)?))),
+        )
     }
 
     pub fn eval_connect6(&self, ip: Ipv6Addr) -> Verdict {
-        for r in &self.network {
-            if r.matches_v6(ip) {
-                return Verdict {
-                    action: r.action,
-                    rule: r.label.clone(),
-                    enforceable: true,
-                };
+        self.net_verdict(
+            self.network
+                .iter()
+                .filter_map(|r| Some((r, r.v6_prefix(ip)?))),
+        )
+    }
+
+    /// Pick the verdict for a connect from the matching `(rule, prefix_len)`
+    /// pairs, MOST-SPECIFIC first (longest prefix wins), ties broken by policy
+    /// order. This is longest-prefix-match, not first-match — the kernel decides
+    /// egress with an LPM trie, and CIDRs matching one IP are always nested, so
+    /// this is the semantics the kernel actually enforces. Evaluating it any
+    /// other way would make the feed disagree with the block that really fired.
+    fn net_verdict<'a>(&self, matches: impl Iterator<Item = (&'a NetRule, u8)>) -> Verdict {
+        let mut best: Option<(&NetRule, u8)> = None;
+        for (r, plen) in matches {
+            // Strictly-greater keeps the earliest rule on a prefix-length tie,
+            // matching the kernel trie (net_entries inserts earliest rule last).
+            if best.is_none_or(|(_, bp)| plen > bp) {
+                best = Some((r, plen));
             }
         }
-        Verdict {
-            action: self.default_action,
-            rule: "default".to_string(),
-            enforceable: true,
+        match best {
+            Some((r, _)) => Verdict {
+                action: r.action,
+                rule: r.label.clone(),
+                enforceable: true,
+            },
+            None => Verdict {
+                action: self.default_action,
+                rule: "default".to_string(),
+                enforceable: true,
+            },
         }
     }
 }
@@ -393,15 +493,20 @@ fn last_segment(p: &str) -> Option<&str> {
     p.rsplit('/').find(|s| !s.is_empty())
 }
 
-/// If a file glob reduces to a kernel-enforceable exact match, return
-/// `(is_parent_dir, key)`: `**/dir/**` → `(true, dir)`; `**/name` or `/abs/name`
-/// → `(false, name)`. Glob-y patterns return `None` (observe-only).
-fn file_key(pattern: &str) -> Option<(bool, [u8; NAME_LEN])> {
-    if let Some(stripped) = pattern.strip_suffix("/**") {
-        last_segment(stripped).and_then(name_key).map(|k| (true, k))
-    } else {
-        last_segment(pattern).and_then(name_key).map(|k| (false, k))
+/// The literal segment the kernel would key a file glob on, if it reduces to
+/// one: `**/dir/**` → `(true, "dir")`; `**/name` or `/abs/name` →
+/// `(false, "name")`. Glob-y segments return `None` (observe-only).
+fn file_seg(pattern: &str) -> Option<(bool, &str)> {
+    match pattern.strip_suffix("/**") {
+        Some(stripped) => last_segment(stripped).map(|s| (true, s)),
+        None => last_segment(pattern).map(|s| (false, s)),
     }
+    .filter(|(_, s)| name_key(s).is_some())
+}
+
+/// As [`file_seg`], but as the NUL-padded fixed-width kernel map key.
+fn file_key(pattern: &str) -> Option<(bool, [u8; NAME_LEN])> {
+    file_seg(pattern).and_then(|(is_dir, s)| name_key(s).map(|k| (is_dir, k)))
 }
 
 /// A literal path segment -> NUL-padded fixed key, or `None` if it contains glob
@@ -571,5 +676,89 @@ exec:
             p.eval_connect("8.8.8.8".parse().unwrap()).action,
             Action::Warn
         );
+    }
+
+    #[test]
+    fn kernel_file_denial_mirrors_the_coarse_lsm_matcher() {
+        let p = policy();
+        // `/etc/shadow` reduced to bare name `shadow`: the kernel denies it
+        // ANYWHERE, even where the glob-based eval says allow.
+        assert_eq!(p.eval_file("/home/u/shadow").action, Action::Allow);
+        assert_eq!(
+            p.kernel_file_denial("/home/u/shadow").as_deref(),
+            Some("name=shadow")
+        );
+        // `**/.ssh/**` keys on the parent dir `.ssh` — only the IMMEDIATE parent
+        // is checked, so a deep file the glob still matches is NOT denied.
+        assert_eq!(
+            p.eval_file("/home/u/.ssh/sub/deep/id").action,
+            Action::Block
+        );
+        assert_eq!(p.kernel_file_denial("/home/u/.ssh/sub/deep/id"), None);
+        // A file directly in `.ssh` IS denied by the kernel.
+        assert_eq!(
+            p.kernel_file_denial("/home/u/.ssh/id_ed25519").as_deref(),
+            Some("dir=.ssh")
+        );
+        // `.env.*` is a glob segment: never a kernel key, so never denied here.
+        assert_eq!(p.kernel_file_denial("/home/u/.env.local"), None);
+    }
+
+    #[test]
+    fn network_uses_longest_prefix_not_first_match() {
+        // A broad block listed BEFORE a specific allow: first-match would block
+        // 1.1.1.1, but the kernel LPM trie (and now userspace) let the /32 win.
+        let p = Policy::from_yaml_str(
+            r#"
+default_action: allow
+network:
+  - { cidr: "0.0.0.0/0", action: block }
+  - { cidr: "1.1.1.1/32", action: allow }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap()).action,
+            Action::Allow
+        );
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap()).rule,
+            "cidr:1.1.1.1/32"
+        );
+        assert_eq!(
+            p.eval_connect("8.8.8.8".parse().unwrap()).action,
+            Action::Block
+        );
+    }
+
+    #[test]
+    fn kernel_exec_denial_matches_basename() {
+        let p = policy();
+        assert_eq!(
+            p.kernel_exec_denial("/usr/bin/nc").as_deref(),
+            Some("name=nc")
+        );
+        assert_eq!(
+            p.kernel_exec_denial("/opt/tools/nc").as_deref(),
+            Some("name=nc")
+        );
+        assert_eq!(p.kernel_exec_denial("/usr/bin/curl"), None); // curl is warn
+    }
+
+    #[test]
+    fn overbroad_block_keys_flags_only_the_over_reaching_rules() {
+        let p = policy();
+        let flagged: Vec<String> = p
+            .overbroad_block_keys()
+            .into_iter()
+            .map(|(pat, _)| pat)
+            .collect();
+        // `/etc/shadow` enforces as bare `shadow` -> over-broad.
+        assert!(flagged.contains(&"/etc/shadow".to_string()));
+        // `**/.env` and `**/.ssh/**` are already the exact canonical form.
+        assert!(!flagged.contains(&"**/.env".to_string()));
+        assert!(!flagged.contains(&"**/.ssh/**".to_string()));
+        // `**/nc` exec rule is canonical too.
+        assert!(!flagged.contains(&"**/nc".to_string()));
     }
 }

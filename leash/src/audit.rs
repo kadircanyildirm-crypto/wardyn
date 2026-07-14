@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! JSONL audit log (M2). One JSON object per line for each policy violation
 //! (warn/block), flushed immediately so the file is tail-able live.
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -17,8 +17,14 @@ pub struct Audit {
 
 impl Audit {
     pub fn create(path: &Path) -> Result<Audit> {
-        let file =
-            File::create(path).with_context(|| format!("creating audit log {}", path.display()))?;
+        // Append, never truncate: the audit log is a security record and must
+        // survive across runs (JSONL, so appending is well-formed). Use
+        // `--audit /dev/null` or a fresh path if a clean log is wanted.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("opening audit log {}", path.display()))?;
         Ok(Audit {
             writer: BufWriter::new(file),
             path: path.display().to_string(),
