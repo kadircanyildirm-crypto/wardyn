@@ -19,10 +19,12 @@ operation by returning an error to the kernel, not after the fact.
 
 | Capability | Observe hook | Enforce hook | Can block? | Notes |
 |---|---|---|---|---|
-| **exec** | `tracepoint/sched/sched_process_exec` | LSM `bprm_check_security` | ✅ (LSM) | deny returns `-EPERM` to `execve` |
-| **file open** (`.env`, `~/.ssh`) | `tracepoint/syscalls/sys_enter_openat` | LSM `file_open` | ✅ (LSM only) | `bpf_override_return` can't deny `openat` — not on the kernel error-injection allowlist, so blocking *requires* BPF LSM |
-| **outbound connect** | `kprobe/tcp_connect` | `cgroup/connect4` + `cgroup/connect6` | ✅ (cgroup v2) | cgroup hook denies `connect()` **without** LSM — works even on stock WSL2 |
-| **fork / child tracking** | `tracepoint/sched/sched_process_fork` | — | — | maintains the watched PID set |
+| **exec** | `tracepoint/syscalls/sys_enter_execve` + `sys_enter_execveat` | LSM `bprm_check_security` | ✅ (LSM) | deny returns `-EPERM` to `execve`; both syscall variants observed so a denial can't happen off-feed |
+| **file open** (`.env`, `~/.ssh`) | `tracepoint/syscalls/sys_enter_openat` + `sys_enter_openat2` | LSM `file_open` | ✅ (LSM only) | `bpf_override_return` can't deny `openat` — not on the kernel error-injection allowlist, so blocking *requires* BPF LSM |
+| **outbound connect** | `tracepoint/syscalls/sys_enter_connect` + `sys_enter_sendto` | `cgroup/connect4·6` + `cgroup/sendmsg4·6` | ✅ (cgroup v2) | cgroup hook denies `connect()`/`sendmsg()` **without** LSM — works even on stock WSL2. `sendmsg`'s msghdr destination is enforce-only (not yet observed) |
+| **fork / child tracking** | `tracepoint/sched/sched_process_fork` (+ `sched_process_exit` to evict) | — | — | maintains the watched PID set |
+
+> The observe hooks are the `sys_enter_*` variants (not `sched_process_exec`/`kprobe tcp_connect`) so that **every** syscall the enforce hooks can act on is also surfaced to the feed — otherwise the kernel could deny an `openat2`/`execveat`/`sendto` that never showed up in the UI or audit log.
 
 Two independent enforcement paths on purpose:
 - **Network blocking → cgroup/connect** (needs only cgroup v2).
@@ -85,17 +87,32 @@ Dev target: **Ubuntu 24.04 VM with BPF LSM enabled** — full observe + full blo
 ## Enforcement (implemented)
 
 Gated on `WATCHED` membership + `CONFIG[enforce]`, so it only ever touches the
-launched subtree, and only under `--enforce`:
+launched subtree, and only under `--enforce`. Because `WATCHED` is seeded only in
+`run` mode, `--enforce` requires `leash run -- <cmd>`; `--enforce --all` is refused
+(system-wide blocking is out of scope, and would otherwise enforce *nothing* while
+claiming to).
 
 - **Network** — `cgroup/connect4` looks the destination IPv4 up in the `NET_RULES`
   LPM trie (compiled from `policy.network`) and returns *deny* for a `block` verdict.
+  The trie is **longest-prefix-match**, so the userspace feed evaluates network
+  rules most-specific-first (not first-match) to report the same verdict the kernel
+  enforces — a broad `block` CIDR before a narrow `allow` no longer disagree.
 - **File** — LSM `file_open` reads `file->f_path.dentry->d_name` (basename) and its
   parent-dir name at fixed kernel offsets, and returns `-EPERM` if either is in the
   `BLOCK_NAMES` / `BLOCK_DIRS` set. aya-ebpf 0.1 has no `bpf_d_path`/`bpf_loop`, so
-  matching is exact basename/dir rather than full-path glob (fail-safe; the richer
-  observation feed still uses full globs). Offsets: `scripts/kernel-offsets.sh`.
+  matching is exact basename/dir rather than full-path glob. Offsets:
+  `scripts/kernel-offsets.sh`.
 - **Exec** — LSM `bprm_check_security` applies the same basename match to
   `linux_binprm->file` against `BLOCK_EXEC`.
+
+**Feed/kernel reconciliation.** The basename/dir reduction is coarser than the glob
+a rule was written as (`/etc/shadow` → deny any file named `shadow`; `**/.ssh/**`
+→ only the immediate `.ssh` parent, not deep descendants). Rather than let the feed
+disagree with the syscall's real outcome, under `--enforce` userspace reproduces the
+kernel matcher for each event: a rule that over-blocks is shown (and audited) as an
+enforced `BLOCK`, and an enforceable-looking glob the kernel *won't* actually deny is
+demoted to `block~`. Rules whose kernel key is broader than their glob are printed as
+a warning at startup so the over-reach is explicit, not silent.
 
 ## Roadmap
 
