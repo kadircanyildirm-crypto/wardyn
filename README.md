@@ -28,7 +28,8 @@ $ sudo wardyn --enforce run -- claude "refactor the auth module"
   40244  curl     connect  ⛔BLOCK  185.220.101.7:443          [cidr:0.0.0.0/0]
   40250  node     open     ⛔BLOCK  /home/me/project/.env      [**/.env]
 
-  wardyn: 3 policy violation(s) logged to wardyn-audit.jsonl
+  wardyn: 4 policy violation(s) logged to wardyn-audit.jsonl
+  wardyn: 3 denial(s) receipted to /tmp/wardyn-denials-40217.jsonl (WARDYN_DENIALS in the agent's env)
 ```
 
 > ⚠️ **Status: early development.** M1–M3 done: observe + policy + **kernel-level
@@ -56,7 +57,9 @@ For the process subtree you launch (`wardyn run -- <cmd>`, followed across `fork
 | **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs (TCP + UDP, IPv4/IPv6) | `tracepoint/connect` + `cgroup/connect4·6` + `sendmsg4·6` |
 
 Every action is checked against a [`policy.yaml`](#policy) → `allow` / `warn` /
-`block`, shown live (coloured) and written to a JSONL audit log.
+`block`, shown live (coloured) and written to a JSONL audit log. Under
+`--enforce` the agent itself gets a machine-readable **denial receipt**
+(`WARDYN_DENIALS`) — see [Telling the agent](#telling-the-agent).
 
 **Surgically scoped & safe:** enforcement only ever touches the subtree you
 launched, and only with `--enforce`. The rest of the system is never affected —
@@ -86,7 +89,8 @@ sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh
 ```
 
 Renders a live TUI when attached to a terminal; pipe it (or pass `--plain`) for a
-plain table. `--policy <file>` and `--audit <file>` override the defaults.
+plain table. `--policy <file>`, `--audit <file>` and `--denials <file>` override
+the defaults.
 
 ## Policy
 
@@ -113,6 +117,38 @@ exec:                                    # glob against the executable path
 ```
 
 Ready-made presets live in [`policies/`](./policies).
+
+## Telling the agent
+
+A kernel denial reaches the agent as a bare `EPERM` — indistinguishable from an
+ordinary permission error. Agents respond the way agents do: retry, reach for
+`sudo`, or code around the failure. Half the loop was missing: you can see
+everything the agent does, but the agent can't see you.
+
+Under `--enforce`, wardyn spawns the target with `WARDYN_DENIALS=<path>` in its
+environment: a per-run JSONL receipt whose first line explains the file (written
+for an LLM to read) and every further line is one action the kernel actually
+denied —
+
+```json
+{"wardyn":"denial-receipt","version":1,"note":"Wardyn is a kernel-level policy warden supervising this process tree. ... Do not retry or work around a denial — report the `rule` to the human operator ...","policy":"9 file rule(s), 8 network rule(s), 5 exec rule(s), default=allow","started":"2026-07-14T10:11:58.102Z","target":"claude refactor the auth module"}
+{"ts":"2026-07-14T10:12:03.412Z","pid":40250,"comm":"node","event":"open","detail":"/home/me/project/.env","rule":"**/.env"}
+{"ts":"2026-07-14T10:12:07.011Z","pid":40244,"comm":"curl","event":"connect","detail":"185.220.101.7:443","rule":"cidr:0.0.0.0/0"}
+```
+
+Tell your agent about it once, in its standing instructions (`CLAUDE.md`,
+`AGENTS.md`, a system prompt):
+
+> If a command fails with a permission or network error and the environment
+> variable `WARDYN_DENIALS` is set, read that file. If a record matches the
+> failure, a security policy denied the action: do **not** retry or work around
+> it — report the `rule` to the user and continue with the rest of the task.
+
+The receipt is advisory *output*, never input: the watched tree can read (or
+even scribble on) it, but enforcement lives in kernel maps and root-owned policy
+it cannot reach. Only real kernel denials are receipted — warns and
+observe-only `block~` flags never appear. `--denials <path>` overrides the
+default location (`/tmp/wardyn-denials-<pid>.jsonl`).
 
 ## How it works
 
@@ -158,6 +194,8 @@ Full design, hook map, and the eBPF-verifier war stories are in
 - BPF LSM (`CONFIG_BPF_LSM=y` + `lsm=...,bpf` on the cmdline) for file/exec blocking.
 - Root (to load/attach eBPF).
 - Built with Rust nightly + `bpf-linker` ([aya](https://aya-rs.dev)).
+- Works from inside pid namespaces (containers, WSL2 distros): wardyn learns its
+  kernel-view pid via an in-kernel handshake and says so when it differs.
 
 > The LSM file/exec matcher reads a few `dentry` fields at fixed offsets for the
 > target kernel (aya-ebpf 0.1 ships neither `bpf_d_path` nor vmlinux structs).
@@ -170,6 +208,10 @@ Full design, hook map, and the eBPF-verifier war stories are in
 - [x] **M3 — Block:** deny egress (cgroup — TCP + UDP, IPv4 + IPv6) + secret reads
   & blocked execs (LSM).
 - [ ] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓, presets ✓)_
+- [ ] **M5 — Agent feedback:** the agent learns what was denied and why, instead
+  of flailing at a bare `EPERM`. _(denial receipts ✓)_ Next: approve-once
+  exceptions from the TUI, persistent overrides kept outside the watched tree's
+  reach.
 
 ## Contributing
 

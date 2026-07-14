@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Denial receipts — the agent learns what was denied (M5).** Under `--enforce`,
+  the watched command is spawned with `WARDYN_DENIALS=<path>`: a per-run JSONL
+  receipt with a self-describing header and one record per kernel-denied action.
+  An agent that just got a bare `EPERM` or a refused connect can read back which
+  rule fired and report it to its operator instead of retrying, reaching for
+  `sudo`, or coding around the block. `--denials <path>` overrides the location;
+  only real kernel denials are receipted (never warns or observe-only `block~`).
 - UDP egress enforcement: `sendmsg4` / `sendmsg6` cgroup hooks gate connectionless
   traffic alongside `connect4` / `connect6`, reusing the same policy logic.
 - Observation for the syscall variants the enforce hooks also act on:
@@ -29,6 +36,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`run` scoping silently watched nothing inside pid namespaces** (docker
+  containers, WSL2 distros — including `--enforce`, which then denied nothing
+  while claiming to). The kernel hooks key `WATCHED` by init-namespace tgid,
+  but userspace seeded it with its own-namespace pids, which never match from
+  inside a namespace. Wardyn now learns its kernel-view tgid at startup via a
+  nonce-gated `sys_enter_personality` handshake, announces a detected
+  namespace, and relies on in-kernel fork adoption for the launched child (a
+  local child pid could collide with an unrelated init-ns tgid). The feed shows
+  init-ns pids under a mismatch.
+- **Child adoption broke on kernels with dynamic sched-tracepoint comm fields**
+  (`__data_loc`, observed on 6.18: `parent_pid` 24→12, `child_pid` 44→20; the
+  hardcoded offsets were for 6.8's inline `char[16]`). The fork hook now gets
+  the offsets from the running kernel's tracefs `format` file via `CONFIG`, so
+  adoption — and with it all of `run` scoping — survives layout changes.
 - **Feed/kernel divergence on file & exec blocks.** The coarse basename/dir
   matcher the LSM hook uses could deny an open/exec the UI reported as `ok`/`warn`
   (e.g. `/etc/shadow` → any file named `shadow`), and could show `BLOCK` for a

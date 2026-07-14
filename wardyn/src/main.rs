@@ -10,15 +10,21 @@
 //!   --plain            force the plain line printer (no TUI)
 //!   --policy <path>    policy file (default: ./policy.yaml, else embedded)
 //!   --audit <path>     JSONL audit log (default: ./wardyn-audit.jsonl)
+//!   --denials <path>   agent-readable denial receipt (--enforce only;
+//!                      default: <tmp>/wardyn-denials-<pid>.jsonl)
 //!
 //! Renders a live ratatui TUI when stdout is a terminal, else a plain table.
 //! Each event is evaluated against the policy (allow/warn/block); violations are
 //! coloured and written to the audit log. With `--enforce`, blocked file reads,
 //! execs and egress are denied in-kernel for the watched subtree. The feed is
 //! honest about it: `BLOCK` = actually denied, `block~` = flagged but the rule
-//! can't be kernel-enforced, `block` = observe-only (no --enforce).
+//! can't be kernel-enforced, `block` = observe-only (no --enforce). Under
+//! `--enforce` the child is also spawned with `WARDYN_DENIALS=<receipt>` — a
+//! JSONL file naming each kernel-denied action — so the agent can learn why an
+//! operation failed instead of flailing against a bare EPERM.
 mod audit;
 mod policy;
+mod receipt;
 mod tui;
 
 use std::io::IsTerminal as _;
@@ -37,6 +43,7 @@ use wardyn_common::{kind, Event, NAME_LEN, PATH_LEN};
 
 use crate::audit::Audit;
 use crate::policy::{Action, Policy, Verdict};
+use crate::receipt::Receipt;
 
 /// Userspace mirror of `wardyn_common::NameKey` (identical C layout) carrying a
 /// `Pod` impl so aya can use it as a hash-map key. The `Pod` impl can't live on
@@ -55,6 +62,12 @@ unsafe impl aya::Pod for Ip6Key {}
 
 /// AF_INET6, matching the eBPF side.
 const AF_INET6: u16 = 10;
+
+/// CONFIG slots shared with the eBPF side (pid-ns handshake, fork offsets).
+const CFG_HS_NONCE: u32 = 3;
+const CFG_HS_TGID: u32 = 4;
+const CFG_FORK_PARENT_OFF: u32 = 5;
+const CFG_FORK_CHILD_OFF: u32 = 6;
 
 pub(crate) enum Mode {
     All,
@@ -75,6 +88,7 @@ struct Opts {
     enforce: bool,
     policy_path: Option<PathBuf>,
     audit_path: PathBuf,
+    denials_path: Option<PathBuf>,
     mode: Mode,
 }
 
@@ -84,6 +98,7 @@ fn parse_args() -> anyhow::Result<Opts> {
     let mut enforce = false;
     let mut policy_path = None;
     let mut audit_path = PathBuf::from("wardyn-audit.jsonl");
+    let mut denials_path = None;
 
     while let Some(a) = it.peek() {
         match a.as_str() {
@@ -110,6 +125,10 @@ fn parse_args() -> anyhow::Result<Opts> {
             "--audit" => {
                 it.next();
                 audit_path = PathBuf::from(it.next().context("--audit needs a path")?);
+            }
+            "--denials" => {
+                it.next();
+                denials_path = Some(PathBuf::from(it.next().context("--denials needs a path")?));
             }
             _ => break,
         }
@@ -149,6 +168,7 @@ fn parse_args() -> anyhow::Result<Opts> {
         enforce,
         policy_path,
         audit_path,
+        denials_path,
         mode,
     })
 }
@@ -195,6 +215,7 @@ fn print_usage() {
          --plain           force the plain line printer (no TUI)\n  \
          --policy <path>   policy file (default: ./policy.yaml, else embedded)\n  \
          --audit <path>    JSONL audit log (default: ./wardyn-audit.jsonl)\n  \
+         --denials <path>  agent-readable denial receipt, exported as WARDYN_DENIALS (--enforce only)\n  \
          -h, --help        print this help\n  \
          -V, --version     print version"
     );
@@ -299,6 +320,29 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut audit = Audit::create(&opts.audit_path)?;
 
+    // Agent-facing denial receipt: only under --enforce (observe mode denies
+    // nothing), created before spawn so the child can inherit its path in
+    // WARDYN_DENIALS and read back what was denied instead of flailing on a
+    // bare EPERM.
+    let mut receipt = if opts.enforce {
+        let path = opts.denials_path.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("wardyn-denials-{}.jsonl", std::process::id()))
+        });
+        Some(Receipt::create(
+            &path,
+            &opts.mode.label(),
+            &policy.summary(),
+        )?)
+    } else {
+        if opts.denials_path.is_some() {
+            eprintln!(
+                "wardyn: warning: --denials has no effect without --enforce \
+                 (observe mode denies nothing, so there is nothing to receipt)"
+            );
+        }
+        None
+    };
+
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/wardyn"
@@ -320,6 +364,23 @@ async fn main() -> anyhow::Result<()> {
         "sys_enter_execveat",
     );
     load_tracepoint_optional(&mut ebpf, "wardyn_sendto", "syscalls", "sys_enter_sendto");
+    // Pid-ns handshake (see `learn_init_ns_tgid`). Best-effort: without it
+    // wardyn still works wherever it shares the kernel's init pid namespace.
+    let handshake_attached = match load_tracepoint(
+        &mut ebpf,
+        "wardyn_handshake",
+        "syscalls",
+        "sys_enter_personality",
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "wardyn: warning: could not attach the pid-ns handshake tracepoint ({e:#}) — if \
+                 wardyn runs inside a container or WSL distro, `run` scoping will silently fail"
+            );
+            false
+        }
+    };
 
     // Enforcement (opt-in): attach the cgroup/connect4 denier BEFORE taking any
     // map, so map relocation still finds NET_RULES/CONFIG/WATCHED in the object.
@@ -356,6 +417,56 @@ async fn main() -> anyhow::Result<()> {
     config.set(0, u32::from(matches!(opts.mode, Mode::All)), 0)?; // watch_all
     config.set(1, u32::from(opts.enforce), 0)?; // enforce
     config.set(2, policy.default_action_code(), 0)?; // net_default
+
+    // sched_process_fork's pid field offsets moved when the kernel made comm
+    // dynamic (`__data_loc`): parent_pid 24→12, child_pid 44→20. Read the
+    // running kernel's authoritative layout from tracefs rather than baking in
+    // one kernel's numbers — fork adoption (and with it ALL `run` scoping)
+    // silently dies when these are wrong.
+    let fork_offs = (
+        tracefs_field_offset("sched/sched_process_fork", "parent_pid"),
+        tracefs_field_offset("sched/sched_process_fork", "child_pid"),
+    );
+    let (parent_off, child_off) = match fork_offs {
+        (Some(p), Some(c)) => (p, c),
+        _ => {
+            eprintln!(
+                "wardyn: warning: could not read the sched_process_fork layout from tracefs — \
+                 falling back to kernel-6.8 offsets; child adoption may silently fail"
+            );
+            (24, 44)
+        }
+    };
+    config.set(CFG_FORK_PARENT_OFF, parent_off, 0)?;
+    config.set(CFG_FORK_CHILD_OFF, child_off, 0)?;
+
+    // `run` scoping: WATCHED is keyed by tgid as the KERNEL sees it (init pid
+    // namespace); std::process::id() is wardyn's pid in its OWN namespace. On a
+    // bare host they coincide, but inside a container or WSL2 distro they never
+    // do — seeding WATCHED with the local pid would watch (and enforce) nothing
+    // while claiming to. Learn the kernel-view tgid instead, and be loud when
+    // the namespaces differ.
+    let self_pid = std::process::id();
+    let mut seed_tgid = self_pid;
+    let mut ns_mismatch = false;
+    if matches!(opts.mode, Mode::Run(_)) && handshake_attached {
+        match learn_init_ns_tgid(&mut config) {
+            Some(tgid) => {
+                seed_tgid = tgid;
+                ns_mismatch = tgid != self_pid;
+                if ns_mismatch {
+                    eprintln!(
+                        "wardyn: pid namespace detected (self {self_pid}, kernel view {tgid}) — \
+                         relying on in-kernel fork adoption; the feed shows init-ns pids"
+                    );
+                }
+            }
+            None => eprintln!(
+                "wardyn: warning: pid-ns handshake failed — assuming no pid namespace; if wardyn \
+                 runs inside a container or WSL distro, `run` scoping will silently fail"
+            ),
+        }
+    }
 
     {
         let mut net: LpmTrie<_, u32, u32> =
@@ -401,20 +512,33 @@ async fn main() -> anyhow::Result<()> {
     if let Mode::Run(argv) = &opts.mode {
         let mut watched: BpfHashMap<_, u32, u8> =
             BpfHashMap::try_from(ebpf.take_map("WATCHED").context("WATCHED")?)?;
-        watched.insert(std::process::id(), 1u8, 0)?; // seed self so fork adopts child
-        let spawned = Command::new(&argv[0])
-            .args(&argv[1..])
+        watched.insert(seed_tgid, 1u8, 0)?; // seed self so fork adopts child
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        // A denial reaches the agent as a bare EPERM; WARDYN_DENIALS names the
+        // receipt explaining it. Env is inherited by the whole subtree.
+        if let Some(r) = &receipt {
+            cmd.env("WARDYN_DENIALS", r.path());
+        }
+        let spawned = cmd
             .spawn()
             .with_context(|| format!("spawning `{}`", argv[0]))?;
         if let Some(pid) = spawned.id() {
-            let _ = watched.insert(pid, 1u8, 0);
+            // Under a pid namespace the local child pid means nothing to the
+            // kernel — worse, it could collide with an unrelated init-ns tgid
+            // and watch a stranger. The fork hook already adopted the child
+            // (spawn returning means the clone completed); the direct insert
+            // is belt-and-braces for the namespace-free case only.
+            if !ns_mismatch {
+                let _ = watched.insert(pid, 1u8, 0);
+            }
             info!("watching `{}` (pid {pid}) and its subtree", argv.join(" "));
         }
         // Self was only seeded so the fork hook would adopt the child at spawn
         // time; the child (and its subtree via fork) is tracked in its own right
         // now, so drop wardyn's own pid — otherwise wardyn would police itself
         // (its own opens/execs/connects) under --enforce and add noise to the feed.
-        let _ = watched.remove(&std::process::id());
+        let _ = watched.remove(&seed_tgid);
         child = Some(spawned);
     } else {
         info!("watching exec/open/connect system-wide; Ctrl-C to stop");
@@ -427,11 +551,20 @@ async fn main() -> anyhow::Result<()> {
             opts.mode.label(),
             &policy,
             &mut audit,
+            receipt.as_mut(),
             opts.enforce,
         )
         .await
     } else {
-        run_plain(async_fd, child, &policy, &mut audit, opts.enforce).await
+        run_plain(
+            async_fd,
+            child,
+            &policy,
+            &mut audit,
+            receipt.as_mut(),
+            opts.enforce,
+        )
+        .await
     };
 
     eprintln!(
@@ -439,6 +572,13 @@ async fn main() -> anyhow::Result<()> {
         audit.count(),
         audit.path()
     );
+    if let Some(r) = &receipt {
+        eprintln!(
+            "wardyn: {} denial(s) receipted to {} (WARDYN_DENIALS in the agent's env)",
+            r.count(),
+            r.path()
+        );
+    }
     result
 }
 
@@ -448,6 +588,7 @@ async fn run_plain(
     mut child: Option<Child>,
     policy: &Policy,
     audit: &mut Audit,
+    mut receipt: Option<&mut Receipt>,
     enforce: bool,
 ) -> anyhow::Result<()> {
     println!(
@@ -473,7 +614,7 @@ async fn run_plain(
             }
             guard = async_fd.readable_mut() => {
                 let mut guard = guard?;
-                drain(guard.get_inner_mut(), policy, audit, enforce, |d| print(d, enforce));
+                drain(guard.get_inner_mut(), policy, audit, receipt.as_deref_mut(), enforce, |d| print(d, enforce));
                 guard.clear_ready();
             }
         }
@@ -481,7 +622,7 @@ async fn run_plain(
     // The exit/Ctrl-C branch can win the select while events still sit in the
     // ring (e.g. a secret read immediately before the child exits). Sweep once
     // more so those final events are shown and audited, not dropped.
-    drain(async_fd.get_mut(), policy, audit, enforce, |d| {
+    drain(async_fd.get_mut(), policy, audit, receipt, enforce, |d| {
         print(d, enforce)
     });
     Ok(())
@@ -529,14 +670,16 @@ impl Desc {
     }
 }
 
-/// Process every event currently in the ring: audit each violation and hand the
-/// decoded [`Desc`] to `sink` for display. Shared by the live loops and their
-/// final post-exit sweep. Reads are synchronous — once the child has exited its
-/// events are already in the buffer, so a plain `next()` loop drains them.
+/// Process every event currently in the ring: audit each violation, receipt
+/// each actual denial for the agent, and hand the decoded [`Desc`] to `sink`
+/// for display. Shared by the live loops and their final post-exit sweep.
+/// Reads are synchronous — once the child has exited its events are already in
+/// the buffer, so a plain `next()` loop drains them.
 pub(crate) fn drain(
     ring: &mut RingBuf<MapData>,
     policy: &Policy,
     audit: &mut Audit,
+    mut receipt: Option<&mut Receipt>,
     enforce: bool,
     mut sink: impl FnMut(Desc),
 ) {
@@ -555,6 +698,13 @@ pub(crate) fn drain(
                     &d.rule,
                     d.denied(enforce),
                 );
+                // The receipt is the agent's view: only what the kernel really
+                // denied belongs there — not warns, not unenforced `block~`.
+                if d.denied(enforce) {
+                    if let Some(r) = receipt.as_deref_mut() {
+                        let _ = r.record(d.pid, &d.comm, d.label, &d.detail, &d.rule);
+                    }
+                }
             }
             sink(d);
         }
@@ -641,6 +791,65 @@ fn reconcile(mut v: Verdict, enforce: bool, kernel_denial: Option<String>) -> Ve
     v
 }
 
+/// Byte offset of `field` in a tracefs event format file, e.g.
+/// `tracefs_field_offset("sched/sched_process_fork", "parent_pid")`. The format
+/// file is the kernel's own declaration of the event layout — the only source
+/// that is correct on every kernel.
+fn tracefs_field_offset(event: &str, field: &str) -> Option<u32> {
+    let text = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+        .iter()
+        .find_map(|root| std::fs::read_to_string(format!("{root}/events/{event}/format")).ok())?;
+    parse_format_offset(&text, field)
+}
+
+/// The parsing half of [`tracefs_field_offset`], split out for tests. Format
+/// lines look like `\tfield:pid_t parent_pid;\toffset:12;\tsize:4;\tsigned:1;`.
+fn parse_format_offset(format: &str, field: &str) -> Option<u32> {
+    let marker = format!(" {field};");
+    for line in format.lines() {
+        if line.contains(&marker) {
+            for part in line.split(';') {
+                if let Some(v) = part.trim().strip_prefix("offset:") {
+                    return v.trim().parse().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Learn wardyn's tgid as the kernel's init pid namespace sees it.
+///
+/// Publish a random nonce in CONFIG, call `personality(nonce)` (a per-process
+/// flag read/set, restored immediately), and let the `sys_enter_personality`
+/// tracepoint write the caller's init-ns tgid back through CONFIG. The nonce
+/// gates the write so a concurrent personality() call from another process
+/// can't elect itself; the window is closed (nonce = 0) before returning.
+fn learn_init_ns_tgid(config: &mut Array<MapData, u32>) -> Option<u32> {
+    use std::io::Read as _;
+    let mut nb = [0u8; 4];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut nb))
+        .ok()?;
+    let mut nonce = u32::from_ne_bytes(nb);
+    if nonce == 0 || nonce == u32::MAX {
+        nonce ^= 0x5ad0_1e55; // 0 disables the hook; -1 is personality's query value
+    }
+    config.set(CFG_HS_NONCE, nonce, 0).ok()?;
+    // personality() returns the previous persona; the nonce persona lives only
+    // for the instant between these two calls, in this process.
+    let old = unsafe { libc::personality(nonce as libc::c_ulong) };
+    if old != -1 {
+        unsafe { libc::personality(old as libc::c_ulong) };
+    }
+    let _ = config.set(CFG_HS_NONCE, 0u32, 0);
+    // The tracepoint ran synchronously inside the personality() syscall.
+    match config.get(&CFG_HS_TGID, 0) {
+        Ok(tgid) if tgid != 0 => Some(tgid),
+        _ => None,
+    }
+}
+
 /// NUL-terminated byte field -> lossy UTF-8 string.
 fn field_str(b: &[u8]) -> String {
     let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
@@ -650,4 +859,39 @@ fn field_str(b: &[u8]) -> String {
 fn event_path(ev: &Event) -> String {
     let len = (ev.path_len as usize).min(PATH_LEN);
     field_str(&ev.path[..len])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_format_offset;
+
+    /// Old layout (kernel 6.8): inline `char comm[16]` fields.
+    const FORK_6_8: &str = "\
+\tfield:char parent_comm[16];\toffset:8;\tsize:16;\tsigned:0;
+\tfield:pid_t parent_pid;\toffset:24;\tsize:4;\tsigned:1;
+\tfield:char child_comm[16];\toffset:28;\tsize:16;\tsigned:0;
+\tfield:pid_t child_pid;\toffset:44;\tsize:4;\tsigned:1;";
+
+    /// New layout (observed on 6.18): comm became `__data_loc` (4 bytes), so
+    /// every pid field moved. Captured verbatim from a real format file.
+    const FORK_6_18: &str = "\
+\tfield:__data_loc char[] parent_comm;\toffset:8;\tsize:4;\tsigned:0;
+\tfield:pid_t parent_pid;\toffset:12;\tsize:4;\tsigned:1;
+\tfield:__data_loc char[] child_comm;\toffset:16;\tsize:4;\tsigned:0;
+\tfield:pid_t child_pid;\toffset:20;\tsize:4;\tsigned:1;";
+
+    #[test]
+    fn parses_both_fork_layout_generations() {
+        assert_eq!(parse_format_offset(FORK_6_8, "parent_pid"), Some(24));
+        assert_eq!(parse_format_offset(FORK_6_8, "child_pid"), Some(44));
+        assert_eq!(parse_format_offset(FORK_6_18, "parent_pid"), Some(12));
+        assert_eq!(parse_format_offset(FORK_6_18, "child_pid"), Some(20));
+    }
+
+    #[test]
+    fn field_name_must_match_exactly() {
+        // `pid` is a suffix of `parent_pid`/`child_pid` and must not match them.
+        assert_eq!(parse_format_offset(FORK_6_18, "pid"), None);
+        assert_eq!(parse_format_offset(FORK_6_18, "no_such_field"), None);
+    }
 }

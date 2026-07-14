@@ -28,9 +28,13 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static WATCHED: HashMap<u32, u8> = HashMap::with_max_entries(8192, 0);
 
-/// Config: [0] watch_all, [1] enforce, [2] net_default (action code).
+/// Config: [0] watch_all, [1] enforce, [2] net_default (action code),
+/// [3] pid-ns handshake nonce (userspace→kernel), [4] learned init-ns tgid
+/// (kernel→userspace, written by `wardyn_handshake`), [5]/[6] byte offsets of
+/// sched_process_fork's parent_pid/child_pid fields (read from tracefs — the
+/// layout moved when comm became `__data_loc` in newer kernels).
 #[map]
-static CONFIG: Array<u32> = Array::with_max_entries(4, 0);
+static CONFIG: Array<u32> = Array::with_max_entries(8, 0);
 
 /// Blocked-CIDR -> action code (longest-prefix), keyed by IPv4 in network order.
 #[map]
@@ -55,16 +59,25 @@ static BLOCK_EXEC: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 const CFG_WATCH_ALL: u32 = 0;
 const CFG_ENFORCE: u32 = 1;
 const CFG_NET_DEFAULT: u32 = 2;
+const CFG_HS_NONCE: u32 = 3;
+const CFG_HS_TGID: u32 = 4;
+const CFG_FORK_PARENT_OFF: u32 = 5;
+const CFG_FORK_CHILD_OFF: u32 = 6;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
+// personality(persona) — persona is the 1st arg, same slot as execve's filename.
+const PERSONALITY_ARG_OFFSET: usize = 16;
 // execveat(fd, filename, ...) — filename is the 2nd arg, so one slot further in.
 const EXECVEAT_FILENAME_OFFSET: usize = 24;
 const OPENAT_FILENAME_OFFSET: usize = 24;
 const CONNECT_USERVADDR_OFFSET: usize = 24;
 // sendto(fd, buf, len, flags, dest_addr, addrlen) — dest_addr is the 5th arg.
 const SENDTO_UADDR_OFFSET: usize = 48;
-const FORK_PARENT_PID_OFFSET: usize = 24;
-const FORK_CHILD_PID_OFFSET: usize = 44;
+// sched_process_fork's pid offsets are NOT hardcoded: the sched tracepoint
+// layout moved when comm became `__data_loc` (parent_pid 24→12, child_pid
+// 44→20). Userspace reads the running kernel's format from tracefs and passes
+// the offsets via CONFIG[CFG_FORK_PARENT_OFF]/[CFG_FORK_CHILD_OFF]. Syscall
+// tracepoints (above) keep their ABI-stable 16+8·n argument slots.
 
 // struct offsets for kernel 6.8 (from `pahole`); see scripts/kernel-offsets.sh.
 // file.f_path(152) + path.dentry(8):
@@ -419,6 +432,39 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     Ok(OK)
 }
 
+// ── pid-ns handshake: tell userspace its init-ns tgid ───────────────────────
+//
+// Every hook here keys WATCHED by `bpf_get_current_pid_tgid() >> 32` — the tgid
+// in the kernel's INIT pid namespace. Userspace's `std::process::id()` is its
+// pid in its OWN namespace; inside a container or WSL2 distro the two never
+// match, and a WATCHED seeded with local pids watches (and enforces) nothing.
+// So userspace publishes a random nonce in CONFIG and calls personality(nonce);
+// this tracepoint sees the call, checks the nonce, and writes the caller's
+// init-ns tgid back through CONFIG. The nonce gate keeps a concurrent
+// personality() call from an unrelated process from electing itself.
+
+#[tracepoint]
+pub fn wardyn_handshake(ctx: TracePointContext) -> u32 {
+    let _ = try_handshake(&ctx);
+    0
+}
+
+fn try_handshake(ctx: &TracePointContext) -> Result<(), i64> {
+    let nonce = cfg(CFG_HS_NONCE);
+    if nonce == 0 {
+        return Ok(());
+    }
+    let persona: u64 = unsafe { ctx.read_at::<u64>(PERSONALITY_ARG_OFFSET) }?;
+    if persona as u32 != nonce {
+        return Ok(());
+    }
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if let Some(slot) = CONFIG.get_ptr_mut(CFG_HS_TGID) {
+        unsafe { *slot = tgid };
+    }
+    Ok(())
+}
+
 // ── fork: adopt children of watched processes ───────────────────────────────
 
 #[tracepoint]
@@ -428,11 +474,16 @@ pub fn wardyn_fork(ctx: TracePointContext) -> u32 {
 }
 
 fn handle_fork(ctx: &TracePointContext) -> Result<(), i64> {
-    let parent = unsafe { ctx.read_at::<i32>(FORK_PARENT_PID_OFFSET) }? as u32;
+    let parent_off = cfg(CFG_FORK_PARENT_OFF) as usize;
+    let child_off = cfg(CFG_FORK_CHILD_OFF) as usize;
+    if parent_off == 0 || child_off == 0 {
+        return Ok(()); // offsets not published yet — nothing can be watched yet either
+    }
+    let parent = unsafe { ctx.read_at::<i32>(parent_off) }? as u32;
     if !is_watched(parent) {
         return Ok(());
     }
-    let child = unsafe { ctx.read_at::<i32>(FORK_CHILD_PID_OFFSET) }? as u32;
+    let child = unsafe { ctx.read_at::<i32>(child_off) }? as u32;
     let _ = WATCHED.insert(&child, &1u8, 0);
     Ok(())
 }

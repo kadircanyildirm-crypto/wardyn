@@ -22,7 +22,7 @@ operation by returning an error to the kernel, not after the fact.
 | **exec** | `tracepoint/syscalls/sys_enter_execve` + `sys_enter_execveat` | LSM `bprm_check_security` | ✅ (LSM) | deny returns `-EPERM` to `execve`; both syscall variants observed so a denial can't happen off-feed |
 | **file open** (`.env`, `~/.ssh`) | `tracepoint/syscalls/sys_enter_openat` + `sys_enter_openat2` | LSM `file_open` | ✅ (LSM only) | `bpf_override_return` can't deny `openat` — not on the kernel error-injection allowlist, so blocking *requires* BPF LSM |
 | **outbound connect** | `tracepoint/syscalls/sys_enter_connect` + `sys_enter_sendto` | `cgroup/connect4·6` + `cgroup/sendmsg4·6` | ✅ (cgroup v2) | cgroup hook denies `connect()`/`sendmsg()` **without** LSM — works even on stock WSL2. `sendmsg`'s msghdr destination is enforce-only (not yet observed) |
-| **fork / child tracking** | `tracepoint/sched/sched_process_fork` (+ `sched_process_exit` to evict) | — | — | maintains the watched PID set |
+| **fork / child tracking** | `tracepoint/sched/sched_process_fork` (+ `sched_process_exit` to evict) | — | — | maintains the watched PID set; pid field offsets read from tracefs at runtime |
 
 > The observe hooks are the `sys_enter_*` variants (not `sched_process_exec`/`kprobe tcp_connect`) so that **every** syscall the enforce hooks can act on is also surfaced to the feed — otherwise the kernel could deny an `openat2`/`execveat`/`sendto` that never showed up in the UI or audit log.
 
@@ -41,6 +41,22 @@ Wardyn is scoped to *one* agent invocation, not the whole host:
 
 This makes Wardyn safe to run on a shared machine: it only constrains the subtree you launched.
 
+Two portability traps live in that seeding, both handled at startup:
+
+- **Pid namespaces.** The hooks key `WATCHED` by *init-namespace* tgid
+  (`bpf_get_current_pid_tgid`), while `std::process::id()` is wardyn's pid in
+  its *own* namespace — different numbers inside a container or WSL2 distro, so
+  a locally-seeded map would watch (and enforce) nothing while claiming to.
+  Wardyn learns its kernel-view tgid via a nonce-gated tracepoint handshake on
+  `sys_enter_personality`, seeds that, announces the mismatch, and leaves child
+  adoption entirely to the in-kernel fork hook (a local child pid could collide
+  with an unrelated init-ns tgid). Under a mismatch the feed shows init-ns pids.
+- **Fork tracepoint layout.** `sched_process_fork`'s pid offsets moved when the
+  kernel made comm dynamic (`__data_loc`, observed on 6.18: parent_pid 24→12,
+  child_pid 44→20). Wardyn reads the running kernel's tracefs `format` file and
+  passes the offsets to the hook via `CONFIG` instead of hardcoding one
+  kernel's numbers.
+
 ## Event flow
 
 ```
@@ -50,14 +66,16 @@ This makes Wardyn safe to run on a shared machine: it only constrains the subtre
  │ + cgroup/connect    ├──────────────▶│  → policy engine (match) │
  │  (enforce inline)   │               │  → ratatui TUI (live)    │
  │  ▲ policy verdict   │  PerCpuArray  │  → JSONL audit log       │
- │  └──── shared maps ◀─┼───────────────┤ compiled policy → maps  │
- └─────────────────────┘               └──────────────────────────┘
+ │  └──── shared maps ◀─┼───────────────┤  → denial receipt → agent│
+ └─────────────────────┘               │ compiled policy → maps  │
+                                       └──────────────────────────┘
 ```
 
 - **Fast-path decisions live in kernel maps.** Userspace compiles `policy.yaml` into eBPF maps
   (path-hash → action, CIDR trie → action) so the LSM/cgroup hook decides `allow|block`
   inline without a userspace round-trip. `warn` events are streamed up for display only.
-- **RingBuf** carries events to userspace for the TUI + audit log.
+- **RingBuf** carries events to userspace for the TUI, the audit log, and the
+  agent-facing denial receipt.
 
 ## Policy model
 
@@ -114,9 +132,34 @@ enforced `BLOCK`, and an enforceable-looking glob the kernel *won't* actually de
 demoted to `block~`. Rules whose kernel key is broader than their glob are printed as
 a warning at startup so the over-reach is explicit, not silent.
 
+## Agent feedback — denial receipts
+
+A denial reaches the watched agent as a bare `EPERM`, indistinguishable from an
+ordinary permission error — so agents retry, reach for `sudo`, or work around the
+failure. Wardyn can see everything the agent does; the receipt gives the agent a
+way to see Wardyn back.
+
+Under `--enforce`, `run` spawns the child with `WARDYN_DENIALS=<path>` in its
+environment: a per-run JSONL file (truncated at start, unlike the append-only
+audit log) with a self-describing header line written for an LLM reader, then one
+record per kernel-denied event, flushed as it happens. The agent matches its
+failed operation against the records, learns which rule fired, and can surface
+that to its operator instead of flailing.
+
+Trust model: the receipt is *output to* the watched tree, never input. The agent
+can read it — or scribble on its copy of the truth — but the enforcement state
+lives in kernel maps and root-owned policy it cannot reach. Denials are receipted
+from the same reconciled verdict as the feed and audit log (`Desc::denied`), so
+the receipt never claims a denial the kernel didn't make. Known gap: UDP
+`sendmsg()` destinations are enforce-only (not observed), so those denials can't
+be receipted.
+
 ## Roadmap
 
 - [x] **M1 — Observe:** exec + openat + connect for the watched tree → live TUI.
 - [x] **M2 — Policy/warn:** `policy.yaml` compiled to matchers, violations coloured, JSONL audit.
 - [x] **M3 — Block:** network via cgroup/connect + file & exec via LSM.
 - [ ] **M4 — Ship:** demo GIF, presets, `--dry-run`, IPv6 egress, CI devcontainer.
+- [ ] **M5 — Agent feedback:** denial receipts ✓ (`WARDYN_DENIALS`); next:
+  approve-once exceptions from the TUI, persistent overrides kept outside the
+  watched tree's reach.
