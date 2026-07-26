@@ -10,8 +10,12 @@ files:
   - { match: "**/.ssh/**", action: block }
   - { match: "**/.aws/**", action: block }
   - { match: "**/.config/gcloud/**", action: block }
-  - { match: "**/.kube/config", action: block }
-  - { match: "**/.docker/config.json", action: block }
+  # Use directory form (**/dir/**) not **/.kube/config: the kernel matcher keys on
+  # the basename, so `.../config` would reduce to "deny ANY file named config" and
+  # also block .git/config — contradicting the warn rule below. The dir form keys
+  # on `.kube`/`.docker` instead.
+  - { match: "**/.kube/**", action: block }
+  - { match: "**/.docker/**", action: block }
   - { match: "**/.netrc", action: block }
   - { match: "**/.npmrc", action: block }
   - { match: "**/.pypirc", action: block }
@@ -24,10 +28,14 @@ network:
   - { cidr: "10.0.0.0/8", action: allow }
   - { cidr: "172.16.0.0/12", action: allow }
   - { cidr: "192.168.0.0/16", action: allow }
+  - { cidr: "::1/128", action: allow } # IPv6 loopback
+  - { cidr: "fc00::/7", action: allow } # IPv6 unique-local (private)
+  - { cidr: "fe80::/10", action: allow } # IPv6 link-local
   - { domain: "github.com", action: allow }
   - { domain: "api.anthropic.com", action: allow }
   - { domain: "registry.npmjs.org", action: allow }
-  - { cidr: "0.0.0.0/0", action: block } # deny everything else
+  - { cidr: "0.0.0.0/0", action: block } # deny everything else (IPv4)
+  - { cidr: "::/0", action: block } # deny everything else (IPv6 + v4-mapped)
 
 exec:
   - { match: "**/nc", action: block }

@@ -25,6 +25,12 @@ demo:
 test:
     cargo test
 
+# End-to-end enforcement test: load the real eBPF and assert blocks/allows.
+# Needs root + a release build (`just build`). BPF-LSM optional (file assertions
+# self-skip without it).
+e2e:
+    sudo bash tests/e2e/run.sh ./target/release/wardyn
+
 # What CI checks: formatting + clippy (deny warnings).
 lint:
     cargo fmt --all --check

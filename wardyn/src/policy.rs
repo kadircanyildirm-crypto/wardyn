@@ -465,6 +465,35 @@ impl Policy {
         out
     }
 
+    /// Egress coverage gaps between the IPv4 and IPv6 rule sets, as human warnings.
+    /// The kernel decides v6 (and v4-mapped `::ffff:` — see the connect6 hook) with
+    /// the v6 trie, falling back to `default_action` on a miss; so a v4 `0.0.0.0/0`
+    /// deny-all with no `::/0` counterpart and a non-`block` default leaves every
+    /// IPv6 destination allowed while the operator believes "deny all other egress"
+    /// is in force. Surfaced at startup so the hole is never silent.
+    pub fn net_coverage_gaps(&self) -> Vec<String> {
+        let has_block_all = |v6: bool| {
+            self.network.iter().any(|r| {
+                r.action == Action::Block
+                    && match &r.which {
+                        NetMatch::V4Cidr(n) => !v6 && n.prefix_len() == 0,
+                        NetMatch::V6Cidr(n) => v6 && n.prefix_len() == 0,
+                        _ => false,
+                    }
+            })
+        };
+        let mut out = Vec::new();
+        if has_block_all(false) && !has_block_all(true) && self.default_action != Action::Block {
+            out.push(
+                "policy denies all IPv4 egress (0.0.0.0/0 block) but has no IPv6 catch-all and \
+                 default_action is not `block` — IPv6 and IPv4-mapped destinations are NOT denied. \
+                 Add `- { cidr: \"::/0\", action: block }` (plus any v6 allow rules) to close it."
+                    .to_string(),
+            );
+        }
+        out
+    }
+
     /// Patterns of `block` file/exec rules that CANNOT be kernel-enforced (glob
     /// segments). The feed flags these distinctly and startup warns about them.
     pub fn observe_only_blocks(&self) -> Vec<String> {

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Fixture policy for the end-to-end enforcement test (tests/e2e/run.sh).
+# Deliberately has NO `domain:` rules, so the test needs no DNS and is
+# deterministic offline. Blocks a public IP (v4 + v6), a `.env` basename, and
+# `nc`; allows loopback and everything else.
+version: 1
+default_action: allow
+
+files:
+  - { match: "**/.env", action: block }
+  - { match: "**", action: allow }
+
+network:
+  - { cidr: "127.0.0.0/8", action: allow } # loopback v4
+  - { cidr: "::1/128", action: allow } # loopback v6
+  - { cidr: "0.0.0.0/0", action: block } # deny all other v4 egress
+  - { cidr: "::/0", action: block } # deny all other v6 egress (regression guard)
+
+exec:
+  - { match: "**/nc", action: block }
+  - { match: "**", action: allow }

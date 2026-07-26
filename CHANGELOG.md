@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Runtime BTF offset resolution for the LSM matcher.** The `dentry` field offsets
+  the file/exec hooks read are now resolved from the running kernel's own BTF
+  (`/sys/kernel/btf/vmlinux`) and passed via `CONFIG`, so the matcher adapts to the
+  kernel instead of being pinned to 6.8; it falls back to the built-in offsets (and
+  demotes file/exec rows to `block~`) when BTF is unavailable and the kernel isn't
+  6.8. (True CO-RE is unavailable for the Rust BPF target — a `rustc`/LLVM
+  limitation — so userspace-side resolution is the portable substitute.)
+- **Privilege drop for the watched agent.** Under `run`, the child is dropped to
+  `$SUDO_UID`/`$SUDO_GID` (or `--as-user uid[:gid]`) with `PR_SET_NO_NEW_PRIVS`
+  before `exec`, so the sandboxed process no longer inherits the root that could
+  disable its own warden. `--keep-root` opts out; the drop is required under
+  `--enforce` unless a target identity is available.
+- Startup warning for IPv6 egress coverage gaps (`net_coverage_gaps`): a v4
+  `0.0.0.0/0` deny-all with no `::/0` counterpart is now flagged, not silent.
+- `docs/AUDIT.md` (adversarially-verified full audit) and `docs/COMPARISON.md`
+  (honest positioning vs sandboxes, Landlock, Tetragon/Tracee).
+
 - **Denial receipts — the agent learns what was denied (M5).** Under `--enforce`,
   the watched command is spawned with `WARDYN_DENIALS=<path>`: a per-run JSONL
   receipt with a self-describing header and one record per kernel-denied action.
@@ -43,6 +60,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README and roadmap updated to reflect completed IPv6 egress and UDP gating.
 
 ### Fixed
+
+- **IPv6 egress was not enforced.** Both presets expressed "deny all other egress"
+  only as `0.0.0.0/0` (IPv4), leaving every IPv6 destination — and IPv4-mapped
+  `::ffff:a.b.c.d` from dual-stack sockets, which run the `connect6` hook — allowed
+  while the feed showed `ok`. The presets now carry `::/0` (and v6 loopback/private
+  allows), `connect6` unwraps v4-mapped addresses into the v4 trie, and the
+  userspace feed mirrors both.
+- **`pthread_exit()` from a thread-group leader silently unwatched a live process.**
+  `wardyn_exit` evicted on leader exit, but a leader can exit while worker threads
+  keep running. When there is no pid-namespace mismatch, eviction is now deferred to
+  a userspace `/proc` sweep that only drops a tgid once its whole thread group is
+  gone (`CFG_DEFER_EVICT`); the kernel keeps leader-exit eviction under a mismatch.
+- **The feed/receipt claimed file/exec `BLOCK` when the LSM wasn't actually
+  enforcing.** When the BPF LSM fails to attach, or the `dentry` offsets aren't
+  trusted on a non-6.8 kernel, file/exec `block` rows are now demoted to `block~`
+  and are **not** receipted, instead of asserting a denial that never fired.
+- **`strict.yaml` blocked any file named `config`/`config.json`** (from
+  `**/.kube/config` and `**/.docker/config.json` reducing to bare basenames, which
+  also broke `.git/config`). These are now directory-form rules (`**/.kube/**`,
+  `**/.docker/**`).
 
 - **`run` scoping silently watched nothing inside pid namespaces** (docker
   containers, WSL2 distros — including `--enforce`, which then denied nothing

@@ -19,7 +19,11 @@ network:
   - { cidr: "10.0.0.0/8", action: allow }
   - { cidr: "172.16.0.0/12", action: allow }
   - { cidr: "192.168.0.0/16", action: allow }
-  - { cidr: "0.0.0.0/0", action: warn } # flag external egress, don't block
+  - { cidr: "::1/128", action: allow } # IPv6 loopback
+  - { cidr: "fc00::/7", action: allow } # IPv6 unique-local (private)
+  - { cidr: "fe80::/10", action: allow } # IPv6 link-local
+  - { cidr: "0.0.0.0/0", action: warn } # flag external IPv4 egress, don't block
+  - { cidr: "::/0", action: warn } # flag external IPv6 egress too
 
 exec:
   - { match: "**/nc", action: warn }

@@ -24,7 +24,7 @@ operation by returning an error to the kernel, not after the fact.
 | **outbound connect** | `tracepoint/syscalls/sys_enter_connect` + `sys_enter_sendto` | `cgroup/connect4·6` + `cgroup/sendmsg4·6` | ✅ (cgroup v2) | cgroup hook denies `connect()`/`sendmsg()` **without** LSM — works even on stock WSL2. `sendmsg`'s msghdr destination is enforce-only (not yet observed) |
 | **fork / child tracking** | `tracepoint/sched/sched_process_fork` (+ `sched_process_exit` to evict) | — | — | maintains the watched PID set; pid field offsets read from tracefs at runtime |
 
-> The observe hooks are the `sys_enter_*` variants (not `sched_process_exec`/`kprobe tcp_connect`) so that **every** syscall the enforce hooks can act on is also surfaced to the feed — otherwise the kernel could deny an `openat2`/`execveat`/`sendto` that never showed up in the UI or audit log.
+> The observe hooks are the `sys_enter_*` variants (not `sched_process_exec`/`kprobe tcp_connect`) so that the common syscalls the enforce hooks act on are also surfaced to the feed. This coverage is **not total**: the LSM/cgroup hooks fire for a strictly larger set of entry points than the attached tracepoints (e.g. the legacy `open(2)`/`creat(2)`, `sendmsg(2)`, io_uring `IORING_OP_*`, and a script interpreter reached via `execve`), so a denial on one of those paths can still happen *off-feed*. The durable fix is to have the deciding hook emit its own verdict event rather than have userspace re-derive it (see "Agent feedback" and `docs/AUDIT.md`).
 
 Two independent enforcement paths on purpose:
 - **Network blocking → cgroup/connect** (needs only cgroup v2).
@@ -116,10 +116,16 @@ claiming to).
   rules most-specific-first (not first-match) to report the same verdict the kernel
   enforces — a broad `block` CIDR before a narrow `allow` no longer disagree.
 - **File** — LSM `file_open` reads `file->f_path.dentry->d_name` (basename) and its
-  parent-dir name at fixed kernel offsets, and returns `-EPERM` if either is in the
-  `BLOCK_NAMES` / `BLOCK_DIRS` set. aya-ebpf 0.1 has no `bpf_d_path`/`bpf_loop`, so
-  matching is exact basename/dir rather than full-path glob. Offsets:
-  `scripts/kernel-offsets.sh`.
+  parent-dir name and returns `-EPERM` if either is in the `BLOCK_NAMES` /
+  `BLOCK_DIRS` set. Matching is **exact basename/dir**, not full-path glob (so it
+  stops accidental/naive access but is bypassable by renaming or hard-linking the
+  target — see `SECURITY.md`). Full-path matching via `bpf_d_path` is on the
+  roadmap. The `dentry`-field offsets are resolved **at runtime from the kernel's
+  BTF** (`/sys/kernel/btf/vmlinux`) and passed via `CONFIG`, falling back to the
+  built-in kernel-6.8 offsets if BTF resolution fails. (Compiler-emitted CO-RE
+  relocations are unavailable for the Rust BPF target — a `rustc`/LLVM limitation —
+  so userspace-side BTF resolution is the portable substitute.) `scripts/kernel-offsets.sh`
+  remains a manual cross-check.
 - **Exec** — LSM `bprm_check_security` applies the same basename match to
   `linux_binprm->file` against `BLOCK_EXEC`.
 
@@ -149,10 +155,18 @@ that to its operator instead of flailing.
 Trust model: the receipt is *output to* the watched tree, never input. The agent
 can read it — or scribble on its copy of the truth — but the enforcement state
 lives in kernel maps and root-owned policy it cannot reach. Denials are receipted
-from the same reconciled verdict as the feed and audit log (`Desc::denied`), so
-the receipt never claims a denial the kernel didn't make. Known gap: UDP
-`sendmsg()` destinations are enforce-only (not observed), so those denials can't
-be receipted.
+from the same reconciled verdict as the feed and audit log (`Desc::denied`).
+
+That verdict is currently a userspace **inference** (the deciding hook does not
+report its own decision — see the hook-map note above), so it can diverge from
+what the kernel really did. Two known ways it lies, both now guarded but not
+eliminated: (1) when the BPF LSM does not attach or the `dentry` offsets are not
+trustworthy, file/exec `block` rules are demoted to `block~` and are **not**
+receipted, rather than claiming a `BLOCK` that never fired; (2) UDP `sendmsg()`
+destinations are enforce-only (not observed), and dirfd-relative / symlink opens
+can be denied by the kernel yet under-reported by the mirror. The durable fix —
+emitting the verdict from the enforcement hook itself — is tracked in
+`docs/AUDIT.md` (`no-kernel-verdict-channel`).
 
 ### Approve-once exceptions (TUI)
 

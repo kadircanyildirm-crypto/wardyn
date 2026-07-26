@@ -90,9 +90,11 @@ sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh
 
 Renders a live TUI when attached to a terminal; pipe it (or pass `--plain`) for a
 plain table. `--policy <file>`, `--audit <file>` and `--denials <file>` override
-the defaults. In the TUI, `q` quits; under `--enforce`, `a` grants an
-approve-once exception for the last denial (with a y/n confirm that names the
-true scope).
+the defaults. The watched agent is run as your non-root user by default (via
+`$SUDO_UID`, so it can't disable its own warden); use `--as-user uid[:gid]` to
+choose, or `--keep-root` to keep it as root. In the TUI, `q` quits; under
+`--enforce`, `a` grants an approve-once exception for the last denial (with a y/n
+confirm that names the true scope).
 
 ## Policy
 
@@ -208,9 +210,15 @@ Full design, hook map, and the eBPF-verifier war stories are in
 - Works from inside pid namespaces (containers, WSL2 distros): wardyn learns its
   kernel-view pid via an in-kernel handshake and says so when it differs.
 
-> The LSM file/exec matcher reads a few `dentry` fields at fixed offsets for the
-> target kernel (aya-ebpf 0.1 ships neither `bpf_d_path` nor vmlinux structs).
-> Regenerate them for another kernel with [`scripts/kernel-offsets.sh`](./scripts/kernel-offsets.sh).
+> The LSM file/exec matcher reads a few `dentry` fields by offset. Wardyn now
+> resolves those offsets **at runtime from the kernel's own BTF**
+> (`/sys/kernel/btf/vmlinux`) and passes them to the eBPF program, so it adapts to
+> the running kernel instead of being pinned to one layout; if BTF resolution
+> fails it falls back to the built-in kernel-6.8 offsets and says so. (True
+> CO-RE — compiler-emitted BTF relocations — is *not* available for the Rust BPF
+> target; this is a `rustc`/LLVM limitation, not an aya one, so runtime resolution
+> is the portable answer.) [`scripts/kernel-offsets.sh`](./scripts/kernel-offsets.sh)
+> remains a manual cross-check.
 
 ## Roadmap
 
@@ -235,6 +243,12 @@ we follow a [Code of Conduct](./CODE_OF_CONDUCT.md).
 Wardyn runs as root and loads eBPF into the kernel. Found a vulnerability? Please
 report it **privately** — see [SECURITY.md](./SECURITY.md), not the public issue
 tracker. The threat model and known limitations are documented there too.
+
+An independent, adversarially-verified audit of the whole codebase — every gap,
+escape, and honesty caveat, ranked by severity — lives in
+[`docs/AUDIT.md`](./docs/AUDIT.md); an honest comparison against sandboxes,
+Landlock, and Tetragon/Tracee is in [`docs/COMPARISON.md`](./docs/COMPARISON.md).
+Read both before relying on Wardyn as anything more than a defence-in-depth layer.
 
 ## License
 

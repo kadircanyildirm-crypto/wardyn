@@ -32,9 +32,14 @@ static WATCHED: HashMap<u32, u8> = HashMap::with_max_entries(8192, 0);
 /// [3] pid-ns handshake nonce (userspace→kernel), [4] learned init-ns tgid
 /// (kernel→userspace, written by `wardyn_handshake`), [5]/[6] byte offsets of
 /// sched_process_fork's parent_pid/child_pid fields (read from tracefs — the
-/// layout moved when comm became `__data_loc` in newer kernels).
+/// layout moved when comm became `__data_loc` in newer kernels),
+/// [7] defer_evict (1 = don't evict WATCHED on leader exit; userspace prunes
+/// against /proc instead — avoids the pthread_exit-from-leader escape),
+/// [8]/[9]/[10]/[11] LSM struct offsets (file→dentry, dentry→name, dentry→parent,
+/// binprm→file) resolved at runtime from BTF; 0 means "fall back to the built-in
+/// kernel-6.8 constants".
 #[map]
-static CONFIG: Array<u32> = Array::with_max_entries(8, 0);
+static CONFIG: Array<u32> = Array::with_max_entries(16, 0);
 
 /// Blocked-CIDR -> action code (longest-prefix), keyed by IPv4 in network order.
 #[map]
@@ -63,6 +68,11 @@ const CFG_HS_NONCE: u32 = 3;
 const CFG_HS_TGID: u32 = 4;
 const CFG_FORK_PARENT_OFF: u32 = 5;
 const CFG_FORK_CHILD_OFF: u32 = 6;
+const CFG_DEFER_EVICT: u32 = 7;
+const CFG_FILE_DENTRY_OFF: u32 = 8;
+const CFG_DENTRY_NAME_OFF: u32 = 9;
+const CFG_DENTRY_PARENT_OFF: u32 = 10;
+const CFG_BPRM_FILE_OFF: u32 = 11;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
 // personality(persona) — persona is the 1st arg, same slot as execve's filename.
@@ -79,7 +89,10 @@ const SENDTO_UADDR_OFFSET: usize = 48;
 // the offsets via CONFIG[CFG_FORK_PARENT_OFF]/[CFG_FORK_CHILD_OFF]. Syscall
 // tracepoints (above) keep their ABI-stable 16+8·n argument slots.
 
-// struct offsets for kernel 6.8 (from `pahole`); see scripts/kernel-offsets.sh.
+// Built-in struct offsets for kernel 6.8 (from `pahole`; see
+// scripts/kernel-offsets.sh). These are only a FALLBACK now: userspace resolves
+// the running kernel's real offsets from BTF and publishes them via CONFIG[8..11]
+// (`off()` prefers the CONFIG value and drops to these when it is 0).
 // file.f_path(152) + path.dentry(8):
 const FILE_DENTRY_OFF: usize = 160;
 // dentry.d_name(32) + qstr.name(8):
@@ -111,6 +124,19 @@ struct SockAddrIn6 {
 #[inline(always)]
 fn cfg(i: u32) -> u32 {
     CONFIG.get(i).copied().unwrap_or(0)
+}
+
+/// A byte offset published by userspace in `CONFIG[idx]`, or `default` when it is
+/// 0 (userspace could not resolve it from BTF). Used for the LSM `dentry` offsets
+/// so the matcher adapts to the running kernel instead of being pinned to 6.8.
+#[inline(always)]
+fn off(idx: u32, default: usize) -> usize {
+    let v = cfg(idx) as usize;
+    if v != 0 {
+        v
+    } else {
+        default
+    }
 }
 
 #[inline(always)]
@@ -265,6 +291,22 @@ pub fn connect4(ctx: SockAddrContext) -> i32 {
     }
 }
 
+/// Longest-prefix verdict for an IPv4 destination (network byte order, matching
+/// how `user_ip4` and the userspace-compiled `NET_RULES` keys are laid out).
+/// Shared by `connect4` and by `connect6`'s v4-mapped path.
+#[inline(always)]
+fn net4_verdict(ip: u32) -> i32 {
+    let action = NET_RULES
+        .get(&Key::new(32, ip))
+        .copied()
+        .unwrap_or_else(|| cfg(CFG_NET_DEFAULT));
+    if action == action::BLOCK {
+        DENY
+    } else {
+        ALLOW
+    }
+}
+
 fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     if cfg(CFG_ENFORCE) == 0 {
         return Ok(ALLOW);
@@ -274,15 +316,7 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(ALLOW);
     }
     let ip = unsafe { (*ctx.sock_addr).user_ip4 }; // network byte order
-    let action = NET_RULES
-        .get(&Key::new(32, ip))
-        .copied()
-        .unwrap_or_else(|| cfg(CFG_NET_DEFAULT));
-    if action == action::BLOCK {
-        Ok(DENY)
-    } else {
-        Ok(ALLOW)
-    }
+    Ok(net4_verdict(ip))
 }
 
 #[cgroup_sock_addr(connect6)]
@@ -314,6 +348,30 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         ]
     };
     let ip6: [u8; 16] = unsafe { core::mem::transmute(w) };
+    // A dual-stack AF_INET6 socket connecting to an IPv4 host runs THIS hook with
+    // a v4-mapped address (`::ffff:a.b.c.d`) — `connect4` never fires for it. If we
+    // only consulted the v6 trie, every IPv4 rule (including the `0.0.0.0/0` deny-
+    // all) would be silently bypassed. So detect the `::ffff:0:0/96` prefix and run
+    // the embedded v4 address through the v4 trie. Explicit byte compares (no loop)
+    // keep the verifier happy.
+    let v4_mapped = ip6[0] == 0
+        && ip6[1] == 0
+        && ip6[2] == 0
+        && ip6[3] == 0
+        && ip6[4] == 0
+        && ip6[5] == 0
+        && ip6[6] == 0
+        && ip6[7] == 0
+        && ip6[8] == 0
+        && ip6[9] == 0
+        && ip6[10] == 0xff
+        && ip6[11] == 0xff;
+    if v4_mapped {
+        // ip6[12..16] are the embedded v4 octets in network order — the same
+        // representation `net4_verdict` and `user_ip4` use.
+        let ip = u32::from_ne_bytes([ip6[12], ip6[13], ip6[14], ip6[15]]);
+        return Ok(net4_verdict(ip));
+    }
     let action = NET_RULES6
         .get(&Key::new(128, Ip6Key(ip6)))
         .copied()
@@ -368,19 +426,19 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
 
     // struct file* -> f_path.dentry
     let file: *const u8 = unsafe { ctx.arg(0) };
-    let dentry = read_ptr(file, FILE_DENTRY_OFF)?;
+    let dentry = read_ptr(file, off(CFG_FILE_DENTRY_OFF, FILE_DENTRY_OFF))?;
 
     // basename: dentry->d_name.name
     let mut name = [0u8; NAME_LEN];
-    read_name(dentry, &mut name)?;
+    read_name(dentry, off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF), &mut name)?;
     if unsafe { BLOCK_NAMES.get(&NameKey(name)).is_some() } {
         return Ok(EPERM);
     }
 
     // parent directory name: dentry->d_parent->d_name.name
-    let parent = read_ptr(dentry, DENTRY_PARENT_OFF)?;
+    let parent = read_ptr(dentry, off(CFG_DENTRY_PARENT_OFF, DENTRY_PARENT_OFF))?;
     let mut dir = [0u8; NAME_LEN];
-    read_name(parent, &mut dir)?;
+    read_name(parent, off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF), &mut dir)?;
     if unsafe { BLOCK_DIRS.get(&NameKey(dir)).is_some() } {
         return Ok(EPERM);
     }
@@ -395,8 +453,8 @@ fn read_ptr(base: *const u8, off: usize) -> Result<*const u8, i64> {
 }
 
 #[inline(always)]
-fn read_name(dentry: *const u8, buf: &mut [u8; NAME_LEN]) -> Result<(), i64> {
-    let name_pp = dentry.wrapping_add(DENTRY_NAME_OFF) as *const *const u8;
+fn read_name(dentry: *const u8, name_off: usize, buf: &mut [u8; NAME_LEN]) -> Result<(), i64> {
+    let name_pp = dentry.wrapping_add(name_off) as *const *const u8;
     let name_ptr: *const u8 = unsafe { bpf_probe_read_kernel(name_pp) }?;
     let _ = unsafe { bpf_probe_read_kernel_str_bytes(name_ptr, buf) };
     Ok(())
@@ -422,10 +480,10 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     }
     // linux_binprm* -> file -> f_path.dentry -> d_name.name (the exec basename)
     let bprm: *const u8 = unsafe { ctx.arg(0) };
-    let file = read_ptr(bprm, BPRM_FILE_OFF)?;
-    let dentry = read_ptr(file, FILE_DENTRY_OFF)?;
+    let file = read_ptr(bprm, off(CFG_BPRM_FILE_OFF, BPRM_FILE_OFF))?;
+    let dentry = read_ptr(file, off(CFG_FILE_DENTRY_OFF, FILE_DENTRY_OFF))?;
     let mut name = [0u8; NAME_LEN];
-    read_name(dentry, &mut name)?;
+    read_name(dentry, off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF), &mut name)?;
     if unsafe { BLOCK_EXEC.get(&NameKey(name)).is_some() } {
         return Ok(EPERM);
     }
@@ -491,12 +549,20 @@ fn handle_fork(ctx: &TracePointContext) -> Result<(), i64> {
 /// Drop a process from WATCHED when it exits, so the set can't grow unbounded
 /// and a reused pid can't be wrongly treated as still-watched.
 ///
-/// `sched_process_exit` fires per-thread, but WATCHED is keyed by tgid. Only act
-/// on the thread-group leader's exit (tid == tgid) and remove by tgid — a worker
-/// thread's tid could otherwise collide with an unrelated watched process's tgid
-/// and evict it by mistake.
+/// `sched_process_exit` fires per-thread, but WATCHED is keyed by tgid. Removing
+/// on the leader's exit (`tid == tgid`) is wrong when the leader exits *first*
+/// while other threads keep running (`pthread_exit()` from `main`): the process
+/// is still alive but silently unwatched. When userspace can prune WATCHED
+/// against `/proc` itself (no pid-namespace mismatch), it sets `CFG_DEFER_EVICT`
+/// and we skip kernel eviction entirely, leaving removal to that sweep — which
+/// only drops a tgid once its whole thread group is actually gone. Under a pid
+/// namespace (where userspace can't map init-ns tgids to its own `/proc`), we
+/// keep the original leader-exit eviction as the best available signal.
 #[tracepoint]
 pub fn wardyn_exit(_ctx: TracePointContext) -> u32 {
+    if cfg(CFG_DEFER_EVICT) != 0 {
+        return 0; // userspace prunes WATCHED against /proc instead
+    }
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;

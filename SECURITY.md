@@ -68,4 +68,29 @@ Out of scope (known limitations, documented, not vulnerabilities):
   fail; Wardyn warns at startup. Regenerate with `scripts/kernel-offsets.sh`.
 - **Requires privilege you already granted.** Wardyn needs root to load eBPF; it
   does not defend against an attacker who is already root outside the watched
-  subtree.
+  subtree. To keep the watched subtree from being that attacker, `run` now drops
+  the child to `$SUDO_UID`/`$SUDO_GID` before `exec` by default (with
+  `PR_SET_NO_NEW_PRIVS`); pass `--keep-root` to disable this or `--as-user` to
+  choose the target identity. A child kept at root can still reach the enforcement
+  maps and disable itself — do not run untrusted agents with `--keep-root`.
+
+- **Name-based file/exec matching is content-blind.** The LSM matcher keys on a
+  file's basename and immediate parent-dir name, so it stops *accidental and naive*
+  access but is **bypassable** by renaming or hard-linking the target before
+  opening it (`mv`/`link()` are not hooked) or by copying a blocked binary to a new
+  name. Treat it as a guard against mistakes, not a defence against deliberate
+  exfiltration. Full-path matching (`bpf_d_path`) and `(dev, ino)` keying are on the
+  roadmap.
+
+- **The feed/audit/receipt verdict is an inference.** The enforcement hook returns
+  `-EPERM`/deny but does not report *what* it denied; userspace re-derives the
+  verdict from the observed syscall path. That inference can diverge from the kernel
+  for dirfd-relative and symlink opens, `sendmsg()` egress, and off-feed syscall
+  paths. When the LSM does not attach or `dentry` offsets are untrustworthy,
+  file/exec blocks are demoted to `block~` and not receipted rather than asserting a
+  denial that did not fire. The durable fix (emit the verdict from the hook) is
+  tracked in [`docs/AUDIT.md`](./docs/AUDIT.md).
+
+The complete, adversarially-verified list of gaps and escapes — including several
+not yet fixed — is in [`docs/AUDIT.md`](./docs/AUDIT.md). It is required reading
+before depending on Wardyn.

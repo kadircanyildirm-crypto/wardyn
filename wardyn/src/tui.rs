@@ -28,7 +28,7 @@ use tokio::process::Child;
 use wardyn_common::kind;
 
 use crate::policy::{Action, DenialKey, Exceptions};
-use crate::{drain, wait_for, Desc, RunCtx};
+use crate::{drain, prune_watched, wait_for, Desc, RunCtx};
 
 const MAX_ROWS: usize = 4096;
 
@@ -315,6 +315,9 @@ pub async fn run(
     let mut app = App::new(target, ctx.enforce);
     let mut exceptions = Exceptions::default();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    // Prune WATCHED against /proc every ~2s (20 × 100ms ticks) when eviction is
+    // deferred to userspace; harmless otherwise (ctx.watched is None).
+    let mut sweeps: u32 = 0;
     let mut quit = false;
 
     while !quit {
@@ -322,6 +325,13 @@ pub async fn run(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => quit = true,
             _ = ticker.tick() => {
+                sweeps += 1;
+                if sweeps >= 20 {
+                    sweeps = 0;
+                    if let Some(m) = ctx.watched.as_mut() {
+                        prune_watched(m);
+                    }
+                }
                 while event::poll(Duration::ZERO)? {
                     if let CtEvent::Key(k) = event::read()? {
                         let ctrl_c = k.code == KeyCode::Char('c')

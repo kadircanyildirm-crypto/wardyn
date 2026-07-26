@@ -22,14 +22,23 @@ files:
 # ── Outbound network ───────────────────────────────────────────
 # Match by `cidr` (IP range) or `domain` (resolved to IPs at load time).
 network:
+  # IPv4
   - { cidr: "127.0.0.0/8", action: allow } # loopback
   - { cidr: "10.0.0.0/8", action: allow } # private LAN
   - { cidr: "172.16.0.0/12", action: allow }
   - { cidr: "192.168.0.0/16", action: allow }
+  # IPv6 — mirror the private/loopback allows, or the v6 deny-all below blocks them
+  - { cidr: "::1/128", action: allow } # loopback
+  - { cidr: "fc00::/7", action: allow } # unique-local (private)
+  - { cidr: "fe80::/10", action: allow } # link-local
+  # Allowed services (each resolves to A *and* AAAA records at load)
   - { domain: "api.anthropic.com", action: allow }
   - { domain: "registry.npmjs.org", action: allow }
   - { domain: "github.com", action: allow }
-  - { cidr: "0.0.0.0/0", action: block } # deny all other egress
+  # Deny all other egress — BOTH families. Without the ::/0 rule, every IPv6
+  # destination (and IPv4-mapped ::ffff: from dual-stack sockets) would be allowed.
+  - { cidr: "0.0.0.0/0", action: block }
+  - { cidr: "::/0", action: block }
 
 # ── Process execution ──────────────────────────────────────────
 # `match` is a glob against the executable path being exec'd.

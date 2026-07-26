@@ -1,0 +1,55 @@
+# End-to-end enforcement test: build the real eBPF object, load it, run an agent
+# under --enforce, and assert the kernel actually blocked/allowed what policy says.
+# This is the coverage the unit tests can't provide (they never load the eBPF).
+#
+# Hosted GitHub runners have BTF + cgroup v2 (so egress enforcement, the eBPF
+# load/verifier path, and privilege drop are all exercised) but NOT BPF-LSM, so
+# the file/exec assertions self-skip. For full file/exec coverage, run this on a
+# self-hosted runner (or a VM) booted with `lsm=...,bpf` — see scripts/enable-bpf-lsm.sh.
+name: Enforcement E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  enforce-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
+      - name: Build (release — userspace + eBPF object)
+        run: cargo build --release
+
+      - name: Show kernel / capability context
+        run: |
+          uname -a
+          echo "LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown)"
+          echo "BTF:  $([ -e /sys/kernel/btf/vmlinux ] && echo present || echo MISSING)"
+          echo "cgroup: $(stat -fc %T /sys/fs/cgroup 2>/dev/null)"
+
+      # sudo preserves $SUDO_UID, which the test uses to assert privilege drop.
+      # Invoke via `bash` so the test does not depend on the checked-out exec bit.
+      - name: Run enforcement E2E
+        run: sudo bash ./tests/e2e/run.sh ./target/release/wardyn
