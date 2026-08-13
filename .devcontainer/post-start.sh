@@ -49,9 +49,9 @@ if [[ ",$LSMS," == *",bpf,"* ]]; then
 else
   warn "BPF LSM NOT active (lsm=$LSMS)"
   printf '      File/exec blocking is unavailable on this host. Builds, unit tests,\n'
-  printf '      --dry-run and egress enforcement all still work; `just e2e` will\n'
+  printf '      --dry-run and egress enforcement all still work; "just e2e" will\n'
   printf '      SKIP its file assertions. To get it, boot the HOST kernel with\n'
-  printf '      `lsm=...,bpf` (scripts/enable-bpf-lsm.sh, in a VM you control).\n'
+  printf '      lsm=...,bpf (scripts/enable-bpf-lsm.sh, in a VM you control).\n'
   printf '      Docker Desktop on macOS/Windows ships a VM kernel without it.\n'
 fi
 

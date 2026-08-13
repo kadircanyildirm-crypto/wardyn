@@ -43,8 +43,11 @@ RUN cd /tmp/toolchain && rustup show \
  && rustup component add rustfmt clippy \
  && rm -rf /tmp/toolchain
 
-# Links the eBPF object. `--locked` so the linker itself is reproducible.
-RUN cargo install bpf-linker --locked
+# Links the eBPF object — pinned by the same argument as the compiler, and
+# copied in rather than repeated for the same reason as rust-toolchain.toml.
+COPY --chown=ubuntu:ubuntu BPF_LINKER_VERSION /tmp/
+RUN cargo install bpf-linker --locked --version "$(cat /tmp/BPF_LINKER_VERSION)" \
+ && rm -f /tmp/BPF_LINKER_VERSION
 
 # `bpfel-unknown-none` needs no rustup target: build.rs builds it with
 # -Z build-std=core, which is why rust-src is pinned as a component above.

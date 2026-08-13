@@ -133,6 +133,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit log is opened for **append** instead of truncated on each run, so the
   security record survives across invocations.
 - README and roadmap updated to reflect completed IPv6 egress and UDP gating.
+- **`bpf-linker` is pinned** in `BPF_LINKER_VERSION` and installed `--locked`
+  everywhere it is installed (both CI workflows, the release workflow,
+  `setup-vm.sh`, the dev container). Pinning the nightly while leaving the linker
+  floating covered half the problem: the linker is what emits the bytecode the
+  verifier sees, so two builds of the same commit could still differ. It is also
+  what actually broke — bpf-linker 0.11 stopped using the LLVM bundled with rustc
+  and now requires a matching system LLVM, so every unpinned install started
+  failing with `could not find llvm-config`, on a tool whose failure mode is to
+  fail open.
 - `scripts/setup-vm.sh` installs the toolchain `rust-toolchain.toml` pins
   (via `rustup show` from the repo root) instead of a floating `nightly`. It was
   downloading a second toolchain that nothing then built with, and reporting its

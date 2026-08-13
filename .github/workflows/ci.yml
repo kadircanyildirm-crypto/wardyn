@@ -54,9 +54,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `--locked` so the linker itself is built from a fixed dependency graph.
+      # The linker version is pinned for the same reason the nightly is: it
+      # produces the bytecode the kernel verifies. A floating linker also breaks
+      # unannounced — 0.11 dropped rustc's bundled LLVM for a system one and
+      # every build here started failing with "could not find llvm-config".
+      # `--locked` fixes the linker's own dependency graph on top of that.
       - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+        run: cargo install bpf-linker --locked --version "$(cat BPF_LINKER_VERSION)"
 
       - name: Format
         run: cargo fmt --all --check

@@ -22,7 +22,13 @@ Requirements:
 
 - **Rust nightly** + `rust-src` (pinned in [`rust-toolchain.toml`](./rust-toolchain.toml)).
   The eBPF crate is compiled with `-Z build-std=core` for the `bpfel` target.
-- **`bpf-linker`** — `cargo install bpf-linker`.
+- **`bpf-linker`**, at the version pinned in
+  [`BPF_LINKER_VERSION`](./BPF_LINKER_VERSION) — `scripts/setup-vm.sh` installs
+  it, or `cargo install bpf-linker --locked --version "$(cat BPF_LINKER_VERSION)"`.
+  Pinned for the same reason as the compiler: it emits the bytecode the kernel
+  verifies. Bumping it is a deliberate change — re-run `just e2e` afterwards, and
+  note that from 0.11 onwards bpf-linker needs a *system* LLVM matching rustc's
+  (`rustc -vV` prints the version), not the one bundled with rustc.
 - To *run* enforcement: a kernel with **BTF**, **cgroup v2**, and **BPF LSM**
   (`CONFIG_BPF_LSM=y` + `lsm=...,bpf`; see [`scripts/enable-bpf-lsm.sh`](./scripts/enable-bpf-lsm.sh)).
 

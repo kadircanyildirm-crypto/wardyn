@@ -11,7 +11,7 @@ echo "SECRET_API_KEY=sk-demo-not-real"      > "$DEMO/.env"
 echo "//registry.npmjs.org/:_authToken=xx" > "${HOME}/.npmrc"
 [ -f "${HOME}/.ssh/id_ed25519" ] || echo "FAKE-DEMO-KEY" > "${HOME}/.ssh/id_ed25519"
 
-for i in 1 2 3; do
+for _ in 1 2 3; do
   # ── file reads ──
   cat /etc/hostname            >/dev/null 2>&1   # open  -> allow
   cat "$DEMO/.env"             >/dev/null 2>&1   # open  -> BLOCK  (**/.env)

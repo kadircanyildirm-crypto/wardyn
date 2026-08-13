@@ -52,6 +52,10 @@ if grep -qw bpf /sys/kernel/security/lsm 2>/dev/null; then LSM_ACTIVE=1; fi
 
 # ── workspace ───────────────────────────────────────────────────────────────
 WS="$(mktemp -d)"
+# Invoked by the EXIT trap below, never by name. ShellCheck renamed this check
+# between releases (SC2317 in 0.9, SC2329 in 0.11), so silence both or the lint
+# passes locally and fails on whichever version CI happens to ship.
+# shellcheck disable=SC2317,SC2329
 cleanup() { rm -rf "$WS"; }
 trap cleanup EXIT
 chmod 777 "$WS" # the agent runs dropped-privilege; let it read/write here

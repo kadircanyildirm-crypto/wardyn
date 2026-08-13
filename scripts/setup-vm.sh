@@ -26,9 +26,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 (cd "$REPO_ROOT" && rustup show)
 
 echo "== bpf-linker (links the eBPF object) =="
-# --locked, as CI does: the linker that produces the kernel-side artifact is
-# built from a fixed dependency graph rather than whatever resolves today.
-cargo install bpf-linker --locked
+# Pinned in BPF_LINKER_VERSION and installed --locked, for the same reason the
+# nightly is pinned: this is the tool that emits the bytecode the kernel
+# verifies. It is also a moving target — 0.11 swapped rustc's bundled LLVM for a
+# system one, so an unpinned install fails outright on a machine without a
+# matching llvm-config.
+cargo install bpf-linker --locked --version "$(cat "$REPO_ROOT/BPF_LINKER_VERSION")"
 
 echo
 echo "== versions =="
