@@ -34,6 +34,12 @@ test:
 test-portable:
     cargo test --locked -p wardyn-policy -p wardyn-common
 
+# Put EVERY eBPF program in front of the kernel verifier — load only, never
+# attach, so it covers the LSM hooks even on a kernel that cannot attach them.
+# Needs root and jq. This is the cheap check; `just e2e` is the honest one.
+verify-programs:
+    bin="$(cargo test --locked --release --test verifier_smoke --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "verifier_smoke") | .executable')"; sudo "$bin" --nocapture
+
 # End-to-end enforcement test: load the real eBPF and assert blocks/allows.
 # Needs root + a release build (`just build`). BPF-LSM optional (file assertions
 # self-skip without it).

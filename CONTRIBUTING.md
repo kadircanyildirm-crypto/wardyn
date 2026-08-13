@@ -86,10 +86,17 @@ cargo test --locked
 
 Keep the build **warning-free**, including the eBPF crate.
 
-Changing anything the kernel programs do? CI compiles the eBPF object but cannot
-load it (GitHub runners have no BPF LSM). Run `just e2e` on a kernel booted with
-`lsm=...,bpf` and say so in the PR — the verifier is the only thing that can
-confirm a hook is acceptable, and a rejected program takes the whole tool down.
+Changing anything the kernel programs do? CI now loads the object for real:
+`just verify-programs` (the Enforcement E2E workflow runs it) puts **every**
+program in front of the verifier, including the file/exec LSM hooks, because
+loading needs only `CAP_BPF` while attaching is what needs an active BPF LSM.
+The same workflow then attaches the network hooks and asserts the kernel really
+blocks. What is still not covered anywhere in CI is file/exec enforcement
+*firing* — for that, run `just e2e` on a kernel booted with `lsm=...,bpf` and say
+so in the PR.
+
+Take a rejected program seriously: wardyn fails open, so it does not degrade, it
+disappears — a green feed over a kernel enforcing nothing.
 
 ## What to know about the codebase
 

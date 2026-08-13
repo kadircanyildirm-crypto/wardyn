@@ -101,6 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actually exercise: a container cannot turn on the BPF LSM (a kernel
   command-line setting), so file/exec blocking is normally unavailable there and
   now says so instead of surfacing as skipped e2e assertions an hour later.
+- **Verifier smoke test (`wardyn/tests/verifier_smoke.rs`, `just verify-programs`).**
+  Hands every one of the fourteen eBPF programs to the kernel verifier. Loading
+  needs only `CAP_BPF` while attaching is what needs cgroup v2 and an active BPF
+  LSM, so this covers the file/exec LSM hooks on a stock runner that could never
+  attach them — the half of enforcement CI had no way to judge. A verifier
+  rejection fails the test; anything else (no BTF, no BPF LSM) is reported as an
+  environment skip, so it stays honest about what it actually proved. Runs as
+  root in the Enforcement E2E workflow.
 - Checked-in VHS tapes for the README demo (`docs/demo.tape` for the live TUI,
   `docs/demo-plain.tape` for the `--plain` fallback).
 
@@ -148,6 +156,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version as if it were the one in use — which defeats the point of pinning.
   `bpf-linker` is installed `--locked`, as CI does.
 - ShellCheck (CI and `just lint`) also covers `.devcontainer/*.sh`.
+- **CI and the Enforcement E2E run on every branch**, not only `main` and pull
+  requests. A branch could otherwise carry days of work with nothing ever
+  compiling it — which is exactly how an eBPF object no kernel would load was
+  merged, and how three unrelated CI breakages surfaced at once when it was.
 - `rust-toolchain.toml` also pins `rustfmt` and `clippy`. Pinning the channel
   moved cargo onto a toolchain that had neither, so `cargo fmt` failed with
   "'cargo-fmt' is not installed" — the components CI installs go to the

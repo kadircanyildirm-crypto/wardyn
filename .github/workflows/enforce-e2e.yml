@@ -8,9 +8,12 @@
 # self-hosted runner (or a VM) booted with `lsm=...,bpf` — see scripts/enable-bpf-lsm.sh.
 name: Enforcement E2E
 
+# Every branch: this workflow is the only thing that loads the eBPF object into a
+# kernel, and it is what caught an unloadable one that clippy, the unit tests and
+# a release build had all called clean.
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 permissions:
@@ -50,6 +53,19 @@ jobs:
           echo "LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown)"
           echo "BTF:  $([ -e /sys/kernel/btf/vmlinux ] && echo present || echo MISSING)"
           echo "cgroup: $(stat -fc %T /sys/fs/cgroup 2>/dev/null)"
+
+      # Loading needs only CAP_BPF; attaching is what needs cgroup v2 and an
+      # active BPF LSM. So every program — including the file/exec LSM hooks this
+      # runner can never attach — can still be put in front of the verifier here.
+      # Built as the normal user and then run under sudo, so nothing in target/
+      # ends up root-owned.
+      - name: Verifier smoke (every program, load-only)
+        run: |
+          set -euo pipefail
+          bin="$(cargo test --release --test verifier_smoke --no-run --message-format=json \
+                 | jq -r 'select(.executable != null and .target.name == "verifier_smoke") | .executable')"
+          test -n "$bin"
+          sudo "$bin" --nocapture
 
       # sudo preserves $SUDO_UID, which the test uses to assert privilege drop.
       # Invoke via `bash` so the test does not depend on the checked-out exec bit.

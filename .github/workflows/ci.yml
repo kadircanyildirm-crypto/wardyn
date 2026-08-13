@@ -1,8 +1,12 @@
 name: CI
 
+# Every branch, not just main. Running only on main and on pull requests meant a
+# branch could carry days of work — a kernel rewrite, in one case — with nothing
+# ever compiling it, and the first honest run happened after the merge. The
+# duplicate run when a branch also has a PR open is worth that.
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 # Least privilege: CI only needs to read the repo.
