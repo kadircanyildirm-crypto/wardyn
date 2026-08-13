@@ -35,7 +35,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       pkg: ${{ steps.package.outputs.pkg }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The action installs *a* nightly; rust-toolchain.toml then pins the one
       # cargo actually uses, because the BPF bytecode that ends up in the kernel
@@ -125,7 +125,7 @@ jobs:
           echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
           ls -lh dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.pkg }}
           path: dist/*.tar.gz*
@@ -139,9 +139,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.pkg }}
           path: dist
