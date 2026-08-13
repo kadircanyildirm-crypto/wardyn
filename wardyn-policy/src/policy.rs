@@ -22,7 +22,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use globset::{Glob, GlobMatcher};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use wardyn_common::NAME_LEN;
 
 /// The policy schema version this build understands.
@@ -71,7 +71,10 @@ pub struct Verdict {
 /// exact unit an approve-once exception operates at. An exception can't be
 /// narrower than what the kernel matches, so this type is also the honest
 /// vocabulary for telling the operator what they are about to allow.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// `kind`/`value` rather than serde's default shape, because this type is
+/// written into an overrides file a human is expected to audit and edit.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum DenialKey {
     /// LSM `file_open`: basename match (BLOCK_NAMES), e.g. `.env`.
     FileName(String),
