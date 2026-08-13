@@ -20,6 +20,7 @@
 //! operation failed instead of flailing against a bare EPERM.
 mod audit;
 mod btf;
+mod overrides_file;
 mod receipt;
 mod tui;
 

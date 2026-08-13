@@ -233,6 +233,10 @@ pub struct Policy {
     /// `domain:` rules that resolved to nothing at load time — they enforce
     /// nothing at all, so startup says so instead of leaving a silent hole.
     unresolved_domains: Vec<String>,
+    /// Identifies this exact policy source, so a stored approval granted under
+    /// it stops applying the moment the rules change. Computed here because
+    /// this is the only place the source text exists.
+    fingerprint: String,
 }
 
 /// The default policy, embedded so `wardyn` runs out of the box with no file.
@@ -258,6 +262,13 @@ pub fn null_resolver(_domain: &str) -> Vec<IpAddr> {
 }
 
 impl Policy {
+    /// Identifies this policy's source. A stored approval records it and
+    /// applies to no other, so editing the rules retires the approvals granted
+    /// against the version that no longer exists.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
     /// Load from an explicit path, else `./policy.yaml`, else the embedded default.
     pub fn load(path: Option<&Path>) -> Result<Policy> {
         if let Some(p) = path {
@@ -387,6 +398,7 @@ impl Policy {
             .collect();
 
         Ok(Policy {
+            fingerprint: crate::overrides::fingerprint(text),
             default_action: raw.default_action,
             files,
             exec,
@@ -983,6 +995,21 @@ exec:
         assert_eq!(
             p.eval_connect6("2606:4700::1".parse().unwrap()).action,
             Action::Allow
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_tracks_the_rules_a_policy_was_approved_against() {
+        let a = "files:\n  - match: \"**/.env\"\n    action: block\n";
+        let b = "files:\n  - match: \"**/.env\"\n    action: warn\n";
+        let pa = Policy::from_yaml_str_with(a, &null_resolver).unwrap();
+        let pb = Policy::from_yaml_str_with(b, &null_resolver).unwrap();
+        let pa2 = Policy::from_yaml_str_with(a, &null_resolver).unwrap();
+        assert_eq!(pa.fingerprint(), pa2.fingerprint(), "same source, same id");
+        assert_ne!(
+            pa.fingerprint(),
+            pb.fingerprint(),
+            "block -> warn must retire approvals granted under the block"
         );
     }
 
