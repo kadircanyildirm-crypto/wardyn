@@ -293,6 +293,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Silenced an unused-assignment warning in the connect-observation path so the
   eBPF crate builds warning-free.
 
+### Security
+
+- **`lru` advisory closed.** It reached the build through ratatui, pinned at
+  0.12.5 — below 0.16.3, the lowest version without the advisory — so Dependabot
+  could only report `security_update_not_possible` and fail, once per push.
+  Nothing could move it without moving ratatui, which is why the fix is the 0.30
+  bump below rather than a lockfile edit; `lru` now resolves at 0.18.2 through
+  `ratatui-core`.
+
+### Dependencies
+
+- **ratatui 0.29 → 0.30, with `default-features = false`.** The default feature
+  set drags in 79 extra crates — the termwiz and image backends this tool never
+  renders with — on a binary that runs as root and ships a `cargo-deny` audit.
+  Narrowed to `crossterm`, `layout-cache` and `underline-color`, the real cost is
+  12 crates, all of them ratatui's own 0.30 split (`ratatui-core` / `-crossterm`
+  / `-widgets`), its new layout solver `kasuari` (replacing `cassowary`), and
+  proc-macro helpers. crossterm moves 0.28 → 0.29 underneath; none of 0.30's
+  breaking changes reach this code (no custom `Backend`, no `block::Title`, no
+  crossterm colour conversions).
+- `actions/checkout` v4 → v7, `actions/upload-artifact` v4 → v7,
+  `actions/download-artifact` v4 → v8 — also ending the Node 20 deprecation
+  warning printed on every run.
+- Lockfile refreshed within semver (anyhow, globset, ipnet, libc, serde,
+  serde_json, tokio and the rest of the compatible space).
+- `cargo-deny` (`audit.yml`) runs on every branch, so a dependency change is
+  reviewed before it lands rather than after.
+
 ## [0.1.0] — unreleased (development)
 
 First working milestones (M1–M3):

@@ -1,8 +1,11 @@
 name: Security audit
 
+# Every branch, like CI and the E2E. A dependency change is exactly what this
+# workflow exists to review, and reviewing it only after the merge means the
+# licences and advisories of a new subtree are read once it is already in.
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
