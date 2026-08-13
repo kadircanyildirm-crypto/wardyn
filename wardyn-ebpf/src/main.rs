@@ -393,12 +393,35 @@ fn emit_deny_net(daddr: u32, daddr6: [u8; 16], dport: u16, family: u16) {
 const ALLOW: i32 = 1;
 const DENY: i32 = 0;
 
+/// Collapse a hook's result into a verdict the verifier can bound.
+///
+/// A `cgroup_sock_addr` program must exit with `R0` in `[0, 1]`, and that bound
+/// is checked at load. The verifier cannot see through the bpf-to-bpf call:
+/// `try_connect*` hands its `Result` back through a caller stack slot, and the
+/// slot is marked unknown once the callee has written to it. So the natural
+/// `Ok(v) => v` reloads a full-range scalar into `R0` and the program is
+/// rejected outright:
+///
+/// ```text
+/// At program exit the register R0 has smin=0 smax=4294967295
+/// should have been in [0, 1]
+/// ```
+///
+/// Every arm here yields a literal instead, which is what makes the bound
+/// provable. Do not fold this back into `Ok(v) => v` because "it is the same
+/// value": it compiles, and then fails at load — and wardyn fails open, so the
+/// result is egress silently unenforced behind a feed that still looks healthy.
+#[inline(always)]
+fn net_verdict(r: Result<i32, i64>) -> i32 {
+    match r {
+        Ok(DENY) => DENY,
+        _ => ALLOW, // allow, and fail open on a read error
+    }
+}
+
 #[cgroup_sock_addr(connect4)]
 pub fn connect4(ctx: SockAddrContext) -> i32 {
-    match try_connect4(&ctx) {
-        Ok(v) => v,
-        Err(_) => ALLOW, // fail open
-    }
+    net_verdict(try_connect4(&ctx))
 }
 
 /// Longest-prefix verdict for an IPv4 destination (network byte order, matching
@@ -440,10 +463,7 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
 
 #[cgroup_sock_addr(connect6)]
 pub fn connect6(ctx: SockAddrContext) -> i32 {
-    match try_connect6(&ctx) {
-        Ok(v) => v,
-        Err(_) => ALLOW,
-    }
+    net_verdict(try_connect6(&ctx))
 }
 
 fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
@@ -514,18 +534,12 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
 
 #[cgroup_sock_addr(sendmsg4)]
 pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
-    match try_connect4(&ctx) {
-        Ok(v) => v,
-        Err(_) => ALLOW,
-    }
+    net_verdict(try_connect4(&ctx))
 }
 
 #[cgroup_sock_addr(sendmsg6)]
 pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
-    match try_connect6(&ctx) {
-        Ok(v) => v,
-        Err(_) => ALLOW,
-    }
+    net_verdict(try_connect6(&ctx))
 }
 
 // ── file enforcement: deny opening blocked secrets ──────────────────────────
@@ -533,12 +547,22 @@ pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
 const EPERM: i32 = -1;
 const OK: i32 = 0;
 
+/// The LSM counterpart of [`net_verdict`] — identical reasoning, different
+/// range: an LSM hook must exit with `R0` in `[-4095, 0]`. These two hooks are
+/// the ones a `?` can genuinely fail in (they read kernel memory), so the error
+/// arm is live here rather than ceremony, and it permits: wardyn fails open by
+/// design, and a failed read must not be turned into a denial nobody can explain.
+#[inline(always)]
+fn lsm_verdict(r: Result<i32, i64>) -> i32 {
+    match r {
+        Ok(EPERM) => EPERM,
+        _ => OK, // permit, and fail open on a read error
+    }
+}
+
 #[lsm(hook = "file_open")]
 pub fn file_open(ctx: LsmContext) -> i32 {
-    match try_file_open(&ctx) {
-        Ok(v) => v,
-        Err(_) => OK, // fail open on a read error
-    }
+    lsm_verdict(try_file_open(&ctx))
 }
 
 fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
@@ -619,10 +643,7 @@ fn read_name(dentry: *const u8, name_off: usize, buf: &mut [u8; NAME_LEN]) -> Re
 
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check(ctx: LsmContext) -> i32 {
-    match try_bprm_check(&ctx) {
-        Ok(v) => v,
-        Err(_) => OK,
-    }
+    lsm_verdict(try_bprm_check(&ctx))
 }
 
 fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {

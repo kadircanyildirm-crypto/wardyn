@@ -148,8 +148,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version as if it were the one in use — which defeats the point of pinning.
   `bpf-linker` is installed `--locked`, as CI does.
 - ShellCheck (CI and `just lint`) also covers `.devcontainer/*.sh`.
+- `rust-toolchain.toml` also pins `rustfmt` and `clippy`. Pinning the channel
+  moved cargo onto a toolchain that had neither, so `cargo fmt` failed with
+  "'cargo-fmt' is not installed" — the components CI installs go to the
+  toolchain the action selects, and this file then overrides which one runs.
 
 ### Fixed
+
+- **Egress enforcement never loaded: the verifier rejected every
+  `cgroup_sock_addr` program.** `connect4`, `connect6`, `sendmsg4` and
+  `sendmsg6` must exit with `R0` in `[0, 1]`, and each returned the value its
+  `try_*` helper had produced. The verifier cannot see through a bpf-to-bpf
+  call — the `Result` comes back through a caller stack slot that is marked
+  unknown once the callee has written to it — so the reload put a full-range
+  scalar in `R0` and `BPF_PROG_LOAD` failed with *"should have been in
+  `[0, 1]`"*. Wardyn fails open, so this presented as a startup error and no
+  network enforcement at all. The entry points now collapse the result to a
+  literal (`net_verdict`), which is what makes the bound provable; the LSM
+  hooks return through the same construct (`lsm_verdict`) for the same reason.
+  Caught by the enforcement E2E workflow on its first ever run — it was added
+  alongside the audit fixes but, like everything else on that branch, had never
+  been triggered, because CI only runs on `main` and on pull requests.
 
 - **A thread-heavy agent could switch enforcement off for every future child.**
   `sched_process_fork` also fires for `CLONE_THREAD`, and its `child_pid` is then

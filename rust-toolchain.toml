@@ -7,6 +7,12 @@
 # kernel-side artifact changes silently between two builds of the same commit
 # cannot be reviewed or reproduced. Bump this deliberately, and re-run
 # `just e2e` on a BPF-LSM kernel afterwards.
+#
+# rustfmt and clippy are listed because CI runs them: with only `rust-src` here,
+# pinning the channel silently un-installed them (the CI action installs
+# components into the toolchain it selects, and this file then overrides which
+# toolchain cargo uses), and `cargo fmt` failed with "'cargo-fmt' is not
+# installed for the toolchain nightly-2026-07-13".
 [toolchain]
 channel = "nightly-2026-07-13"
-components = ["rust-src"]
+components = ["rust-src", "rustfmt", "clippy"]

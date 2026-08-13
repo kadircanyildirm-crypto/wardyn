@@ -39,9 +39,7 @@ ENV PATH=/home/ubuntu/.cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | sh -s -- -y --no-modify-path --default-toolchain none
 COPY --chown=ubuntu:ubuntu rust-toolchain.toml /tmp/toolchain/
-RUN cd /tmp/toolchain && rustup show \
- && rustup component add rustfmt clippy \
- && rm -rf /tmp/toolchain
+RUN cd /tmp/toolchain && rustup show && rm -rf /tmp/toolchain
 
 # Links the eBPF object — pinned by the same argument as the compiler, and
 # copied in rather than repeated for the same reason as rust-toolchain.toml.
