@@ -1,2 +1,10 @@
 # Shell scripts must stay LF even when checked out on Windows, or bash breaks.
 *.sh text eol=lf
+
+# Read with $(cat BPF_LINKER_VERSION) by CI and setup-vm.sh. A CRLF checkout
+# would put a carriage return inside the version string and fail the install
+# with a message that names a version that looks correct.
+BPF_LINKER_VERSION text eol=lf
+
+# VHS tapes are executed by vhs on Linux; keep them LF for the same reason.
+*.tape text eol=lf
