@@ -4,6 +4,33 @@
 
 > **Uyarı.** Bu bir dış denetim görüşüdür, çalıştırılan bir güvenlik kanıtı değil. Doğrulanan bulgular işaretlenmiştir; işaretsiz bulgular (özellikle 5. ve 6. boyut) öneri niteliğindedir. `bpf_d_path`'in aya-ebpf 0.1.1'de bulunduğu ve rakip-sandbox iddiaları uygulamadan önce bağımsız teyit edilmelidir.
 
+## Düzeltme durumu
+
+Rapordaki bulguların bir bölümü kapatıldı; ayrıntılar için [CHANGELOG](../CHANGELOG.md).
+Aşağıdaki metin **denetim anındaki** durumu anlatır ve olduğu gibi bırakılmıştır —
+bir bulgunun burada durması, hâlâ açık olduğu anlamına gelmez.
+
+**Kapatılanlar (özet):** hook'ların kendi kararlarını raporlaması
+(`no-kernel-verdict-channel` ve ona bağlı off-feed/relative-path/LSM-yalanı
+bulguları) · WATCHED thread-TID sızıntısı ve doyma bypass'ı
+(`watched-thread-tid-pollution`) · fork parent'ının TID/TGID karışıklığı
+(`fork-parent-keyed-by-tid`) · sessiz ring-buffer kayıpları (`ringbuf-silent-drops`)
+· `**/dir/**` kurallarının yalnızca doğrudan çocukları kapsaması · TUI'den çıkınca
+enforcement'ın sessizce kalkması · terminal restore / `process::exit` / sinyal /
+exit-code / kapalı-pipe sorunları · argüman ayrıştırma hataları ve test edilemezliği
+· terminal escape enjeksiyonu · dünyaya-okunur ve symlink-takip eden receipt ·
+şema doğrulaması ve `version` kontrolü · parser içindeki canlı DNS · policy
+motorunun Linux-only binary crate'e hapsedilmiş olması · eBPF crate'inin
+lint'lenmemesi, shell script'lerin kontrol edilmemesi, floating nightly, `--locked`
+eksikliği, preset'lerin hiç parse edilmemesi.
+
+**Bilerek açık bırakılanlar:** isim tabanlı eşleşmenin `mv`/`link`/`cp` ile
+atlatılabilmesi (gerçek çözüm `(dev, ino)` veya `bpf_d_path` — M6), read/write
+ekseninin olmaması, ağ kurallarında port/protokol boyutu, AF_UNIX ve loopback'in
+izlenmemesi, io_uring, `domain:` kurallarının tek seferlik çözümlenmesi,
+paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
+[SECURITY.md](../SECURITY.md)'de açıkça anlatılıyor.
+
 ## Adversaryal Doğrulama Özeti
 
 | Bulgu | İddia | Karar | Düzeltilmiş | Not |

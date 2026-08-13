@@ -2,12 +2,18 @@
 //! Policy engine (M2).
 //!
 //! Loads `policy.yaml`, compiles it into ordered matchers, and evaluates each
-//! observed event to an [`Action`] (`allow | warn | block`). First matching rule
-//! wins; if nothing matches, `default_action` applies.
+//! observed event to an [`Action`] (`allow | warn | block`).
 //!
-//! This is the single source of truth for policy in warn-mode. Kernel-side
-//! *enforcement* (M3) will reuse these same rules to deny inline via cgroup/LSM
-//! hooks; keeping evaluation here (and unit-tested) pins the semantics first.
+//! **Matching order is not uniform, and pretending otherwise would misdescribe
+//! what the kernel does:**
+//! - *files / exec* — first matching rule wins, then `default_action`.
+//! - *network* — longest-prefix-match (the kernel decides egress with an LPM
+//!   trie; CIDRs covering one address are always nested, so "most specific
+//!   wins" is the only semantics that can agree with it), then `default_action`.
+//! - *under `--enforce`*, the kernel's file/exec matcher is an unordered set of
+//!   block keys: an `allow` rule listed before a `block` rule does **not** save
+//!   a path the block rule's key covers. [`Policy::shadowed_by_kernel`] finds
+//!   those rules so startup can say so out loud.
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -18,6 +24,9 @@ use globset::{Glob, GlobMatcher};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 use wardyn_common::NAME_LEN;
+
+/// The policy schema version this build understands.
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// The three policy verdicts. Wire values match `wardyn_common::action`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -48,6 +57,7 @@ impl Action {
 }
 
 /// A policy decision plus the rule that produced it (for audit / display).
+#[derive(Debug, Clone)]
 pub struct Verdict {
     pub action: Action,
     pub rule: String,
@@ -65,7 +75,7 @@ pub struct Verdict {
 pub enum DenialKey {
     /// LSM `file_open`: basename match (BLOCK_NAMES), e.g. `.env`.
     FileName(String),
-    /// LSM `file_open`: immediate parent-dir match (BLOCK_DIRS), e.g. `.ssh`.
+    /// LSM `file_open`: ancestor-directory match (BLOCK_DIRS), e.g. `.ssh`.
     FileDir(String),
     /// LSM `bprm_check`: exec basename match (BLOCK_EXEC), e.g. `nc`.
     Exec(String),
@@ -82,7 +92,7 @@ impl DenialKey {
         match self {
             DenialKey::FileName(n) => format!("opening ANY file named `{n}` (any directory)"),
             DenialKey::FileDir(d) => {
-                format!("opening ANY file directly inside a directory named `{d}`")
+                format!("opening ANY file anywhere under a directory named `{d}`")
             }
             DenialKey::Exec(n) => format!("executing ANY program named `{n}` (any path)"),
             DenialKey::Net4(ip) => format!("ALL egress to {ip} (any port/protocol)"),
@@ -127,8 +137,15 @@ fn default_action() -> Action {
     Action::Allow
 }
 
+/// `deny_unknown_fields` throughout: a typo'd key (`file:` for `files:`,
+/// `match_:` for `match`) used to be silently ignored, which disabled an entire
+/// rule class while the policy looked fine. A policy that does not mean what it
+/// says is worse than one that refuses to load.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPolicy {
+    #[serde(default)]
+    version: Option<u32>,
     #[serde(default = "default_action")]
     default_action: Action,
     #[serde(default)]
@@ -137,10 +154,10 @@ struct RawPolicy {
     network: Vec<NetRuleRaw>,
     #[serde(default)]
     exec: Vec<PathRuleRaw>,
-    // `version` (and any other keys) are ignored.
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PathRuleRaw {
     #[serde(rename = "match")]
     pattern: String,
@@ -148,6 +165,7 @@ struct PathRuleRaw {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetRuleRaw {
     cidr: Option<String>,
     domain: Option<String>,
@@ -203,16 +221,38 @@ pub struct Policy {
     exec: Vec<PathRule>,
     network: Vec<NetRule>,
     /// Mirror of the kernel's `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_EXEC` maps.
-    /// The LSM hook can only see a dentry's basename and its parent-dir name, so
-    /// these are what it *actually* matches on — kept here so userspace can
-    /// reproduce the kernel's verdict instead of guessing from the glob.
+    /// The LSM hook can only see dentry names, so these are what it *actually*
+    /// matches on — kept here so userspace can reproduce the kernel's verdict
+    /// instead of guessing from the glob.
     kern_names: BTreeSet<String>,
     kern_dirs: BTreeSet<String>,
     kern_execs: BTreeSet<String>,
+    /// `domain:` rules that resolved to nothing at load time — they enforce
+    /// nothing at all, so startup says so instead of leaving a silent hole.
+    unresolved_domains: Vec<String>,
 }
 
 /// The default policy, embedded so `wardyn` runs out of the box with no file.
 const DEFAULT_POLICY: &str = include_str!("../../policy.yaml");
+
+/// How a `domain:` rule is turned into addresses. Injectable because the real
+/// one performs live DNS: baking it into the parser made every policy test
+/// network-dependent, and made the documented `domain:` form untestable.
+pub type Resolver<'a> = &'a dyn Fn(&str) -> Vec<IpAddr>;
+
+/// Best-effort A/AAAA lookup through the system resolver.
+pub fn system_resolver(domain: &str) -> Vec<IpAddr> {
+    match (domain, 0u16).to_socket_addrs() {
+        Ok(addrs) => addrs.map(|sa| sa.ip()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// A resolver that never resolves anything — for tests and for `--dry-run`
+/// style parsing where touching the network would be wrong.
+pub fn null_resolver(_domain: &str) -> Vec<IpAddr> {
+    Vec::new()
+}
 
 impl Policy {
     /// Load from an explicit path, else `./policy.yaml`, else the embedded default.
@@ -229,8 +269,21 @@ impl Policy {
         Policy::from_yaml_str(DEFAULT_POLICY).context("parsing embedded default policy")
     }
 
+    /// Parse with the system DNS resolver (what the binary uses).
     pub fn from_yaml_str(text: &str) -> Result<Policy> {
+        Policy::from_yaml_str_with(text, &system_resolver)
+    }
+
+    pub fn from_yaml_str_with(text: &str, resolve: Resolver<'_>) -> Result<Policy> {
         let raw: RawPolicy = serde_yaml::from_str(text).context("invalid policy YAML")?;
+        if let Some(v) = raw.version {
+            if v != SCHEMA_VERSION {
+                anyhow::bail!(
+                    "policy `version: {v}` is not supported by this build (expected \
+                     {SCHEMA_VERSION}) — upgrade wardyn or drop the version key"
+                );
+            }
+        }
 
         // `dir_capable` files support the `**/dir/**` parent-directory form; exec
         // rules are basename-only.
@@ -264,9 +317,15 @@ impl Policy {
         // at load time, expanding to one Ip rule per resolved address, preserving
         // order.
         let mut network = Vec::new();
+        let mut unresolved_domains = Vec::new();
         for r in raw.network {
             match (&r.cidr, &r.domain) {
-                (Some(cidr), _) => {
+                (Some(cidr), Some(domain)) => {
+                    anyhow::bail!(
+                        "network rule has both `cidr: {cidr}` and `domain: {domain}` — pick one"
+                    );
+                }
+                (Some(cidr), None) => {
                     let net: IpNet = cidr.parse().with_context(|| format!("bad cidr `{cidr}`"))?;
                     let which = match net {
                         IpNet::V4(n) => NetMatch::V4Cidr(n),
@@ -279,9 +338,9 @@ impl Policy {
                     });
                 }
                 (None, Some(domain)) => {
-                    let ips = resolve_domain(domain);
+                    let ips = resolve(domain);
                     if ips.is_empty() {
-                        log::warn!("policy: could not resolve domain `{domain}` (rule ignored)");
+                        unresolved_domains.push(domain.clone());
                     }
                     for ip in ips {
                         let which = match ip {
@@ -332,6 +391,7 @@ impl Policy {
             kern_names,
             kern_dirs,
             kern_execs,
+            unresolved_domains,
         })
     }
 
@@ -349,9 +409,12 @@ impl Policy {
         self.default_action.code()
     }
 
-    /// Network rules as `(prefix_len, ipv4-in-network-byte-order-as-u32, action
-    /// code)` for the kernel LPM trie. Reversed so earlier policy rules win on
-    /// identical keys (LPM `insert` overwrites on collision).
+    /// Network rules as `(prefix_len, ipv4 address as it is laid out in memory,
+    /// action code)` for the kernel LPM trie, which compares the key bytes from
+    /// the most significant end. `from_ne_bytes` keeps the octets in network
+    /// order *in memory* on either endianness — `from_le_bytes` happened to do
+    /// that only on a little-endian host. Reversed so earlier policy rules win
+    /// on identical keys (LPM `insert` overwrites on collision).
     pub fn net_entries(&self) -> Vec<(u32, u32, u32)> {
         self.network
             .iter()
@@ -360,9 +423,9 @@ impl Policy {
                 let (plen, data) = match &r.which {
                     NetMatch::V4Cidr(net) => (
                         net.prefix_len() as u32,
-                        u32::from_le_bytes(net.network().octets()),
+                        u32::from_ne_bytes(net.network().octets()),
                     ),
-                    NetMatch::V4Ip(a) => (32u32, u32::from_le_bytes(a.octets())),
+                    NetMatch::V4Ip(a) => (32u32, u32::from_ne_bytes(a.octets())),
                     _ => return None,
                 };
                 Some((plen, data, r.action.code()))
@@ -388,7 +451,8 @@ impl Policy {
     }
 
     /// Block rules compiled for kernel-side file enforcement: exact basenames
-    /// (e.g. `.env`, `shadow`) and exact parent-directory names (e.g. `.ssh`).
+    /// (e.g. `.env`, `shadow`) and exact directory names (e.g. `.ssh`), the
+    /// latter matched against every ancestor of the opened file.
     /// Patterns that can't reduce to a literal segment stay observe/warn only.
     pub fn file_enforcement(&self) -> (Vec<[u8; NAME_LEN]>, Vec<[u8; NAME_LEN]>) {
         let keys = |set: &BTreeSet<String>| -> Vec<[u8; NAME_LEN]> {
@@ -400,20 +464,25 @@ impl Policy {
     /// The key the LSM `file_open` hook would deny `path` on, if any — the
     /// userspace mirror of the kernel's matcher.
     ///
-    /// The hook sees only a basename and its parent-dir name, so it is coarser
-    /// than the glob the rule was written as: `/etc/shadow` compiles to the bare
-    /// name `shadow` and therefore denies `/srv/app/shadow` too. Consult this
-    /// (not just the glob) before reporting a verdict, otherwise the feed says
-    /// `ok` for an open the kernel actually turned into `-EPERM`.
+    /// The hook sees dentry names, not the glob the rule was written as, so it
+    /// is coarser: `/etc/shadow` compiles to the bare name `shadow` and
+    /// therefore denies `/srv/app/shadow` too. Directory keys are matched
+    /// against **every** ancestor (the hook walks `d_parent` up to
+    /// [`MAX_DIR_WALK`] levels), so `**/.ssh/**` covers deep paths as its glob
+    /// always claimed. Consult this (not just the glob) before reporting a
+    /// verdict, otherwise the feed says `ok` for an open the kernel actually
+    /// turned into `-EPERM`.
     pub fn kernel_file_denial(&self, path: &str) -> Option<DenialKey> {
         let mut segs = path.rsplit('/').filter(|s| !s.is_empty());
         let name = segs.next()?;
         if self.kern_names.contains(name) {
             return Some(DenialKey::FileName(name.to_string()));
         }
-        let dir = segs.next()?;
-        if self.kern_dirs.contains(dir) {
-            return Some(DenialKey::FileDir(dir.to_string()));
+        // Ancestors, nearest first, bounded exactly like the kernel walk.
+        for dir in segs.take(MAX_DIR_WALK) {
+            if self.kern_dirs.contains(dir) {
+                return Some(DenialKey::FileDir(dir.to_string()));
+            }
         }
         None
     }
@@ -442,7 +511,7 @@ impl Policy {
                 let (exact, reach) = if is_dir {
                     (
                         format!("**/{seg}/**"),
-                        format!("any file under a dir named `{seg}`"),
+                        format!("any file anywhere under a dir named `{seg}`"),
                     )
                 } else {
                     (format!("**/{seg}"), format!("any file named `{seg}`"))
@@ -462,6 +531,47 @@ impl Policy {
                 }
             }
         }
+        out
+    }
+
+    /// Rules the kernel's unordered block-key set overrides under `--enforce`.
+    ///
+    /// Userspace evaluates file/exec rules first-match-wins, but the LSM hook
+    /// holds only a *set* of block keys with no notion of order: an `allow`
+    /// listed before a `block` does not protect anything the block rule's key
+    /// covers. Each entry is `(allow-rule pattern, the key that beats it)`.
+    pub fn shadowed_by_kernel(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut check = |rules: &[PathRule], names: &BTreeSet<String>, dirs: &BTreeSet<String>| {
+            for (i, r) in rules.iter().enumerate() {
+                if r.action == Action::Block {
+                    continue;
+                }
+                // Does a *later* block rule's key cover paths this rule matches?
+                let later_blocks = rules[i + 1..].iter().any(|b| b.action == Action::Block);
+                if !later_blocks {
+                    continue;
+                }
+                if let Some(seg) = last_segment(&r.pattern) {
+                    if names.contains(seg) {
+                        out.push((r.pattern.clone(), format!("name={seg}")));
+                        continue;
+                    }
+                }
+                // Any literal segment of this pattern that is a blocked dir name
+                // makes the whole subtree denied, wherever it appears.
+                if let Some(seg) = r
+                    .pattern
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .find(|s| dirs.contains(*s))
+                {
+                    out.push((r.pattern.clone(), format!("dir={seg}")));
+                }
+            }
+        };
+        check(&self.files, &self.kern_names, &self.kern_dirs);
+        check(&self.exec, &self.kern_execs, &BTreeSet::new());
         out
     }
 
@@ -494,8 +604,151 @@ impl Policy {
         out
     }
 
+    /// Everything else about this policy that does not mean what it looks like.
+    /// Returned as ready-to-print sentences; startup prints them under
+    /// `--enforce` so no gap is discovered later from an audit log.
+    pub fn semantic_warnings(&self) -> Vec<String> {
+        let mut out = self.net_coverage_gaps();
+
+        // `default_action: block` is a real kernel default-deny for network (the
+        // LPM miss path consults it) but NOT for files or exec: the LSM hooks
+        // only deny on an explicit block key, so "deny everything by default"
+        // silently means "deny all egress, allow every file and exec".
+        if self.default_action == Action::Block {
+            out.push(
+                "default_action: block is a real deny-all for NETWORK only. The file and exec LSM \
+                 hooks deny on explicit block keys, so unmatched file opens and execs are still \
+                 ALLOWED in the kernel — list what must be blocked explicitly."
+                    .to_string(),
+            );
+        }
+
+        for pat in &self.unresolved_domains {
+            out.push(format!(
+                "network rule `domain: {pat}` resolved to no addresses — it enforces NOTHING. \
+                 Domain rules are resolved once, at load: prefer an explicit `cidr:`."
+            ));
+        }
+        if !self.unresolved_domains.is_empty() || self.has_domain_rules() {
+            out.push(
+                "`domain:` rules freeze the addresses DNS returned at startup: a CDN that answers \
+                 with a different address later is not covered by an allow, and not caught by a \
+                 block. Use `cidr:` where the answer can move."
+                    .to_string(),
+            );
+        }
+        out
+    }
+
+    fn has_domain_rules(&self) -> bool {
+        self.network.iter().any(|r| r.label.starts_with("domain:"))
+    }
+
+    /// A full, plain-language account of what this policy will actually do in
+    /// the kernel — printed by `--dry-run`, which validates a policy without
+    /// root or eBPF. Written because every gap below used to be discoverable
+    /// only by reading an audit log after the fact.
+    pub fn explain(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(s, "policy: {}", self.summary());
+
+        let _ = writeln!(s, "\nkernel-enforced under --enforce:");
+        for n in &self.kern_names {
+            let _ = writeln!(
+                s,
+                "  file  name={n:<24} denies opening ANY file named `{n}`"
+            );
+        }
+        for d in &self.kern_dirs {
+            let _ = writeln!(
+                s,
+                "  file  dir={d:<25} denies ANY file under a directory named `{d}` (any depth)"
+            );
+        }
+        for e in &self.kern_execs {
+            let _ = writeln!(
+                s,
+                "  exec  name={e:<24} denies executing ANY program named `{e}`"
+            );
+        }
+        let blocked_nets: Vec<&str> = self
+            .network
+            .iter()
+            .filter(|r| r.action == Action::Block)
+            .map(|r| r.label.as_str())
+            .collect();
+        if blocked_nets.is_empty() {
+            let _ = writeln!(s, "  net   (no block rules — no egress is denied)");
+        } else {
+            let _ = writeln!(s, "  net   blocked: {}", blocked_nets.join(", "));
+        }
+        if self.kern_names.is_empty() && self.kern_dirs.is_empty() && self.kern_execs.is_empty() {
+            let _ = writeln!(
+                s,
+                "  file/exec: NOTHING is kernel-enforced (no block rule reduces to a name or dir)"
+            );
+        }
+
+        // A name-form rule (`**/.aws`) denies opening the entry itself; it does
+        // not cover the files inside a directory of that name — very easy to
+        // write believing the opposite, so state it per rule rather than guess.
+        let name_only: Vec<&String> = self
+            .kern_names
+            .iter()
+            .filter(|n| !self.kern_dirs.contains(*n))
+            .collect();
+        if !name_only.is_empty() {
+            let _ = writeln!(
+                s,
+                "\nnote: these deny the entry itself, NOT files inside a directory of that name.\n\
+                 If any is a directory, add `- {{ match: \"**/<name>/**\", action: block }}` too:"
+            );
+            for n in name_only {
+                let _ = writeln!(s, "  {n}");
+            }
+        }
+
+        let observe_only = self.observe_only_blocks();
+        if !observe_only.is_empty() {
+            let _ = writeln!(
+                s,
+                "\nflagged but NEVER denied (no kernel key — glob segment, or name too long):"
+            );
+            for p in observe_only {
+                let _ = writeln!(s, "  {p}");
+            }
+        }
+        let overbroad = self.overbroad_block_keys();
+        if !overbroad.is_empty() {
+            let _ = writeln!(s, "\nenforced MORE broadly than written:");
+            for (pat, reach) in overbroad {
+                let _ = writeln!(s, "  {pat}  ->  {reach}");
+            }
+        }
+        let shadowed = self.shadowed_by_kernel();
+        if !shadowed.is_empty() {
+            let _ = writeln!(
+                s,
+                "\noverridden by the kernel's unordered block-key set (the allow does NOT win):"
+            );
+            for (pat, key) in shadowed {
+                let _ = writeln!(s, "  {pat}  <-  {key}");
+            }
+        }
+        let warnings = self.semantic_warnings();
+        if !warnings.is_empty() {
+            let _ = writeln!(s, "\nwarnings:");
+            for w in warnings {
+                let _ = writeln!(s, "  - {w}");
+            }
+        }
+        s
+    }
+
     /// Patterns of `block` file/exec rules that CANNOT be kernel-enforced (glob
-    /// segments). The feed flags these distinctly and startup warns about them.
+    /// segments, or a name at/over the [`NAME_LEN`] key width). The feed flags
+    /// these distinctly and startup warns about them.
     pub fn observe_only_blocks(&self) -> Vec<String> {
         self.files
             .iter()
@@ -564,6 +817,12 @@ impl Policy {
     }
 }
 
+/// How many ancestor directories the LSM hook walks when matching `BLOCK_DIRS`.
+/// The kernel program must stay a bounded loop for the verifier; userspace
+/// mirrors the same bound so the feed cannot claim a denial from a deeper
+/// ancestor than the hook actually inspects.
+pub const MAX_DIR_WALK: usize = 16;
+
 fn eval_path(rules: &[PathRule], path: &str, default: Action) -> Verdict {
     for r in rules {
         if r.matcher.is_match(path) {
@@ -604,27 +863,25 @@ fn file_key(pattern: &str) -> Option<(bool, [u8; NAME_LEN])> {
 }
 
 /// A literal path segment -> NUL-padded fixed key, or `None` if it contains glob
-/// metacharacters (those can't be enforced as an exact name). Also used by the
-/// exception path in main.rs to address the kernel block maps.
-pub(crate) fn name_key(seg: &str) -> Option<[u8; NAME_LEN]> {
+/// metacharacters (those can't be enforced as an exact name) or does not fit the
+/// fixed key width. Also used by the exception path in main.rs to address the
+/// kernel block maps.
+pub fn name_key(seg: &str) -> Option<[u8; NAME_LEN]> {
     if seg == "**" || seg.chars().any(|c| matches!(c, '*' | '?' | '[' | ']')) {
         return None;
     }
     let bytes = seg.as_bytes();
+    // `>= NAME_LEN` and not `>`: the kernel reads the dentry name with
+    // `bpf_probe_read_kernel_str`, which needs room for the trailing NUL. A name
+    // that exactly fills the buffer could never be matched, so refusing it here
+    // routes the rule through `observe_only_blocks` and it is reported instead
+    // of quietly enforcing nothing.
     if bytes.is_empty() || bytes.len() >= NAME_LEN {
         return None;
     }
     let mut k = [0u8; NAME_LEN];
     k[..bytes.len()].copy_from_slice(bytes);
     Some(k)
-}
-
-/// Best-effort A-record lookup; returns the IPv4 addresses for `domain`.
-fn resolve_domain(domain: &str) -> Vec<IpAddr> {
-    match (domain, 0u16).to_socket_addrs() {
-        Ok(addrs) => addrs.map(|sa| sa.ip()).collect(),
-        Err(_) => Vec::new(),
-    }
 }
 
 #[cfg(test)]
@@ -653,8 +910,18 @@ exec:
   - { match: "**", action: allow }
 "#;
 
+    fn parse(text: &str) -> Result<Policy> {
+        Policy::from_yaml_str_with(text, &null_resolver)
+    }
+
     fn policy() -> Policy {
-        Policy::from_yaml_str(P).expect("policy parses")
+        parse(P).expect("policy parses")
+    }
+
+    fn key(s: &str) -> [u8; NAME_LEN] {
+        let mut k = [0u8; NAME_LEN];
+        k[..s.len()].copy_from_slice(s.as_bytes());
+        k
     }
 
     #[test]
@@ -731,11 +998,6 @@ exec:
     fn file_enforcement_compiles_block_rules() {
         let p = policy();
         let (names, dirs) = p.file_enforcement();
-        let key = |s: &str| {
-            let mut k = [0u8; NAME_LEN];
-            k[..s.len()].copy_from_slice(s.as_bytes());
-            k
-        };
         assert!(names.contains(&key(".env"))); // **/.env
         assert!(names.contains(&key("shadow"))); // /etc/shadow
         assert!(dirs.contains(&key(".ssh"))); // **/.ssh/**
@@ -765,7 +1027,7 @@ exec:
 
     #[test]
     fn empty_policy_uses_default() {
-        let p = Policy::from_yaml_str("default_action: warn").unwrap();
+        let p = parse("default_action: warn").unwrap();
         assert_eq!(p.eval_file("/anything").action, Action::Warn);
         assert_eq!(
             p.eval_connect("8.8.8.8".parse().unwrap()).action,
@@ -783,13 +1045,6 @@ exec:
             p.kernel_file_denial("/home/u/shadow"),
             Some(DenialKey::FileName("shadow".into()))
         );
-        // `**/.ssh/**` keys on the parent dir `.ssh` — only the IMMEDIATE parent
-        // is checked, so a deep file the glob still matches is NOT denied.
-        assert_eq!(
-            p.eval_file("/home/u/.ssh/sub/deep/id").action,
-            Action::Block
-        );
-        assert_eq!(p.kernel_file_denial("/home/u/.ssh/sub/deep/id"), None);
         // A file directly in `.ssh` IS denied by the kernel.
         assert_eq!(
             p.kernel_file_denial("/home/u/.ssh/id_ed25519"),
@@ -797,6 +1052,37 @@ exec:
         );
         // `.env.*` is a glob segment: never a kernel key, so never denied here.
         assert_eq!(p.kernel_file_denial("/home/u/.env.local"), None);
+        assert_eq!(p.kernel_file_denial("/home/u/src/main.rs"), None);
+    }
+
+    #[test]
+    fn dir_rules_cover_the_whole_subtree_not_just_direct_children() {
+        let p = policy();
+        // `**/.ssh/**` matches deep paths as a glob...
+        assert_eq!(
+            p.eval_file("/home/u/.ssh/sub/deep/id").action,
+            Action::Block
+        );
+        // ...and the kernel now agrees, because the hook walks every ancestor.
+        assert_eq!(
+            p.kernel_file_denial("/home/u/.ssh/sub/deep/id"),
+            Some(DenialKey::FileDir(".ssh".into()))
+        );
+    }
+
+    #[test]
+    fn ancestor_walk_is_bounded_exactly_like_the_kernel_loop() {
+        let p = parse(r#"files: [{ match: "**/secret/**", action: block }]"#).unwrap();
+        // `secret` sits MAX_DIR_WALK levels above the file: still caught.
+        let just_inside = format!("/secret{}/f", "/d".repeat(MAX_DIR_WALK - 1));
+        assert_eq!(
+            p.kernel_file_denial(&just_inside),
+            Some(DenialKey::FileDir("secret".into()))
+        );
+        // One level deeper than the kernel walks: not claimed, because the hook
+        // would not have seen it either.
+        let too_deep = format!("/secret{}/f", "/d".repeat(MAX_DIR_WALK));
+        assert_eq!(p.kernel_file_denial(&too_deep), None);
     }
 
     #[test]
@@ -826,7 +1112,7 @@ exec:
     fn network_uses_longest_prefix_not_first_match() {
         // A broad block listed BEFORE a specific allow: first-match would block
         // 1.1.1.1, but the kernel LPM trie (and now userspace) let the /32 win.
-        let p = Policy::from_yaml_str(
+        let p = parse(
             r#"
 default_action: allow
 network:
@@ -878,5 +1164,246 @@ network:
         assert!(!flagged.contains(&"**/.ssh/**".to_string()));
         // `**/nc` exec rule is canonical too.
         assert!(!flagged.contains(&"**/nc".to_string()));
+    }
+
+    // ── schema validation ───────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_keys_are_rejected_instead_of_silently_disabling_a_rule_class() {
+        // `file:` instead of `files:` used to parse fine and enforce nothing.
+        let err = parse("file:\n  - { match: \"**/.env\", action: block }\n")
+            .err()
+            .expect("an unknown top-level key is refused");
+        assert!(format!("{err:#}").contains("file"), "{err:#}");
+        // Same for a mistyped rule key.
+        assert!(parse(r#"files: [{ pattern: "**/.env", action: block }]"#).is_err());
+        // ...and for a stray top-level key.
+        assert!(parse("defualt_action: block").is_err());
+    }
+
+    #[test]
+    fn unsupported_schema_version_is_refused() {
+        assert!(parse("version: 2\ndefault_action: allow").is_err());
+        assert!(parse("version: 1\ndefault_action: allow").is_ok());
+        assert!(parse("default_action: allow").is_ok(), "version optional");
+    }
+
+    #[test]
+    fn a_network_rule_needs_exactly_one_of_cidr_or_domain() {
+        assert!(parse(r#"network: [{ action: block }]"#).is_err());
+        assert!(
+            parse(r#"network: [{ cidr: "0.0.0.0/0", domain: "x.test", action: block }]"#).is_err()
+        );
+    }
+
+    #[test]
+    fn domain_rules_resolve_through_the_injected_resolver() {
+        let stub = |d: &str| -> Vec<IpAddr> {
+            if d == "example.test" {
+                vec!["203.0.113.7".parse().unwrap()]
+            } else {
+                vec![]
+            }
+        };
+        let p = Policy::from_yaml_str_with(
+            r#"
+default_action: block
+network:
+  - { domain: "example.test", action: allow }
+  - { domain: "nowhere.test", action: allow }
+"#,
+            &stub,
+        )
+        .unwrap();
+        assert_eq!(
+            p.eval_connect("203.0.113.7".parse().unwrap()).action,
+            Action::Allow
+        );
+        assert_eq!(
+            p.eval_connect("203.0.113.8".parse().unwrap()).action,
+            Action::Block
+        );
+        assert!(p
+            .semantic_warnings()
+            .iter()
+            .any(|w| w.contains("nowhere.test")));
+    }
+
+    // ── honesty warnings ────────────────────────────────────────────────────
+
+    #[test]
+    fn default_block_warns_that_files_and_exec_are_not_deny_all() {
+        let p = parse("default_action: block").unwrap();
+        assert!(p
+            .semantic_warnings()
+            .iter()
+            .any(|w| w.contains("NETWORK only")));
+    }
+
+    #[test]
+    fn explain_calls_out_a_name_rule_that_is_really_a_directory() {
+        let p = parse(r#"files: [{ match: "**/.aws", action: block }]"#).unwrap();
+        let text = p.explain();
+        assert!(
+            text.contains("NOT files inside a directory"),
+            "a bare `**/.aws` block protects the entry, not its contents:\n{text}"
+        );
+        // Adding the dir form silences it.
+        let p = parse(
+            r#"files:
+  - { match: "**/.aws", action: block }
+  - { match: "**/.aws/**", action: block }"#,
+        )
+        .unwrap();
+        assert!(!p.explain().contains("NOT files inside a directory"));
+    }
+
+    #[test]
+    fn explain_names_every_key_the_kernel_will_deny_on() {
+        let text = policy().explain();
+        for expected in [
+            "name=.env",
+            "name=shadow",
+            "dir=.ssh",
+            "exec  name=nc",
+            "cidr:0.0.0.0/0",
+            // the observe-only block must be shown as never denied
+            "**/.env.*",
+        ] {
+            assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn explain_says_so_when_nothing_is_enforced() {
+        let p = parse("default_action: allow").unwrap();
+        assert!(p.explain().contains("NOTHING is kernel-enforced"));
+    }
+
+    #[test]
+    fn allow_rules_the_kernel_block_set_overrides_are_reported() {
+        // Userspace says "this one .env is fine"; the kernel's key set has no
+        // order and denies every `.env`. Say so instead of letting the operator
+        // believe the exception took.
+        let p = parse(
+            r#"
+files:
+  - { match: "**/fixtures/.env", action: allow }
+  - { match: "**/.env", action: block }
+"#,
+        )
+        .unwrap();
+        let shadowed = p.shadowed_by_kernel();
+        assert_eq!(shadowed.len(), 1);
+        assert_eq!(shadowed[0].0, "**/fixtures/.env");
+        assert_eq!(shadowed[0].1, "name=.env");
+
+        // A dir key shadows any allow rule whose path passes through it.
+        let p = parse(
+            r#"
+files:
+  - { match: "**/.ssh/known_hosts", action: allow }
+  - { match: "**/.ssh/**", action: block }
+"#,
+        )
+        .unwrap();
+        assert_eq!(p.shadowed_by_kernel()[0].1, "dir=.ssh");
+
+        // The ordinary catch-all `**` allow is not flagged.
+        assert!(policy()
+            .shadowed_by_kernel()
+            .iter()
+            .all(|(pat, _)| pat != "**"));
+    }
+
+    #[test]
+    fn oversized_names_are_reported_rather_than_silently_unenforced() {
+        let long = "a".repeat(NAME_LEN);
+        let p = parse(&format!(
+            r#"files: [{{ match: "**/{long}", action: block }}]"#
+        ))
+        .unwrap();
+        assert!(p.observe_only_blocks().len() == 1);
+        assert_eq!(p.kernel_file_denial(&format!("/x/{long}")), None);
+    }
+
+    // ── the policies actually shipped ───────────────────────────────────────
+
+    const SHIPPED: [(&str, &str); 3] = [
+        ("policy.yaml", include_str!("../../policy.yaml")),
+        (
+            "policies/strict.yaml",
+            include_str!("../../policies/strict.yaml"),
+        ),
+        (
+            "policies/permissive.yaml",
+            include_str!("../../policies/permissive.yaml"),
+        ),
+    ];
+
+    #[test]
+    fn every_shipped_policy_parses() {
+        for (name, text) in SHIPPED {
+            Policy::from_yaml_str_with(text, &null_resolver)
+                .unwrap_or_else(|e| panic!("{name} does not parse: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn blocking_presets_really_protect_the_secrets_they_advertise() {
+        // permissive.yaml is warn-only by design, so it is not in this set.
+        for (name, text) in SHIPPED
+            .iter()
+            .filter(|(n, _)| *n != "policies/permissive.yaml")
+        {
+            let p = Policy::from_yaml_str_with(text, &null_resolver).unwrap();
+            for secret in [
+                "/home/u/.env",
+                "/home/u/.ssh/id_ed25519",
+                "/home/u/.ssh/nested/deeper/key",
+            ] {
+                assert_eq!(
+                    p.eval_file(secret).action,
+                    Action::Block,
+                    "{name} does not block {secret}"
+                );
+                assert!(
+                    p.kernel_file_denial(secret).is_some(),
+                    "{name} blocks {secret} only in userspace — the kernel would allow it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shipped_policies_do_not_break_git_or_ordinary_source_files() {
+        // A regression guard for the strict.yaml bug where `**/.kube/config`
+        // reduced to the bare name `config` and denied `.git/config`.
+        for (name, text) in SHIPPED {
+            let p = Policy::from_yaml_str_with(text, &null_resolver).unwrap();
+            for ordinary in [
+                "/home/u/proj/.git/config",
+                "/home/u/proj/src/main.rs",
+                "/home/u/proj/Cargo.toml",
+            ] {
+                assert_eq!(
+                    p.kernel_file_denial(ordinary),
+                    None,
+                    "{name} would make the kernel deny {ordinary}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_deny_all_egress_preset_covers_ipv6_too() {
+        for (name, text) in SHIPPED {
+            let p = Policy::from_yaml_str_with(text, &null_resolver).unwrap();
+            assert!(
+                p.net_coverage_gaps().is_empty(),
+                "{name} leaves an IPv6 egress gap: {:?}",
+                p.net_coverage_gaps()
+            );
+        }
     }
 }

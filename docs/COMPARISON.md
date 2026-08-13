@@ -55,8 +55,8 @@ one that is modest and honest.
 - **No filesystem namespace / containment.** No mount namespace, no chroot, no
   overlay. The whole real filesystem is visible.
 - **Name-based file/exec blocking is content-blind.** The LSM matcher keys on a
-  file's basename and immediate parent-dir name, so it stops *accidental and
-  naive* access; it is bypassable by renaming/hard-linking the target (`mv`,
+  file's basename and on its ancestor directory names, so it stops *accidental
+  and naive* access; it is bypassable by renaming/hard-linking the target (`mv`,
   `link()` are not hooked) and by copying a blocked binary to a new name. See
   [`SECURITY.md`](../SECURITY.md).
 - **No defence against a root child (as shipped).** If the watched process runs

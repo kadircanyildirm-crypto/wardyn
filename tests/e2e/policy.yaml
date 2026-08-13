@@ -8,6 +8,9 @@ default_action: allow
 
 files:
   - { match: "**/.env", action: block }
+  # Directory form: the LSM hook walks every ancestor, so this must cover a file
+  # nested several levels below `.ssh`, not just its direct children.
+  - { match: "**/.ssh/**", action: block }
   - { match: "**", action: allow }
 
 network:

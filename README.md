@@ -61,6 +61,15 @@ Every action is checked against a [`policy.yaml`](#policy) → `allow` / `warn` 
 `--enforce` the agent itself gets a machine-readable **denial receipt**
 (`WARDYN_DENIALS`) — see [Telling the agent](#telling-the-agent).
 
+**A denial is reported by the hook that made it.** The tracepoints observe a
+*userspace path string*; the LSM and cgroup hooks act on the resolved object and
+emit their own event naming the key they matched. So an open through a directory
+fd, a symlinked path, or a `sendmsg()` destination — none of which the observed
+string describes correctly — still shows up in the feed, the audit log and the
+receipt. What the kernel could not tell you is counted too: ring-buffer drops and
+watch-set saturation appear in the header and at exit, because a lost event for a
+denied action is a missing audit record, not a cosmetic glitch.
+
 **Surgically scoped & safe:** enforcement only ever touches the subtree you
 launched, and only with `--enforce`. The rest of the system is never affected —
 `wardyn --enforce run -- agent` can block the agent from `8.8.8.8` while every other
@@ -81,10 +90,13 @@ sudo ./scripts/enable-bpf-lsm.sh && sudo reboot
 # 3. build
 cargo build --release      # userspace + eBPF, via aya-build
 
-# 4. observe (no blocking) — watch an agent's whole subtree
+# 4. check what your policy will REALLY do — no root, no eBPF, no target
+./target/release/wardyn --dry-run --policy policies/strict.yaml
+
+# 5. observe (no blocking) — watch an agent's whole subtree
 sudo ./target/release/wardyn run -- bash
 
-# 5. enforce — actually block policy violations
+# 6. enforce — actually block policy violations
 sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh
 ```
 
@@ -92,21 +104,39 @@ Renders a live TUI when attached to a terminal; pipe it (or pass `--plain`) for 
 plain table. `--policy <file>`, `--audit <file>` and `--denials <file>` override
 the defaults. The watched agent is run as your non-root user by default (via
 `$SUDO_UID`, so it can't disable its own warden); use `--as-user uid[:gid]` to
-choose, or `--keep-root` to keep it as root. In the TUI, `q` quits; under
-`--enforce`, `a` grants an approve-once exception for the last denial (with a y/n
-confirm that names the true scope).
+choose, or `--keep-root` to keep it as root.
+
+In the TUI, `q` quits — **and stops the agent with it.** Wardyn's enforcement
+lives in programs this process owns, so leaving the agent running after wardyn
+exits would hand it the unsupervised shell the tool exists to prevent, silently,
+at the moment you pressed a key. Under `--enforce`, `a` grants an approve-once
+exception for the last denial (with a y/n confirm that names the true scope).
+Wardyn exits with the agent's own exit status.
 
 ## Policy
 
-[`policy.yaml`](./policy.yaml) — three ordered rule lists; **first match wins**;
-`default_action` is the fallback. Actions: `allow | warn | block`.
+[`policy.yaml`](./policy.yaml) — three rule lists; `default_action` is the
+fallback. Actions: `allow | warn | block`. Matching order differs per axis, and
+saying "first match wins" everywhere would be wrong:
+
+| Axis | Order |
+|---|---|
+| `files` / `exec` | first match wins |
+| `network` | **longest prefix wins** (the kernel uses an LPM trie) |
+| `files` / `exec` under `--enforce` | **no order** — the kernel holds a *set* of block keys, so an earlier `allow` does not exempt what a later `block` covers |
+
+`wardyn --dry-run` prints exactly which keys the kernel will hold, which rules are
+flagged but never denied, which enforce more broadly than written, and which
+`allow` rules the kernel's unordered set overrides. Unknown keys and unsupported
+`version:` values are refused rather than ignored — a typo'd section used to
+disable a whole rule class silently.
 
 ```yaml
 default_action: allow
 
 files:                                   # glob against the opened path (** spans dirs)
-  - { match: "**/.env",      action: block }
-  - { match: "**/.ssh/**",   action: block }
+  - { match: "**/.env",      action: block }   # any file named .env
+  - { match: "**/.ssh/**",   action: block }   # anything under a dir named .ssh, at any depth
   - { match: "/etc/shadow",  action: block }
   - { match: "**",           action: allow }
 
@@ -192,10 +222,15 @@ the run only.
   colours the feed, and writes the audit log.
 - **Scoping** — `WATCHED` is seeded with the launched pid; a `sched_process_fork`
   hook adopts children in-kernel, so the whole subtree is followed race-free.
+  Thread ids are evicted as their threads die, and a failed insert is counted —
+  a full watch set would otherwise mean new children running unwatched.
 - **Enforcement** — separate programs deny inline: `cgroup/connect4·6` +
   `sendmsg4·6` return *deny* for blocked egress (TCP connect and UDP sendmsg, IPv4
   & IPv6); BPF-LSM `file_open` / `bprm_check_security` return `-EPERM` for blocked
   reads / execs. All gated on `WATCHED` + an `enforce` flag.
+- **Reporting** — each of those hooks emits its own event naming the key it
+  matched, so the feed, the audit log and the receipt state what the kernel did
+  rather than what userspace guessed from the observed path.
 
 Full design, hook map, and the eBPF-verifier war stories are in
 **[ARCHITECTURE.md](./ARCHITECTURE.md)**.
@@ -226,11 +261,17 @@ Full design, hook map, and the eBPF-verifier war stories are in
 - [x] **M2 — Policy:** `policy.yaml` (glob + CIDR), allow/warn/block, JSONL audit.
 - [x] **M3 — Block:** deny egress (cgroup — TCP + UDP, IPv4 + IPv6) + secret reads
   & blocked execs (LSM).
-- [ ] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓, presets ✓)_
+- [ ] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓,
+  presets ✓, `--dry-run` policy checker ✓, portable policy tests on Linux/macOS/
+  Windows ✓)_
 - [ ] **M5 — Agent feedback:** the agent learns what was denied and why, instead
   of flailing at a bare `EPERM`. _(denial receipts ✓, approve-once exceptions
-  from the TUI ✓)_ Next: persistent overrides kept outside the watched tree's
-  reach.
+  from the TUI ✓, kernel-reported denials ✓)_ Next: persistent overrides kept
+  outside the watched tree's reach.
+- [ ] **M6 — Match on identity, not names:** full-path (`bpf_d_path`) and
+  `(dev, ino)` keying, a read/write/create axis, and port/protocol in network
+  rules. Until then a rename or a copy defeats a file rule — see
+  [`SECURITY.md`](./SECURITY.md).
 
 ## Contributing
 

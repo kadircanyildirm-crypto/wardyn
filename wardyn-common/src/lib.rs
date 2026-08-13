@@ -21,12 +21,58 @@ pub const NAME_LEN: usize = 40;
 pub struct NameKey(pub [u8; NAME_LEN]);
 
 /// What kind of syscall/LSM event this is.
+///
+/// `EXEC` / `OPEN` / `CONNECT` are *observations*: a syscall entered the kernel.
+/// The `DENY_*` kinds are *decisions*, emitted by the very hook that returned
+/// `-EPERM` (or refused the address). The difference matters: an observation is
+/// a userspace string read at `sys_enter`, while a decision names the object the
+/// kernel actually acted on, so only a `DENY_*` event proves a denial happened.
 pub mod kind {
     pub const EXEC: u32 = 0;
     pub const OPEN: u32 = 1;
     pub const CONNECT: u32 = 2;
     pub const FORK: u32 = 3;
+    /// LSM `file_open` denied an open. `path` holds the matched key, `meta`
+    /// says whether it was a basename ([`meta::KEY_NAME`]) or an ancestor
+    /// directory ([`meta::KEY_DIR`]).
+    pub const DENY_FILE: u32 = 4;
+    /// LSM `bprm_check_security` denied an exec; `path` holds the basename.
+    pub const DENY_EXEC: u32 = 5;
+    /// A cgroup `connect*`/`sendmsg*` hook refused an address.
+    pub const DENY_NET: u32 = 6;
 }
+
+/// Values of [`Event::meta`], interpreted per `kind`.
+pub mod meta {
+    /// `DENY_FILE`: the file's own basename matched `BLOCK_NAMES`.
+    pub const KEY_NAME: u32 = 0;
+    /// `DENY_FILE`: an ancestor directory matched `BLOCK_DIRS`.
+    pub const KEY_DIR: u32 = 1;
+}
+
+/// Slots of the per-CPU `STATS` map. Counters the kernel keeps and userspace
+/// reports: without them, a full ring buffer or a full watch set is a silent
+/// loss of exactly the records the tool exists to produce.
+pub mod stat {
+    /// Events dropped because the ring buffer was full.
+    pub const RING_DROPS: u32 = 0;
+    /// Children that could NOT be added to `WATCHED` (map full) — every one is
+    /// a process that escaped both observation and enforcement.
+    pub const WATCH_FULL: u32 = 1;
+    /// Opens denied by the LSM `file_open` hook.
+    pub const DENIED_FILE: u32 = 2;
+    /// Execs denied by the LSM `bprm_check_security` hook.
+    pub const DENIED_EXEC: u32 = 3;
+    /// Destinations refused by the cgroup `connect*`/`sendmsg*` hooks.
+    pub const DENIED_NET: u32 = 4;
+    /// Number of slots (the map's `max_entries`).
+    pub const COUNT: u32 = 5;
+}
+
+/// How many ancestor directories the LSM `file_open` hook walks when matching
+/// `BLOCK_DIRS`. Bounded so the verifier accepts the loop; userspace mirrors the
+/// same bound so the feed never claims a denial from deeper than the hook looks.
+pub const MAX_DIR_WALK: usize = 16;
 
 /// The verdict the policy engine reached for this event.
 pub mod action {
@@ -69,6 +115,9 @@ pub struct Event {
     pub dport: u16,
     /// Address family for CONNECT: AF_INET (2) or AF_INET6 (10); 0 otherwise.
     pub family: u16,
+
+    /// Kind-specific discriminator; see [`meta`]. 0 for observation events.
+    pub meta: u32,
 }
 
 impl Event {
@@ -87,6 +136,7 @@ impl Event {
             daddr6: [0; 16],
             dport: 0,
             family: 0,
+            meta: 0,
         }
     }
 }

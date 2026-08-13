@@ -1,0 +1,23 @@
+[package]
+name = "wardyn-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Wardyn's policy engine and CLI parsing — pure logic, no kernel or OS dependencies, so it is testable on any host."
+
+# Deliberately portable: no aya, no libc, no Linux-only APIs. `cargo test -p
+# wardyn-policy` runs on Linux, macOS and Windows, which is what keeps the
+# semantics under test even though the binary that uses them is Linux-only.
+[dependencies]
+wardyn-common = { workspace = true }
+anyhow = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+globset = "0.4"
+ipnet = "2"
+
+[lib]
+path = "src/lib.rs"

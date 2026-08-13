@@ -1,5 +1,12 @@
 # The eBPF crate is compiled with `-Z build-std=core` for the bpfel target, which
 # needs nightly + rust-src. Userspace also builds fine on nightly.
+#
+# The nightly is PINNED, not floating. The bytecode that ends up in the kernel is
+# a function of this compiler: a different nightly emits different instructions,
+# which the verifier may accept or reject differently. A security tool whose
+# kernel-side artifact changes silently between two builds of the same commit
+# cannot be reviewed or reproduced. Bump this deliberately, and re-run
+# `just e2e` on a BPF-LSM kernel afterwards.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-07-13"
 components = ["rust-src"]

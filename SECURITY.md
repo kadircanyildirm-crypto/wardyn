@@ -75,21 +75,33 @@ Out of scope (known limitations, documented, not vulnerabilities):
   maps and disable itself — do not run untrusted agents with `--keep-root`.
 
 - **Name-based file/exec matching is content-blind.** The LSM matcher keys on a
-  file's basename and immediate parent-dir name, so it stops *accidental and naive*
+  file's basename and on the names of its ancestor directories (a bounded walk, so
+  a `**/dir/**` rule does cover the whole subtree). It stops *accidental and naive*
   access but is **bypassable** by renaming or hard-linking the target before
   opening it (`mv`/`link()` are not hooked) or by copying a blocked binary to a new
   name. Treat it as a guard against mistakes, not a defence against deliberate
   exfiltration. Full-path matching (`bpf_d_path`) and `(dev, ino)` keying are on the
   roadmap.
 
-- **The feed/audit/receipt verdict is an inference.** The enforcement hook returns
-  `-EPERM`/deny but does not report *what* it denied; userspace re-derives the
-  verdict from the observed syscall path. That inference can diverge from the kernel
-  for dirfd-relative and symlink opens, `sendmsg()` egress, and off-feed syscall
-  paths. When the LSM does not attach or `dentry` offsets are untrustworthy,
-  file/exec blocks are demoted to `block~` and not receipted rather than asserting a
-  denial that did not fire. The durable fix (emit the verdict from the hook) is
-  tracked in [`docs/AUDIT.md`](./docs/AUDIT.md).
+- **Rule *order* does not survive into the kernel.** Under `--enforce` the LSM hook
+  holds an unordered set of block keys, so an `allow` rule listed before a `block`
+  does not create an exception for anything that block's key covers. Startup names
+  every rule this affects, and `--dry-run` lists them without running anything.
+
+- **Denials are reported by the hook that makes them** — each enforcement hook
+  emits an event naming the key it matched, so a dirfd-relative open, a symlinked
+  path, a `sendmsg()` destination or an off-feed syscall path is reported even
+  though the observed path described something else. What userspace still *infers*
+  is the prediction shown before the kernel answers; when the LSM does not attach
+  or `dentry` offsets are untrustworthy, those predictions are demoted to `block~`
+  rather than asserting a denial that did not fire, and at exit the kernel's own
+  denial counters are compared against everything the receipt claimed.
+
+- **Events can still be lost under load.** The ring buffer is finite; a burst that
+  overruns it drops events, and a dropped event for a denied action means no feed
+  row, no audit record and no receipt line. Wardyn counts drops in the kernel and
+  reports them in the header and at exit — it does not silently pretend the run was
+  clean.
 
 The complete, adversarially-verified list of gaps and escapes — including several
 not yet fixed — is in [`docs/AUDIT.md`](./docs/AUDIT.md). It is required reading

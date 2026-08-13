@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The kernel reports its own denials.** Every enforcement hook
+  (`lsm/file_open`, `lsm/bprm_check_security`, `cgroup/connect4·6`,
+  `cgroup/sendmsg4·6`) now emits an event naming the key it matched, and
+  userspace *renders* that instead of re-deriving a verdict from the observed
+  `sys_enter` path. The two describe different objects whenever a path is
+  relative, opened through a directory fd, or reached via a symlink — in all of
+  which the feed used to show a green `ok` for a syscall the kernel had turned
+  into `-EPERM`, with no audit record and no receipt line. Denials on paths with
+  no observe hook at all (`sendmsg`, legacy `open(2)`) are now reported too. A
+  kernel report that merely confirms a row already shown is folded away, so the
+  common case still renders as one line.
+- **Kernel-side loss counters (`STATS`).** Ring-buffer drops, failed `WATCHED`
+  inserts and per-class denial counts are counted in a per-CPU map, shown in the
+  TUI header, and printed at exit. A dropped event for a denied action means no
+  feed row, no audit record and no receipt line; that is now impossible to
+  mistake for a clean run. At exit the kernel's denial counters are compared
+  against what the receipt told the agent — if the receipt claimed denials the
+  kernel never made, the run says so.
+- **`--dry-run`.** Loads and explains a policy without root, eBPF, or a target:
+  every key the kernel will hold, every `block` rule that is flagged but never
+  denied, every rule that enforces more broadly than written, and every `allow`
+  the kernel's unordered block set overrides. CI now dry-runs all four shipped
+  policies.
+- **`wardyn-policy` crate.** The policy engine and CLI parsing moved into a
+  portable crate with no `aya`/`libc` dependency, so `cargo test -p wardyn-policy`
+  runs on Linux, macOS and Windows — CI now does exactly that on all three. The
+  semantics that decide what an agent may read, run and reach were previously
+  trapped inside a Linux-only binary crate.
+- `WARDYN_SKIP_EBPF_BUILD=1` for `build.rs`: type-check the userspace crate
+  without `bpf-linker` (`just check-nolinker`). The resulting binary refuses to
+  start rather than pretending to enforce anything.
+- The eBPF object now declares its license section explicitly instead of relying
+  on a loader default. It must be GPL-compatible for the GPL-only helpers the
+  matchers depend on (`bpf_probe_read_kernel`).
+
 - **Runtime BTF offset resolution for the LSM matcher.** The `dentry` field offsets
   the file/exec hooks read are now resolved from the running kernel's own BTF
   (`/sys/kernel/btf/vmlinux`) and passed via `CONFIG`, so the matcher adapts to the
@@ -52,6 +87,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Quitting the TUI now stops the agent.** Wardyn's enforcement lives in
+  programs this process owns, so `q` used to tear down every hook and leave the
+  watched agent running unsupervised — silently, at the moment the operator
+  pressed a key. The subtree is now signalled (SIGTERM, then SIGKILL after a
+  grace period) whenever wardyn exits, however it exits.
+- **Wardyn exits with the target's exit status** (128+signal when it was killed),
+  instead of always 0.
+- Unknown keys in `policy.yaml` and unsupported `version:` values are now hard
+  errors. A typo'd section (`file:` for `files:`) silently disabled an entire
+  rule class while the policy looked correct.
+- Startup diagnostics are shown as feed rows instead of being written to stderr
+  milliseconds before the TUI replaced the screen with an alternate one.
+- The denial receipt is created `O_EXCL|O_NOFOLLOW`, mode `0600`, and chowned to
+  the identity the agent runs as: it lives at a predictable path in a
+  world-writable directory and is opened by root.
+- The pinned nightly in `rust-toolchain.toml` is now an exact dated toolchain.
+  The bytecode loaded into the kernel is a function of the compiler, so a
+  floating channel meant two builds of the same commit could differ in what the
+  verifier sees.
+- The ring buffer grew from 256 KiB (~800 in-flight events) to 4 MiB, and
+  `WATCHED` from 8192 to 65536 entries.
 - Network rules are now evaluated most-specific-first in userspace to match the
   kernel's longest-prefix-match LPM trie; the feed no longer reports a `block`
   the kernel actually allows (or vice-versa) when a broad CIDR precedes a narrow one.
@@ -61,6 +117,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A thread-heavy agent could switch enforcement off for every future child.**
+  `sched_process_fork` also fires for `CLONE_THREAD`, and its `child_pid` is then
+  a *thread* id, inserted into a tgid-keyed `WATCHED` and never removed. Roughly
+  8192 `pthread_create` calls filled the map, after which every `insert` failed
+  with `-E2BIG` — the error was discarded — and each newly forked child ran with
+  no observation and no enforcement at all. Thread ids are now evicted as their
+  threads exit, failed inserts increment `STATS[WATCH_FULL]` and are reported
+  loudly, and the map is eight times larger. Stale thread ids also used to alias
+  a later, unrelated process that happened to get that pid number, denying *its*
+  file opens and egress.
+- **`**/dir/**` rules only covered a directory's immediate children.** The LSM
+  hook compared just `d_parent`, so `~/.ssh/sub/deeper/id_ed25519` was readable
+  while the feed and the docs both presented the rule as covering the subtree.
+  The hook now walks every ancestor (bounded, and the userspace mirror uses the
+  same bound so it cannot claim a denial from deeper than the hook looks).
+- **Fork adoption compared a thread id against a tgid-keyed map.** The hook now
+  takes the parent's tgid from `bpf_get_current_pid_tgid` — it runs in the
+  parent's context — which is correct for a fork from any thread, and no longer
+  depends on thread ids polluting the map to work at all.
+- **An option could swallow the next flag as its value.**
+  `wardyn --audit --enforce run -- x` ran in observe mode with an audit log named
+  `--enforce`, while the operator believed enforcement was on.
+- **A non-UTF-8 argument aborted wardyn before it started.** Arguments are
+  `OsString` end to end now, so the agent's command line can name any file.
+- **Every `?` in the TUI returned before the terminal restore**, leaving the
+  operator in raw mode inside the alternate screen. Restoration is a guard now.
+  A `wait` error no longer calls `process::exit(1)`, which skipped the restore,
+  the final ring sweep and the exit summary.
+- **A pre-typed `a`+`y` could grant an exception whose confirm prompt was never
+  drawn** — the TUI drained all buffered keystrokes in one tick. `y` is only
+  accepted after the blast-radius prompt has actually been rendered.
+- **Attacker-controlled path bytes were printed raw**, so a file name containing
+  `\r` or an ANSI escape could forge feed rows or hide activity from the operator
+  watching. Control characters and bidirectional overrides are escaped for
+  display.
+- **A path at or over the 256-byte event buffer arrived as the empty string** and
+  was evaluated against the policy as `""` — a silent allow with a blank DETAIL.
+  Such events are now flagged as not-evaluated.
+- **Audit write failures were discarded.** A full disk turned the security record
+  into a partial one with no indication; failures are counted and reported.
+- **`run_plain` panicked on a closed pipe** (`wardyn --plain | head`).
+- SIGTERM and SIGHUP are handled, and the Ctrl-C future is created once instead
+  of being recreated every loop iteration (which dropped signals arriving in the
+  gap between iterations).
+- A failed exception grant was rendered as a policy `warn`, inflating the warn
+  counter with an internal error.
+- LPM-trie keys are built with `from_ne_bytes`, not `from_le_bytes`, which was
+  correct only on a little-endian host.
+- `resolve_domain` no longer runs inside the policy parser: the resolver is
+  injectable, so the documented `domain:` rule form is testable and policy tests
+  are not network-dependent. Domains that resolve to nothing are reported instead
+  of silently enforcing nothing.
 - **IPv6 egress was not enforced.** Both presets expressed "deny all other egress"
   only as `0.0.0.0/0` (IPv4), leaving every IPv6 destination — and IPv4-mapped
   `::ffff:a.b.c.d` from dual-stack sockets, which run the `connect6` hook — allowed

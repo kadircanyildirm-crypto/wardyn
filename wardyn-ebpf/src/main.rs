@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Wardyn eBPF programs.
 //!
-//! Observation (tracepoints) streams a structured [`Event`] per exec/open/connect
-//! for the watched subtree. Enforcement (M3, gated on `CONFIG[ENFORCE]` and only
-//! for WATCHED pids) adds:
-//!   - `cgroup/connect4` — deny outbound IPv4 to a blocked CIDR (LPM trie).
-//!   - `lsm/file_open`   — deny opening a file whose basename or parent directory
-//!     is on the block list (exact match; no kernel path-walk needed).
+//! Two kinds of program run here, and the difference is the whole design:
+//!
+//! - **Observation** (tracepoints) streams a structured [`Event`] per
+//!   exec/open/connect for the watched subtree. What it reports is a *userspace
+//!   string read at `sys_enter`* — useful, but not proof of anything.
+//! - **Enforcement** (`cgroup/connect*`, `lsm/file_open`, `lsm/bprm_check`)
+//!   denies inline, and **reports its own decision** as a `DENY_*` event naming
+//!   the key it matched. Userspace therefore renders what the kernel did instead
+//!   of re-deriving it from the observed string — the two disagree whenever a
+//!   path is relative, opened through a dirfd, or reached via a symlink.
+//!
+//! Everything the kernel silently loses is counted in `STATS` (ring-buffer
+//! drops, watch-set saturation, denials) so userspace can say so out loud.
 #![no_std]
 #![no_main]
 
@@ -17,29 +24,55 @@ use aya_ebpf::{
         bpf_probe_read_user_str_bytes,
     },
     macros::{cgroup_sock_addr, lsm, map, tracepoint},
-    maps::{lpm_trie::Key, Array, HashMap, LpmTrie, RingBuf},
+    maps::{lpm_trie::Key, Array, HashMap, LpmTrie, PerCpuArray, RingBuf},
     programs::{LsmContext, SockAddrContext, TracePointContext},
 };
-use wardyn_common::{action, kind, Event, Ip6Key, NameKey, COMM_LEN, NAME_LEN, PATH_LEN};
+use wardyn_common::{
+    action, kind, meta, stat, Event, Ip6Key, NameKey, COMM_LEN, MAX_DIR_WALK, NAME_LEN, PATH_LEN,
+};
 
-#[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+/// The kernel refuses GPL-only helpers (`bpf_probe_read_kernel`, which every
+/// matcher here depends on) unless the object carries a GPL-compatible license
+/// tag. Declaring it explicitly, rather than relying on a loader default, is
+/// also what makes the object's terms visible to anyone inspecting it.
+#[no_mangle]
+#[link_section = "license"]
+pub static LICENSE: [u8; 4] = *b"GPL\0";
 
+/// 4 MiB. An `Event` is ~324 bytes, so the old 256 KiB ring held only ~800
+/// in-flight events — a `cargo build` or `npm install` overruns that in a
+/// fraction of a second, and a dropped event means a denial with no feed row, no
+/// audit record and no receipt line. One allocation, freed when wardyn exits.
 #[map]
-static WATCHED: HashMap<u32, u8> = HashMap::with_max_entries(8192, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+/// Watched tgids. Sized well above the old 8192 because thread creations also
+/// land here transiently (see `handle_fork`): at saturation `insert` fails and
+/// new children silently escape *all* enforcement, which is a bypass primitive,
+/// not just a leak. `wardyn_exit` now evicts thread ids as they die, and
+/// `STATS[WATCH_FULL]` makes any remaining saturation loud.
+#[map]
+static WATCHED: HashMap<u32, u8> = HashMap::with_max_entries(65536, 0);
 
 /// Config: [0] watch_all, [1] enforce, [2] net_default (action code),
 /// [3] pid-ns handshake nonce (userspace→kernel), [4] learned init-ns tgid
-/// (kernel→userspace, written by `wardyn_handshake`), [5]/[6] byte offsets of
-/// sched_process_fork's parent_pid/child_pid fields (read from tracefs — the
-/// layout moved when comm became `__data_loc` in newer kernels),
-/// [7] defer_evict (1 = don't evict WATCHED on leader exit; userspace prunes
-/// against /proc instead — avoids the pthread_exit-from-leader escape),
-/// [8]/[9]/[10]/[11] LSM struct offsets (file→dentry, dentry→name, dentry→parent,
-/// binprm→file) resolved at runtime from BTF; 0 means "fall back to the built-in
-/// kernel-6.8 constants".
+/// (kernel→userspace, written by `wardyn_handshake`), [5] RESERVED (was the
+/// sched_process_fork parent_pid offset; the hook now takes the parent's tgid
+/// from `bpf_get_current_pid_tgid`, which is correct for a fork from any
+/// thread), [6] byte offset of sched_process_fork's child_pid field (read from
+/// tracefs — the layout moved when comm became `__data_loc`), [7] defer_evict
+/// (1 = don't evict a WATCHED leader on exit; userspace prunes against /proc
+/// instead — avoids the pthread_exit-from-leader escape), [8]/[9]/[10]/[11] LSM
+/// struct offsets (file→dentry, dentry→name, dentry→parent, binprm→file)
+/// resolved at runtime from BTF; 0 means "fall back to the built-in kernel-6.8
+/// constants".
 #[map]
 static CONFIG: Array<u32> = Array::with_max_entries(16, 0);
+
+/// Per-CPU counters; see [`stat`]. Per-CPU because a shared `Array` counter
+/// incremented from several CPUs loses exactly the events it is meant to count.
+#[map]
+static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(stat::COUNT, 0);
 
 /// Blocked-CIDR -> action code (longest-prefix), keyed by IPv4 in network order.
 #[map]
@@ -53,7 +86,8 @@ static NET_RULES6: LpmTrie<Ip6Key, u32> = LpmTrie::with_max_entries(1024, 0);
 #[map]
 static BLOCK_NAMES: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 
-/// Blocked parent-directory names (e.g. `.ssh`, `.aws`) — exact match.
+/// Blocked directory names (e.g. `.ssh`, `.aws`) — exact match against every
+/// ancestor of the opened file, up to [`MAX_DIR_WALK`] levels.
 #[map]
 static BLOCK_DIRS: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 
@@ -66,7 +100,6 @@ const CFG_ENFORCE: u32 = 1;
 const CFG_NET_DEFAULT: u32 = 2;
 const CFG_HS_NONCE: u32 = 3;
 const CFG_HS_TGID: u32 = 4;
-const CFG_FORK_PARENT_OFF: u32 = 5;
 const CFG_FORK_CHILD_OFF: u32 = 6;
 const CFG_DEFER_EVICT: u32 = 7;
 const CFG_FILE_DENTRY_OFF: u32 = 8;
@@ -83,11 +116,11 @@ const OPENAT_FILENAME_OFFSET: usize = 24;
 const CONNECT_USERVADDR_OFFSET: usize = 24;
 // sendto(fd, buf, len, flags, dest_addr, addrlen) — dest_addr is the 5th arg.
 const SENDTO_UADDR_OFFSET: usize = 48;
-// sched_process_fork's pid offsets are NOT hardcoded: the sched tracepoint
-// layout moved when comm became `__data_loc` (parent_pid 24→12, child_pid
-// 44→20). Userspace reads the running kernel's format from tracefs and passes
-// the offsets via CONFIG[CFG_FORK_PARENT_OFF]/[CFG_FORK_CHILD_OFF]. Syscall
-// tracepoints (above) keep their ABI-stable 16+8·n argument slots.
+// sched_process_fork's child_pid offset is NOT hardcoded: the sched tracepoint
+// layout moved when comm became `__data_loc` (child_pid 44→20). Userspace reads
+// the running kernel's format from tracefs and passes the offset via
+// CONFIG[CFG_FORK_CHILD_OFF]. Syscall tracepoints (above) keep their ABI-stable
+// 16+8·n argument slots.
 
 // Built-in struct offsets for kernel 6.8 (from `pahole`; see
 // scripts/kernel-offsets.sh). These are only a FALLBACK now: userspace resolves
@@ -136,6 +169,15 @@ fn off(idx: u32, default: usize) -> usize {
         v
     } else {
         default
+    }
+}
+
+/// Bump a [`stat`] counter. Best-effort: a counter we failed to increment must
+/// never change what the hook decides.
+#[inline(always)]
+fn bump(slot: u32) {
+    if let Some(p) = STATS.get_ptr_mut(slot) {
+        unsafe { *p += 1 };
     }
 }
 
@@ -191,12 +233,14 @@ fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -
     let filename = unsafe { ctx.read_at::<u64>(filename_off) }? as *const u8;
 
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        bump(stat::RING_DROPS);
         return Err(0);
     };
     let e = entry.as_mut_ptr();
     unsafe {
         (*e).kind = ev_kind;
         (*e).action = action::ALLOW;
+        (*e).meta = 0;
         (*e).pid = pid;
         (*e).ppid = 0;
         (*e).uid = bpf_get_current_uid_gid() as u32;
@@ -208,7 +252,11 @@ fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -
         let dst = core::slice::from_raw_parts_mut((*e).path.as_mut_ptr(), PATH_LEN);
         (*e).path_len = match bpf_probe_read_user_str_bytes(filename, dst) {
             Ok(bytes) => bytes.len() as u32,
-            Err(_) => 0,
+            // A path at or over PATH_LEN (or an unreadable one) leaves the
+            // helper's zeroed buffer behind. Report it as PATH_LEN rather than
+            // 0 so userspace can say "truncated/unreadable" instead of showing
+            // an empty DETAIL and evaluating the policy against "".
+            Err(_) => PATH_LEN as u32,
         };
     }
     entry.submit(0);
@@ -226,7 +274,7 @@ pub fn wardyn_connect(ctx: TracePointContext) -> u32 {
 // UDP egress uses sendto/sendmsg, not connect — and the cgroup sendmsg hooks
 // enforce on it — so observe sendto too, or blocked datagrams would be denied
 // invisibly. (sendmsg's destination hides behind a msghdr indirection aya-ebpf
-// 0.1 can't easily walk, so that path stays enforce-only for now.)
+// 0.1 can't easily walk; the DENY_NET event from the cgroup hook covers it.)
 #[tracepoint]
 pub fn wardyn_sendto(ctx: TracePointContext) -> u32 {
     let _ = emit_connect(&ctx, SENDTO_UADDR_OFFSET);
@@ -258,12 +306,14 @@ fn emit_connect(ctx: &TracePointContext, uaddr_off: usize) -> Result<(), i64> {
     }
 
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        bump(stat::RING_DROPS);
         return Err(0);
     };
     let e = entry.as_mut_ptr();
     unsafe {
         (*e).kind = kind::CONNECT;
         (*e).action = action::ALLOW;
+        (*e).meta = 0;
         (*e).pid = pid;
         (*e).ppid = 0;
         (*e).uid = bpf_get_current_uid_gid() as u32;
@@ -276,6 +326,66 @@ fn emit_connect(ctx: &TracePointContext, uaddr_off: usize) -> Result<(), i64> {
     }
     entry.submit(0);
     Ok(())
+}
+
+// ── denial reporting: the hook that decides is the hook that reports ────────
+
+/// Emit a `DENY_FILE` / `DENY_EXEC` event carrying the key that matched. This is
+/// the only evidence userspace has that a denial actually happened: the observed
+/// `sys_enter` path may be relative, may name a symlink, or may not exist at all
+/// (a dirfd-relative open), and the LSM matched the resolved dentry instead.
+#[inline(always)]
+fn emit_deny_name(ev_kind: u32, key: &[u8; NAME_LEN], meta_val: u32) {
+    let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        bump(stat::RING_DROPS);
+        return;
+    };
+    let e = entry.as_mut_ptr();
+    unsafe {
+        (*e).kind = ev_kind;
+        (*e).action = action::BLOCK;
+        (*e).meta = meta_val;
+        (*e).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).ppid = 0;
+        (*e).uid = bpf_get_current_uid_gid() as u32;
+        (*e).comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
+        (*e).daddr = 0;
+        (*e).daddr6 = [0u8; 16];
+        (*e).dport = 0;
+        (*e).family = 0;
+        // Fixed-width copy, no data-dependent indexing: the key is already
+        // NUL-padded and userspace stops at the NUL, and a constant-length
+        // memcpy is what the verifier is happiest with.
+        let dst = core::slice::from_raw_parts_mut((*e).path.as_mut_ptr(), PATH_LEN);
+        dst[..NAME_LEN].copy_from_slice(key);
+        (*e).path_len = NAME_LEN as u32;
+    }
+    entry.submit(0);
+}
+
+/// Emit a `DENY_NET` event for a refused destination.
+#[inline(always)]
+fn emit_deny_net(daddr: u32, daddr6: [u8; 16], dport: u16, family: u16) {
+    let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        bump(stat::RING_DROPS);
+        return;
+    };
+    let e = entry.as_mut_ptr();
+    unsafe {
+        (*e).kind = kind::DENY_NET;
+        (*e).action = action::BLOCK;
+        (*e).meta = 0;
+        (*e).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).ppid = 0;
+        (*e).uid = bpf_get_current_uid_gid() as u32;
+        (*e).comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
+        (*e).path_len = 0;
+        (*e).daddr = daddr;
+        (*e).daddr6 = daddr6;
+        (*e).dport = dport;
+        (*e).family = family;
+    }
+    entry.submit(0);
 }
 
 // ── network enforcement: deny blocked egress ────────────────────────────────
@@ -295,16 +405,20 @@ pub fn connect4(ctx: SockAddrContext) -> i32 {
 /// how `user_ip4` and the userspace-compiled `NET_RULES` keys are laid out).
 /// Shared by `connect4` and by `connect6`'s v4-mapped path.
 #[inline(always)]
-fn net4_verdict(ip: u32) -> i32 {
+fn net4_blocked(ip: u32) -> bool {
     let action = NET_RULES
         .get(&Key::new(32, ip))
         .copied()
         .unwrap_or_else(|| cfg(CFG_NET_DEFAULT));
-    if action == action::BLOCK {
-        DENY
-    } else {
-        ALLOW
-    }
+    action == action::BLOCK
+}
+
+/// The destination port from `bpf_sock_addr::user_port`, which holds a
+/// network-order 16-bit port zero-extended into a `__be32`.
+#[inline(always)]
+fn dest_port(ctx: &SockAddrContext) -> u16 {
+    let raw = unsafe { (*ctx.sock_addr).user_port };
+    u16::from_be(raw as u16)
 }
 
 fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
@@ -316,7 +430,12 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(ALLOW);
     }
     let ip = unsafe { (*ctx.sock_addr).user_ip4 }; // network byte order
-    Ok(net4_verdict(ip))
+    if net4_blocked(ip) {
+        bump(stat::DENIED_NET);
+        emit_deny_net(ip, [0u8; 16], dest_port(ctx), AF_INET);
+        return Ok(DENY);
+    }
+    Ok(ALLOW)
 }
 
 #[cgroup_sock_addr(connect6)]
@@ -368,19 +487,26 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         && ip6[11] == 0xff;
     if v4_mapped {
         // ip6[12..16] are the embedded v4 octets in network order — the same
-        // representation `net4_verdict` and `user_ip4` use.
+        // representation `net4_blocked` and `user_ip4` use.
         let ip = u32::from_ne_bytes([ip6[12], ip6[13], ip6[14], ip6[15]]);
-        return Ok(net4_verdict(ip));
+        if net4_blocked(ip) {
+            bump(stat::DENIED_NET);
+            // Report the address the operator will recognise from the feed.
+            emit_deny_net(0, ip6, dest_port(ctx), AF_INET6);
+            return Ok(DENY);
+        }
+        return Ok(ALLOW);
     }
     let action = NET_RULES6
         .get(&Key::new(128, Ip6Key(ip6)))
         .copied()
         .unwrap_or_else(|| cfg(CFG_NET_DEFAULT));
     if action == action::BLOCK {
-        Ok(DENY)
-    } else {
-        Ok(ALLOW)
+        bump(stat::DENIED_NET);
+        emit_deny_net(0, ip6, dest_port(ctx), AF_INET6);
+        return Ok(DENY);
     }
+    Ok(ALLOW)
 }
 
 // UDP is connectionless — connect() may never fire, so gate sendmsg too. The
@@ -424,23 +550,45 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(OK);
     }
 
+    let name_off = off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF);
+    let parent_off = off(CFG_DENTRY_PARENT_OFF, DENTRY_PARENT_OFF);
+
     // struct file* -> f_path.dentry
     let file: *const u8 = unsafe { ctx.arg(0) };
     let dentry = read_ptr(file, off(CFG_FILE_DENTRY_OFF, FILE_DENTRY_OFF))?;
 
     // basename: dentry->d_name.name
     let mut name = [0u8; NAME_LEN];
-    read_name(dentry, off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF), &mut name)?;
+    read_name(dentry, name_off, &mut name)?;
     if unsafe { BLOCK_NAMES.get(&NameKey(name)).is_some() } {
+        bump(stat::DENIED_FILE);
+        emit_deny_name(kind::DENY_FILE, &name, meta::KEY_NAME);
         return Ok(EPERM);
     }
 
-    // parent directory name: dentry->d_parent->d_name.name
-    let parent = read_ptr(dentry, off(CFG_DENTRY_PARENT_OFF, DENTRY_PARENT_OFF))?;
-    let mut dir = [0u8; NAME_LEN];
-    read_name(parent, off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF), &mut dir)?;
-    if unsafe { BLOCK_DIRS.get(&NameKey(dir)).is_some() } {
-        return Ok(EPERM);
+    // Ancestor directories: dentry->d_parent->...->d_name.name. Walking the whole
+    // chain (not just the immediate parent) is what makes a `**/dir/**` rule mean
+    // what it says; matching only the direct parent quietly let `.ssh/sub/key`
+    // through while the feed showed the rule as covering it.
+    let mut cur = dentry;
+    for _ in 0..MAX_DIR_WALK {
+        let Ok(parent) = read_ptr(cur, parent_off) else {
+            break;
+        };
+        // The root dentry is its own parent — that is the loop's real terminator.
+        if parent.is_null() || parent == cur {
+            break;
+        }
+        let mut dir = [0u8; NAME_LEN];
+        if read_name(parent, name_off, &mut dir).is_err() {
+            break;
+        }
+        if unsafe { BLOCK_DIRS.get(&NameKey(dir)).is_some() } {
+            bump(stat::DENIED_FILE);
+            emit_deny_name(kind::DENY_FILE, &dir, meta::KEY_DIR);
+            return Ok(EPERM);
+        }
+        cur = parent;
     }
 
     Ok(OK)
@@ -452,6 +600,13 @@ fn read_ptr(base: *const u8, off: usize) -> Result<*const u8, i64> {
     unsafe { bpf_probe_read_kernel(p) }
 }
 
+/// Read a NUL-terminated kernel string into a fixed key buffer.
+///
+/// On truncation (`name` at or over [`NAME_LEN`]) or an unreadable pointer, the
+/// helper zeroes `buf`; an all-zero key matches nothing, because userspace
+/// refuses to compile a key that long in the first place. That is the safe
+/// direction — a name too long to key on is never enforced, and the policy
+/// loader reports the rule as observe-only rather than pretending otherwise.
 #[inline(always)]
 fn read_name(dentry: *const u8, name_off: usize, buf: &mut [u8; NAME_LEN]) -> Result<(), i64> {
     let name_pp = dentry.wrapping_add(name_off) as *const *const u8;
@@ -485,6 +640,8 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     let mut name = [0u8; NAME_LEN];
     read_name(dentry, off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF), &mut name)?;
     if unsafe { BLOCK_EXEC.get(&NameKey(name)).is_some() } {
+        bump(stat::DENIED_EXEC);
+        emit_deny_name(kind::DENY_EXEC, &name, meta::KEY_NAME);
         return Ok(EPERM);
     }
     Ok(OK)
@@ -532,41 +689,62 @@ pub fn wardyn_fork(ctx: TracePointContext) -> u32 {
 }
 
 fn handle_fork(ctx: &TracePointContext) -> Result<(), i64> {
-    let parent_off = cfg(CFG_FORK_PARENT_OFF) as usize;
-    let child_off = cfg(CFG_FORK_CHILD_OFF) as usize;
-    if parent_off == 0 || child_off == 0 {
-        return Ok(()); // offsets not published yet — nothing can be watched yet either
-    }
-    let parent = unsafe { ctx.read_at::<i32>(parent_off) }? as u32;
+    // `sched_process_fork` runs synchronously in the PARENT's context inside
+    // kernel_clone(), so the parent's tgid is simply the current one. The
+    // tracepoint's `parent_pid` field is `parent->pid` — a *thread* id — and
+    // testing that against a tgid-keyed map only ever worked because thread ids
+    // were being leaked into the map as well.
+    let parent = (bpf_get_current_pid_tgid() >> 32) as u32;
     if !is_watched(parent) {
         return Ok(());
     }
+    let child_off = cfg(CFG_FORK_CHILD_OFF) as usize;
+    if child_off == 0 {
+        return Ok(()); // offset not published yet — nothing can be watched yet either
+    }
     let child = unsafe { ctx.read_at::<i32>(child_off) }? as u32;
-    let _ = WATCHED.insert(&child, &1u8, 0);
+    // For a real fork, child_pid IS the new tgid. For a CLONE_THREAD the field is
+    // the new thread's tid, which the map does not need (the tgid is already
+    // watched) — `wardyn_exit` drops those again as each thread dies, so they
+    // cannot accumulate toward saturation.
+    if WATCHED.insert(&child, &1u8, 0).is_err() {
+        // The watch set is full: this child, and its whole subtree, is about to
+        // run completely unobserved and unenforced. Userspace turns this counter
+        // into a loud warning — it must never be a silent hole.
+        bump(stat::WATCH_FULL);
+    }
     Ok(())
 }
 
 /// Drop a process from WATCHED when it exits, so the set can't grow unbounded
 /// and a reused pid can't be wrongly treated as still-watched.
 ///
-/// `sched_process_exit` fires per-thread, but WATCHED is keyed by tgid. Removing
-/// on the leader's exit (`tid == tgid`) is wrong when the leader exits *first*
-/// while other threads keep running (`pthread_exit()` from `main`): the process
-/// is still alive but silently unwatched. When userspace can prune WATCHED
-/// against `/proc` itself (no pid-namespace mismatch), it sets `CFG_DEFER_EVICT`
-/// and we skip kernel eviction entirely, leaving removal to that sweep — which
-/// only drops a tgid once its whole thread group is actually gone. Under a pid
-/// namespace (where userspace can't map init-ns tgids to its own `/proc`), we
-/// keep the original leader-exit eviction as the best available signal.
+/// `sched_process_exit` fires per-thread, while WATCHED is keyed by tgid:
+///
+/// - **Thread exit** (`tid != tgid`) always removes the *tid* key. Thread
+///   creations transiently insert their tid (see `handle_fork`), and leaving
+///   them behind both leaks toward the map cap — at which point new children
+///   escape enforcement entirely — and aliases a future process that happens to
+///   be given that pid number. Removing by tid is safe: pid numbers are unique
+///   across threads and processes, so this can only ever remove that thread's
+///   own entry.
+/// - **Leader exit** (`tid == tgid`) is the ambiguous one: a leader can exit via
+///   `pthread_exit()` while worker threads keep running, so evicting there would
+///   silently unwatch a live process. When userspace can prune WATCHED against
+///   `/proc` itself (no pid-namespace mismatch), it sets `CFG_DEFER_EVICT` and we
+///   leave removal to that sweep, which only drops a tgid once the whole thread
+///   group is gone. Under a pid namespace we keep leader-exit eviction as the
+///   best available signal.
 #[tracepoint]
 pub fn wardyn_exit(_ctx: TracePointContext) -> u32 {
-    if cfg(CFG_DEFER_EVICT) != 0 {
-        return 0; // userspace prunes WATCHED against /proc instead
-    }
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;
-    if tid == tgid {
+    if tid != tgid {
+        let _ = WATCHED.remove(&tid);
+        return 0;
+    }
+    if cfg(CFG_DEFER_EVICT) == 0 {
         let _ = WATCHED.remove(&tgid);
     }
     0

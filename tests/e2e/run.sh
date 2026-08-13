@@ -60,6 +60,14 @@ printf 'SECRET_API_KEY=sk-e2e-not-real\n' >"$WS/.env"
 printf 'this file is fine to read\n' >"$WS/ok.txt"
 chmod 644 "$WS/.env" "$WS/ok.txt"
 
+# A secret buried several levels under a blocked DIRECTORY. The LSM hook used to
+# compare only the immediate parent, so this file was readable while the feed
+# showed `**/.ssh/**` as covering it.
+mkdir -p "$WS/.ssh/sub/deeper"
+printf 'PRIVATE KEY\n' >"$WS/.ssh/sub/deeper/id_ed25519"
+chmod -R 755 "$WS/.ssh"
+chmod 644 "$WS/.ssh/sub/deeper/id_ed25519"
+
 AUDIT="$WS/audit.jsonl"
 DENIALS="$WS/denials.jsonl"
 WLOG="$WS/wardyn.stderr"
@@ -79,8 +87,16 @@ timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>/dev/null || true
 timeout 3 bash -c 'exec 3<>/dev/tcp/2606:4700:4700::1111/443' 2>/dev/null || true
 # blocked secret (enforced only under BPF-LSM)
 if cat "$WS/.env" >/dev/null 2>&1; then echo allowed >"$WS/env_read.txt"; else echo denied >"$WS/env_read.txt"; fi
+# blocked secret NESTED under a blocked directory (ancestor walk)
+if cat "$WS/.ssh/sub/deeper/id_ed25519" >/dev/null 2>&1; then
+  echo allowed >"$WS/deep_read.txt"
+else
+  echo denied >"$WS/deep_read.txt"
+fi
 # allowed file
 cat "$WS/ok.txt" >/dev/null 2>&1 || true
+# a deliberate non-zero exit, so the test can assert wardyn propagates it
+exit 7
 AGENT
 chmod 755 "$WS/agent.sh"
 
@@ -159,13 +175,59 @@ if [[ $LSM_ACTIVE -eq 1 ]]; then
   else
     fail "LSM active but the agent read .env successfully"
   fi
+  # The ancestor walk: a file three levels under a blocked directory.
+  if [[ "$(cat "$WS/deep_read.txt" 2>/dev/null)" == "denied" ]]; then
+    pass "LSM: a secret nested under a blocked directory was denied (ancestor walk)"
+  else
+    fail "a file under .ssh/sub/deeper was READ — the dir rule only covers direct children"
+  fi
   if grep -qF '"event":"open"' "$DENIALS" 2>/dev/null && grep -qF '.env' "$DENIALS" 2>/dev/null; then
     pass "denial receipt records the .env denial for the agent"
   else
     fail "the .env denial was not written to the WARDYN_DENIALS receipt"
   fi
+  # The receipt must be readable by the agent (it is chowned to the drop
+  # target) and by nobody else.
+  DPERM="$(stat -c '%a' "$DENIALS" 2>/dev/null || echo '?')"
+  if [[ "$DPERM" == "600" ]]; then
+    pass "denial receipt is private (0600), not world-readable"
+  else
+    fail "denial receipt mode is $DPERM, expected 600"
+  fi
 else
   skip "file/exec blocking (BPF-LSM not active — enable with scripts/enable-bpf-lsm.sh)"
+fi
+
+# 7) the kernel's own counters are reported, and agree that denials happened.
+if grep -q 'kernel denials —' "$WLOG"; then
+  pass "kernel denial counters reported at exit"
+else
+  fail "no 'kernel denials' line — the STATS map was not read"
+fi
+if grep -q 'enforcement did NOT fire' "$WLOG"; then
+  fail "wardyn reported denials to the agent that the kernel never made"
+else
+  pass "every denial claimed to the agent is backed by a kernel counter"
+fi
+if grep -qE 'event\(s\) were dropped|watch set filled up' "$WLOG"; then
+  fail "events were lost during the run (ring buffer or watch set overflowed)"
+else
+  pass "no events dropped and the watch set never filled"
+fi
+
+# 8) the target's exit status reaches the caller (the agent exits 7).
+if [[ "$WARDYN_RC" -eq 7 ]]; then
+  pass "wardyn exits with the target's status (7)"
+else
+  fail "wardyn exited $WARDYN_RC, expected the agent's 7"
+fi
+
+# 9) --dry-run explains the policy without root, eBPF, or a target.
+DRY="$("$WARDYN" --dry-run --policy "$POLICY" 2>&1)"
+if [[ "$DRY" == *"name=.env"* && "$DRY" == *"dir=.ssh"* && "$DRY" == *"cidr:0.0.0.0/0"* ]]; then
+  pass "--dry-run reports every key the kernel will enforce on"
+else
+  fail "--dry-run did not describe the policy's kernel keys"
 fi
 
 # ── summary ─────────────────────────────────────────────────────────────────

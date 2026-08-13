@@ -5,45 +5,40 @@
 //!   wardyn [OPTIONS] run -- <cmd> [args...]   watch that command's subtree
 //!   wardyn [OPTIONS] [--all]                  watch system-wide
 //!
-//! Options:
-//!   --enforce          deny blocked file reads / execs / egress (default: observe)
-//!   --plain            force the plain line printer (no TUI)
-//!   --policy <path>    policy file (default: ./policy.yaml, else embedded)
-//!   --audit <path>     JSONL audit log (default: ./wardyn-audit.jsonl)
-//!   --denials <path>   agent-readable denial receipt (--enforce only;
-//!                      default: <tmp>/wardyn-denials-<pid>.jsonl)
-//!
 //! Renders a live ratatui TUI when stdout is a terminal, else a plain table.
 //! Each event is evaluated against the policy (allow/warn/block); violations are
 //! coloured and written to the audit log. With `--enforce`, blocked file reads,
-//! execs and egress are denied in-kernel for the watched subtree. The feed is
-//! honest about it: `BLOCK` = actually denied, `block~` = flagged but the rule
-//! can't be kernel-enforced, `block` = observe-only (no --enforce). Under
-//! `--enforce` the child is also spawned with `WARDYN_DENIALS=<receipt>` — a
-//! JSONL file naming each kernel-denied action — so the agent can learn why an
+//! execs and egress are denied in-kernel for the watched subtree.
+//!
+//! The feed distinguishes *what the kernel did* from *what the policy predicts*:
+//! `BLOCK` = the kernel reported denying it, `block~` = flagged but not
+//! kernel-enforceable, `block` = observe-only (no `--enforce`). Denials are
+//! reported by the very hook that made them, so an open through a dirfd or a
+//! symlink — which the observed `sys_enter` path describes wrongly — still shows
+//! up. Under `--enforce` the child is also spawned with `WARDYN_DENIALS=<path>`,
+//! a JSONL receipt naming each denied action, so the agent can learn why an
 //! operation failed instead of flailing against a bare EPERM.
 mod audit;
 mod btf;
-mod policy;
 mod receipt;
 mod tui;
 
+use std::collections::VecDeque;
 use std::io::IsTerminal as _;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
 
 use anyhow::{bail, Context as _};
 use aya::maps::lpm_trie::{Key, LpmTrie};
-use aya::maps::{Array, HashMap as BpfHashMap, MapData, RingBuf};
+use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerCpuArray, RingBuf};
 use aya::programs::{CgroupAttachMode, CgroupSockAddr, Lsm, TracePoint};
 use aya::Btf;
-use log::info;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
-use wardyn_common::{action, kind, Event, NAME_LEN, PATH_LEN};
+use wardyn_common::{action, kind, meta, stat, Event, NAME_LEN, PATH_LEN};
+use wardyn_policy::cli::{self, Mode, Opts, ParseOutcome};
+use wardyn_policy::policy::{self, Action, DenialKey, Exceptions, Policy, Verdict};
 
 use crate::audit::Audit;
-use crate::policy::{Action, DenialKey, Exceptions, Policy, Verdict};
 use crate::receipt::Receipt;
 
 /// Userspace mirror of `wardyn_common::NameKey` (identical C layout) carrying a
@@ -64,17 +59,21 @@ unsafe impl aya::Pod for Ip6Key {}
 /// AF_INET6, matching the eBPF side.
 const AF_INET6: u16 = 10;
 
-/// CONFIG slots shared with the eBPF side (pid-ns handshake, fork offsets,
-/// deferred eviction, and the BTF-resolved LSM struct offsets).
+/// CONFIG slots shared with the eBPF side (pid-ns handshake, fork offset,
+/// deferred eviction, and the BTF-resolved LSM struct offsets). Slot 5 is
+/// reserved: it used to carry `sched_process_fork`'s `parent_pid` offset, which
+/// the hook no longer needs.
 const CFG_HS_NONCE: u32 = 3;
 const CFG_HS_TGID: u32 = 4;
-const CFG_FORK_PARENT_OFF: u32 = 5;
 const CFG_FORK_CHILD_OFF: u32 = 6;
 const CFG_DEFER_EVICT: u32 = 7;
 const CFG_FILE_DENTRY_OFF: u32 = 8;
 const CFG_DENTRY_NAME_OFF: u32 = 9;
 const CFG_DENTRY_PARENT_OFF: u32 = 10;
 const CFG_BPRM_FILE_OFF: u32 = 11;
+
+/// Feed rows that carry an operator/diagnostic message rather than a syscall.
+const KIND_NOTICE: u32 = u32::MAX;
 
 /// The live kernel enforcement maps, held for the whole run (not dropped after
 /// population) so the TUI can grant approve-once exceptions while the target
@@ -146,10 +145,13 @@ impl KernelMaps {
             DenialKey::FileName(n) => drop_name(&mut self.names, n),
             DenialKey::FileDir(d) => drop_name(&mut self.dirs, d),
             DenialKey::Exec(n) => drop_name(&mut self.execs, n),
+            // `from_ne_bytes`, not `from_le_bytes`: the LPM trie compares key
+            // bytes from the most significant end, so the octets must sit in
+            // network order in memory on either endianness.
             DenialKey::Net4(ip) => self
                 .net4
                 .insert(
-                    &Key::new(32, u32::from_le_bytes(ip.octets())),
+                    &Key::new(32, u32::from_ne_bytes(ip.octets())),
                     action::ALLOW,
                     0,
                 )
@@ -162,6 +164,52 @@ impl KernelMaps {
     }
 }
 
+/// The kernel's own counters (per-CPU, summed). These are the only numbers in
+/// wardyn that are not a userspace guess, which is what makes them worth
+/// printing: they say how many events were *lost*, how many children escaped the
+/// watch set, and how many denials the hooks really made.
+pub(crate) struct KernelStats {
+    map: PerCpuArray<MapData, u64>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StatSnapshot {
+    pub ring_drops: u64,
+    pub watch_full: u64,
+    pub denied_file: u64,
+    pub denied_exec: u64,
+    pub denied_net: u64,
+}
+
+impl StatSnapshot {
+    pub fn denials(&self) -> u64 {
+        self.denied_file + self.denied_exec + self.denied_net
+    }
+}
+
+impl KernelStats {
+    fn new(map: PerCpuArray<MapData, u64>) -> Self {
+        KernelStats { map }
+    }
+
+    fn slot(&self, idx: u32) -> u64 {
+        self.map
+            .get(&idx, 0)
+            .map(|per_cpu| per_cpu.iter().sum())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn snapshot(&self) -> StatSnapshot {
+        StatSnapshot {
+            ring_drops: self.slot(stat::RING_DROPS),
+            watch_full: self.slot(stat::WATCH_FULL),
+            denied_file: self.slot(stat::DENIED_FILE),
+            denied_exec: self.slot(stat::DENIED_EXEC),
+            denied_net: self.slot(stat::DENIED_NET),
+        }
+    }
+}
+
 /// Everything the event loops need to evaluate, record, and (from the TUI)
 /// grant exceptions — bundled so signatures stay sane.
 pub(crate) struct RunCtx<'a> {
@@ -169,133 +217,44 @@ pub(crate) struct RunCtx<'a> {
     pub audit: &'a mut Audit,
     pub receipt: Option<&'a mut Receipt>,
     pub maps: &'a mut KernelMaps,
+    pub stats: Option<KernelStats>,
     pub enforce: bool,
-    /// File/exec `block` rules are rendered as an enforced `BLOCK` (and receipted)
-    /// only when this is true: the LSM attached AND the dentry offsets are trusted.
-    /// Otherwise those rows are demoted to `block~` so the feed can't claim a
-    /// denial the kernel never made.
+    /// File/exec `block` rules are *predicted* as an enforced `BLOCK` only when
+    /// this is true: the LSM attached AND the dentry offsets are trusted.
+    /// Otherwise those rows are demoted to `block~`. Either way the kernel's own
+    /// `DENY_*` events remain the authority.
     pub enforce_files: bool,
     /// The WATCHED map, held past spawn only when eviction is deferred to userspace
     /// (`prune_watched`); `None` otherwise.
     pub watched: Option<BpfHashMap<MapData, u32, u8>>,
+    /// Predicted denials awaiting the kernel's confirming `DENY_*` event, so a
+    /// confirmation is not rendered (and audited) a second time. Bounded; the
+    /// observe tracepoint always fires before the enforcing hook, so a short
+    /// window is enough.
+    pending: VecDeque<(u32, u32, String)>,
 }
 
-pub(crate) enum Mode {
-    All,
-    Run(Vec<String>),
-}
-
-impl Mode {
-    fn label(&self) -> String {
-        match self {
-            Mode::All => "system-wide".to_string(),
-            Mode::Run(argv) => argv.join(" "),
+impl RunCtx<'_> {
+    fn remember_prediction(&mut self, pid: u32, kind: u32, key: String) {
+        if self.pending.len() >= 256 {
+            self.pending.pop_front();
         }
-    }
-}
-
-struct Opts {
-    plain: bool,
-    enforce: bool,
-    policy_path: Option<PathBuf>,
-    audit_path: PathBuf,
-    denials_path: Option<PathBuf>,
-    keep_root: bool,
-    as_user: Option<String>,
-    mode: Mode,
-}
-
-fn parse_args() -> anyhow::Result<Opts> {
-    let mut it = std::env::args().skip(1).peekable();
-    let mut plain = false;
-    let mut enforce = false;
-    let mut policy_path = None;
-    let mut audit_path = PathBuf::from("wardyn-audit.jsonl");
-    let mut denials_path = None;
-    let mut keep_root = false;
-    let mut as_user = None;
-
-    while let Some(a) = it.peek() {
-        match a.as_str() {
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            "--version" | "-V" => {
-                println!("wardyn {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-            "--plain" => {
-                plain = true;
-                it.next();
-            }
-            "--enforce" => {
-                enforce = true;
-                it.next();
-            }
-            "--policy" => {
-                it.next();
-                policy_path = Some(PathBuf::from(it.next().context("--policy needs a path")?));
-            }
-            "--audit" => {
-                it.next();
-                audit_path = PathBuf::from(it.next().context("--audit needs a path")?);
-            }
-            "--denials" => {
-                it.next();
-                denials_path = Some(PathBuf::from(it.next().context("--denials needs a path")?));
-            }
-            "--keep-root" => {
-                keep_root = true;
-                it.next();
-            }
-            "--as-user" => {
-                it.next();
-                as_user = Some(it.next().context("--as-user needs a uid[:gid]")?);
-            }
-            _ => break,
-        }
+        self.pending.push_back((pid, kind, key));
     }
 
-    let mode = match it.next().as_deref() {
-        None => Mode::All,
-        Some("--all") | Some("watch") => {
-            // Options are only recognised BEFORE the mode; a flag here (e.g.
-            // `wardyn --all --enforce`) would otherwise be silently dropped and
-            // the user would get observe-only despite asking to enforce.
-            if let Some(extra) = it.next() {
-                bail!(
-                    "unexpected argument `{extra}` after `--all` — put options such as \
-                     --enforce BEFORE the mode: wardyn --enforce run -- <cmd>"
-                );
-            }
-            Mode::All
+    /// Was this kernel denial already reported by a predicted row? Consumes the
+    /// prediction if so.
+    fn take_prediction(&mut self, pid: u32, kind: u32, key: &str) -> bool {
+        if let Some(i) = self
+            .pending
+            .iter()
+            .rposition(|(p, k, s)| *p == pid && *k == kind && s == key)
+        {
+            self.pending.remove(i);
+            return true;
         }
-        Some("run") => {
-            let mut rest: Vec<String> = it.collect();
-            if rest.first().is_some_and(|s| s == "--") {
-                rest.remove(0);
-            }
-            if rest.is_empty() {
-                bail!("usage: wardyn run -- <command> [args...]");
-            }
-            Mode::Run(rest)
-        }
-        Some(other) => {
-            bail!("unknown argument `{other}`; usage: wardyn [--plain] [--policy P] [--audit P] [run -- <cmd> | --all]")
-        }
-    };
-
-    Ok(Opts {
-        plain,
-        enforce,
-        policy_path,
-        audit_path,
-        denials_path,
-        keep_root,
-        as_user,
-        mode,
-    })
+        false
+    }
 }
 
 fn load_tracepoint(
@@ -314,44 +273,13 @@ fn load_tracepoint(
     Ok(())
 }
 
-/// Attach a tracepoint that may be absent on older kernels (e.g. `openat2`,
-/// 5.6+): warn and continue instead of aborting, so we don't lose the core
-/// observation feed just because one newer syscall variant isn't traceable.
-fn load_tracepoint_optional(ebpf: &mut aya::Ebpf, name: &str, category: &str, tp: &str) {
-    if let Err(e) = load_tracepoint(ebpf, name, category, tp) {
-        eprintln!(
-            "wardyn: warning: could not attach {category}:{tp} ({e:#}) — opens/execs/sends via \
-             this syscall variant won't appear in the feed (enforcement is unaffected)."
-        );
-    }
-}
-
 /// The kernel the LSM struct offsets in wardyn-ebpf were derived for.
 const OFFSETS_KERNEL: &str = "6.8";
-
-fn print_usage() {
-    println!(
-        "wardyn — a kernel-level warden for AI coding agents\n\n\
-         USAGE:\n  \
-         wardyn [OPTIONS] run -- <cmd> [args...]   watch that command's subtree\n  \
-         wardyn [OPTIONS] [--all]                  watch system-wide\n\n\
-         OPTIONS:\n  \
-         --enforce         deny blocked file reads / execs / egress (default: observe)\n  \
-         --plain           force the plain line printer (no TUI)\n  \
-         --policy <path>   policy file (default: ./policy.yaml, else embedded)\n  \
-         --audit <path>    JSONL audit log (default: ./wardyn-audit.jsonl)\n  \
-         --denials <path>  agent-readable denial receipt, exported as WARDYN_DENIALS (--enforce only)\n  \
-         --as-user <spec>  run the agent as uid[:gid] instead of root (default: $SUDO_UID)\n  \
-         --keep-root       do NOT drop the agent's privileges (unsafe under --enforce)\n  \
-         -h, --help        print this help\n  \
-         -V, --version     print version"
-    );
-}
 
 /// Whether the running kernel's major.minor matches the built-in LSM offset
 /// kernel (`OFFSETS_KERNEL`). Used only as the fallback trust signal when BTF
 /// offset resolution is unavailable: on a match the built-in 6.8 offsets are
-/// correct, so file/exec `BLOCK` can be claimed honestly.
+/// correct, so file/exec `BLOCK` can be predicted honestly.
 fn kernel_matches_builtin_offsets() -> bool {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     let mm = release
@@ -366,7 +294,7 @@ fn kernel_matches_builtin_offsets() -> bool {
 /// Prune WATCHED of tgids whose process has exited. Only used when eviction is
 /// deferred to userspace (no pid-namespace mismatch, so the init-ns tgids in
 /// WATCHED equal the pids under our own /proc). This is what makes the deferred
-/// `wardyn_exit` safe: it removes an entry only once the process is genuinely
+/// leader eviction safe: it removes an entry only once the process is genuinely
 /// gone, so a live process that `pthread_exit`'d from its leader thread stays
 /// watched. A briefly-reused pid may be re-watched until the next sweep — the
 /// intended fail-safe direction (transiently over-watch, never under-watch).
@@ -388,12 +316,17 @@ fn prune_watched(map: &mut BpfHashMap<MapData, u32, u8>) {
 /// `$SUDO_UID`/`$SUDO_GID` (the documented `sudo wardyn ...` path). Refused under
 /// `--enforce` if no non-root target can be found (better to not start than to
 /// hand the sandboxed process the keys); `--keep-root` opts out explicitly.
-fn apply_privilege_drop(cmd: &mut Command, opts: &Opts) -> anyhow::Result<()> {
+fn apply_privilege_drop(
+    cmd: &mut Command,
+    opts: &Opts,
+    notices: &mut Vec<String>,
+) -> anyhow::Result<()> {
     if opts.keep_root {
         if opts.enforce {
-            eprintln!(
-                "wardyn: warning: --keep-root — the watched agent runs as root and can disable \
-                 enforcement from userspace. Only use this for a trusted target."
+            notices.push(
+                "--keep-root — the watched agent runs as root and can disable enforcement from \
+                 userspace. Only use this for a trusted target."
+                    .into(),
             );
         }
         return Ok(());
@@ -407,7 +340,7 @@ fn apply_privilege_drop(cmd: &mut Command, opts: &Opts) -> anyhow::Result<()> {
             if opts.enforce {
                 bail!("{msg} (refused under --enforce: a root child can disable enforcement)");
             }
-            eprintln!("wardyn: warning: {msg}");
+            notices.push(msg.into());
             return Ok(());
         }
     };
@@ -437,7 +370,9 @@ fn apply_privilege_drop(cmd: &mut Command, opts: &Opts) -> anyhow::Result<()> {
             Ok(())
         });
     }
-    info!("dropping the agent to uid={uid} gid={gid} before exec (--keep-root to disable)");
+    notices.push(format!(
+        "the agent runs as uid={uid} gid={gid}, not root (--keep-root to disable)"
+    ));
     Ok(())
 }
 
@@ -485,16 +420,103 @@ fn attach_lsm(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
 }
 
 /// Await the child's exit if there is one; otherwise never resolve.
-pub(crate) async fn wait_for(child: &mut Option<Child>) -> std::process::ExitStatus {
+///
+/// A `wait` error is a *result*, not grounds to `process::exit` — doing that
+/// skipped the terminal restore, the final ring sweep and the exit summary.
+pub(crate) async fn wait_for(child: &mut Option<Child>) -> Option<std::process::ExitStatus> {
     match child {
-        Some(c) => c.wait().await.unwrap_or_else(|_| std::process::exit(1)),
+        Some(c) => c.wait().await.ok(),
         None => std::future::pending().await,
     }
 }
 
+/// Stop the watched agent when wardyn stops.
+///
+/// Wardyn's enforcement lives in programs owned by this process: when it exits,
+/// the cgroup and LSM attachments go away. Leaving the agent running would hand
+/// it exactly the unsupervised shell the tool exists to prevent, silently, at
+/// the moment the operator pressed `q`. So the subtree goes down with the
+/// warden: SIGTERM, a short grace period, then SIGKILL.
+/// Returns `(status, we_signalled)`. When wardyn had to signal the agent — the
+/// operator quit while it was still working — the agent's resulting exit status
+/// describes wardyn's own shutdown, not the agent's outcome, so the caller
+/// reports success instead of a misleading 143.
+async fn stop_child(child: &mut Option<Child>) -> (Option<std::process::ExitStatus>, bool) {
+    let Some(c) = child.as_mut() else {
+        return (None, false);
+    };
+    if let Ok(Some(status)) = c.try_wait() {
+        return (Some(status), false);
+    }
+    let Some(pid) = c.id().map(|p| p as i32) else {
+        return (None, false);
+    };
+    eprintln!(
+        "wardyn: stopping the watched agent (pid {pid}) — enforcement ends when wardyn does, so \
+         it must not keep running unsupervised."
+    );
+    // Negative pid = the whole process group, so a shell's children go too.
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let status = match tokio::time::timeout(std::time::Duration::from_secs(3), c.wait()).await {
+        Ok(status) => status.ok(),
+        Err(_) => {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+            c.wait().await.ok()
+        }
+    };
+    (status, true)
+}
+
+/// The process exit code to report for a finished target: its own code, or
+/// 128+signal in the shell convention.
+fn exit_code_of(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+    status
+        .code()
+        .or_else(|| status.signal().map(|s| 128 + s))
+        .unwrap_or(1)
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
-    let opts = parse_args()?;
+async fn main() {
+    let code = match run().await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("wardyn: error: {e:#}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+async fn run() -> anyhow::Result<i32> {
+    let opts = match cli::parse_args()? {
+        ParseOutcome::Help => {
+            println!("{}", cli::USAGE);
+            return Ok(0);
+        }
+        ParseOutcome::Version => {
+            println!("wardyn {}", env!("CARGO_PKG_VERSION"));
+            return Ok(0);
+        }
+        ParseOutcome::Run(o) => *o,
+    };
+
+    // `--dry-run` answers "what would this policy actually do?" without root,
+    // eBPF, or a target — the check that used to be impossible before deploying
+    // a policy.
+    if opts.dry_run {
+        let policy = Policy::load(opts.policy_path.as_deref())?;
+        print!("{}", policy.explain());
+        return Ok(0);
+    }
+
     // Enforcement is deliberately scoped to the launched subtree (the kernel
     // deny hooks gate on WATCHED membership, and WATCHED is only ever seeded in
     // `run` mode). Under `--all`/bare invocation WATCHED stays empty, so nothing
@@ -517,31 +539,41 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
+    // Startup diagnostics are collected, not printed: in TUI mode stderr is
+    // about to be replaced by the alternate screen, so anything written here
+    // would flash past unread. They are shown as feed rows instead, and printed
+    // plainly when there is no TUI.
+    let mut notices: Vec<String> = Vec::new();
+
     let policy = Policy::load(opts.policy_path.as_deref())?;
-    info!("policy loaded: {}", policy.summary());
+    notices.push(format!("policy loaded: {}", policy.summary()));
     if opts.enforce {
         // Be honest up front: block rules that can't reduce to a kernel-checkable
         // basename/dir are flagged in the feed but never actually denied.
         for pat in policy.observe_only_blocks() {
-            eprintln!(
-                "wardyn: warning: policy `{pat}` (block) can't be kernel-enforced \
-                 (only basename/dir file rules and CIDRs are) — it will be flagged, not denied"
-            );
+            notices.push(format!(
+                "policy `{pat}` (block) can't be kernel-enforced (only basename/dir file rules \
+                 and CIDRs are) — it will be flagged, not denied"
+            ));
         }
         // And the converse: a block glob that reduced to a bare name enforces
-        // MORE broadly than written, because the LSM hook only sees a basename +
-        // its immediate parent dir. Say so, so the over-reach is intentional.
+        // MORE broadly than written, because the LSM hook matches names.
         for (pat, reach) in policy.overbroad_block_keys() {
-            eprintln!(
-                "wardyn: warning: policy `{pat}` (block) enforces on {reach} — the kernel matches \
-                 by basename/dir only, so it will also deny paths the glob wouldn't."
-            );
+            notices.push(format!(
+                "policy `{pat}` (block) enforces on {reach} — the kernel matches by name, so it \
+                 will also deny paths the glob wouldn't."
+            ));
         }
-        // Egress coverage gaps: a v4 catch-all block with no v6 counterpart lets
-        // every IPv6 (and v4-mapped) destination through — the feed would say `ok`
-        // while "deny all other egress" isn't actually in force.
-        for msg in policy.net_coverage_gaps() {
-            eprintln!("wardyn: warning: {msg}");
+        // Rule ORDER does not exist in the kernel: an allow before a block does
+        // not survive the reduction to a set of block keys.
+        for (pat, key) in policy.shadowed_by_kernel() {
+            notices.push(format!(
+                "policy `{pat}` is overridden in the kernel by block key `{key}` — the kernel's \
+                 block set is unordered, so this rule does NOT create an exception."
+            ));
+        }
+        for msg in policy.semantic_warnings() {
+            notices.push(msg);
         }
     }
     let mut audit = Audit::create(&opts.audit_path)?;
@@ -554,26 +586,39 @@ async fn main() -> anyhow::Result<()> {
         let path = opts.denials_path.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("wardyn-denials-{}.jsonl", std::process::id()))
         });
+        // The receipt is created root-owned and 0600, then handed to the
+        // identity the agent will actually run as — otherwise the privilege
+        // drop would leave the agent unable to read its own receipt.
+        let owner = if opts.keep_root {
+            None
+        } else {
+            resolve_target_identity(&opts)
+        };
         Some(Receipt::create(
             &path,
             &opts.mode.label(),
             &policy.summary(),
+            owner,
         )?)
     } else {
         if opts.denials_path.is_some() {
-            eprintln!(
-                "wardyn: warning: --denials has no effect without --enforce \
-                 (observe mode denies nothing, so there is nothing to receipt)"
+            notices.push(
+                "--denials has no effect without --enforce (observe mode denies nothing, so there \
+                 is nothing to receipt)"
+                    .into(),
             );
         }
         None
     };
 
-    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/wardyn"
-    )))
-    .context("loading eBPF object")?;
+    let ebpf_object = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/wardyn"));
+    if ebpf_object.is_empty() {
+        bail!(
+            "this binary was built with WARDYN_SKIP_EBPF_BUILD=1 and contains no eBPF programs — \
+             it can only be type-checked. Rebuild with bpf-linker installed."
+        );
+    }
+    let mut ebpf = aya::Ebpf::load(ebpf_object).context("loading eBPF object")?;
 
     load_tracepoint(&mut ebpf, "wardyn_execve", "syscalls", "sys_enter_execve")?;
     load_tracepoint(&mut ebpf, "wardyn_openat", "syscalls", "sys_enter_openat")?;
@@ -582,14 +627,18 @@ async fn main() -> anyhow::Result<()> {
     load_tracepoint(&mut ebpf, "wardyn_exit", "sched", "sched_process_exit")?;
     // Cover the syscall variants the LSM/cgroup hooks also enforce on, so a
     // denial can't happen off-feed. Optional: absent on older kernels.
-    load_tracepoint_optional(&mut ebpf, "wardyn_openat2", "syscalls", "sys_enter_openat2");
-    load_tracepoint_optional(
-        &mut ebpf,
-        "wardyn_execveat",
-        "syscalls",
-        "sys_enter_execveat",
-    );
-    load_tracepoint_optional(&mut ebpf, "wardyn_sendto", "syscalls", "sys_enter_sendto");
+    for (name, tp) in [
+        ("wardyn_openat2", "sys_enter_openat2"),
+        ("wardyn_execveat", "sys_enter_execveat"),
+        ("wardyn_sendto", "sys_enter_sendto"),
+    ] {
+        if let Err(e) = load_tracepoint(&mut ebpf, name, "syscalls", tp) {
+            notices.push(format!(
+                "could not attach syscalls:{tp} ({e:#}) — opens/execs/sends via this syscall \
+                 variant won't appear in the feed (enforcement is unaffected)."
+            ));
+        }
+    }
     // Pid-ns handshake (see `learn_init_ns_tgid`). Best-effort: without it
     // wardyn still works wherever it shares the kernel's init pid namespace.
     let handshake_attached = match load_tracepoint(
@@ -600,10 +649,10 @@ async fn main() -> anyhow::Result<()> {
     ) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!(
-                "wardyn: warning: could not attach the pid-ns handshake tracepoint ({e:#}) — if \
-                 wardyn runs inside a container or WSL distro, `run` scoping will silently fail"
-            );
+            notices.push(format!(
+                "could not attach the pid-ns handshake tracepoint ({e:#}) — if wardyn runs inside \
+                 a container or WSL distro, `run` scoping will silently fail"
+            ));
             false
         }
     };
@@ -613,8 +662,7 @@ async fn main() -> anyhow::Result<()> {
     // Kept in `_cgroup` for the program's lifetime.
     let mut _cgroup = None;
     // Whether the BPF-LSM file/exec deniers actually attached. Drives the honest
-    // feed: if they didn't, file/exec `block` rows are demoted to `block~` and are
-    // never receipted, instead of asserting a `BLOCK` that never fired.
+    // feed: if they didn't, file/exec `block` rows are demoted to `block~`.
     let mut lsm_active = false;
     if opts.enforce {
         let cg = std::fs::File::open("/sys/fs/cgroup")
@@ -625,6 +673,9 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("{name} program not found"))?
                 .try_into()?;
             prog.load()?;
+            // `Single` is what aya calls flags=0; on kernels >= 5.7 this becomes
+            // a bpf_link attach, which the kernel itself treats as ALLOW_MULTI,
+            // so other cgroup-BPF tools (and a second wardyn) still attach.
             prog.attach(&cg, CgroupAttachMode::Single)
                 .with_context(|| format!("attaching {name} to the cgroup"))?;
         }
@@ -635,14 +686,15 @@ async fn main() -> anyhow::Result<()> {
         match attach_lsm(&mut ebpf) {
             Ok(()) => {
                 lsm_active = true;
-                info!(
-                    "enforcement ON — egress (cgroup) + secret-file reads + blocked execs (LSM) denied"
-                )
+                notices.push(
+                    "enforcement ON — egress (cgroup) + secret-file reads + blocked execs (LSM)"
+                        .into(),
+                );
             }
-            Err(e) => eprintln!(
-                "wardyn: warning: BPF LSM enforcement unavailable ({e:#}) — file/exec blocking is \
-                 OFF (network egress blocking is still active). Enable it via scripts/enable-bpf-lsm.sh."
-            ),
+            Err(e) => notices.push(format!(
+                "BPF LSM enforcement unavailable ({e:#}) — file/exec blocking is OFF (network \
+                 egress blocking is still active). Enable it via scripts/enable-bpf-lsm.sh."
+            )),
         }
     }
 
@@ -651,34 +703,29 @@ async fn main() -> anyhow::Result<()> {
     config.set(1, u32::from(opts.enforce), 0)?; // enforce
     config.set(2, policy.default_action_code(), 0)?; // net_default
 
-    // sched_process_fork's pid field offsets moved when the kernel made comm
-    // dynamic (`__data_loc`): parent_pid 24→12, child_pid 44→20. Read the
-    // running kernel's authoritative layout from tracefs rather than baking in
-    // one kernel's numbers — fork adoption (and with it ALL `run` scoping)
-    // silently dies when these are wrong.
-    let fork_offs = (
-        tracefs_field_offset("sched/sched_process_fork", "parent_pid"),
-        tracefs_field_offset("sched/sched_process_fork", "child_pid"),
-    );
-    let (parent_off, child_off) = match fork_offs {
-        (Some(p), Some(c)) => (p, c),
-        _ => {
-            eprintln!(
-                "wardyn: warning: could not read the sched_process_fork layout from tracefs — \
-                 falling back to kernel-6.8 offsets; child adoption may silently fail"
+    // sched_process_fork's child_pid offset moved when the kernel made comm
+    // dynamic (`__data_loc`): 44→20. Read the running kernel's authoritative
+    // layout from tracefs rather than baking in one kernel's number — fork
+    // adoption (and with it ALL `run` scoping) silently dies when it is wrong.
+    let child_off = match tracefs_field_offset("sched/sched_process_fork", "child_pid") {
+        Some(c) => c,
+        None => {
+            notices.push(
+                "could not read the sched_process_fork layout from tracefs — falling back to \
+                 kernel-6.8 offsets; child adoption may silently fail"
+                    .into(),
             );
-            (24, 44)
+            44
         }
     };
-    config.set(CFG_FORK_PARENT_OFF, parent_off, 0)?;
     config.set(CFG_FORK_CHILD_OFF, child_off, 0)?;
 
     // LSM dentry offsets: resolve them from the running kernel's own BTF so the
     // file/exec matcher adapts to the kernel instead of being pinned to 6.8. On
     // failure the CONFIG slots stay 0 and the eBPF side falls back to the built-in
     // 6.8 constants — strictly a portability win, no regression. `offsets_trusted`
-    // drives the honest feed below (file/exec BLOCK is only claimed when we trust
-    // the offsets are right).
+    // drives the honest feed below (file/exec BLOCK is only predicted when we
+    // trust the offsets are right; the kernel's own events are unaffected).
     let mut offsets_trusted = false;
     if opts.enforce {
         match btf::resolve_lsm_offsets() {
@@ -688,27 +735,22 @@ async fn main() -> anyhow::Result<()> {
                 config.set(CFG_DENTRY_PARENT_OFF, o.dentry_parent, 0)?;
                 config.set(CFG_BPRM_FILE_OFF, o.bprm_file, 0)?;
                 offsets_trusted = true;
-                info!(
-                    "LSM offsets from BTF: file->dentry={}, dentry->name={}, dentry->parent={}, binprm->file={}",
-                    o.file_dentry, o.dentry_name, o.dentry_parent, o.bprm_file
-                );
             }
             None => {
                 // Couldn't read/parse BTF; the built-in 6.8 offsets apply. Only
                 // trust them for the honest feed if we're actually on 6.8.
                 offsets_trusted = kernel_matches_builtin_offsets();
                 if offsets_trusted {
-                    eprintln!(
-                        "wardyn: note: BTF unavailable — using built-in kernel-{OFFSETS_KERNEL} \
-                         LSM offsets (running kernel matches)."
-                    );
+                    notices.push(format!(
+                        "BTF unavailable — using built-in kernel-{OFFSETS_KERNEL} LSM offsets \
+                         (running kernel matches)."
+                    ));
                 } else {
-                    eprintln!(
-                        "wardyn: warning: could not resolve LSM struct offsets from BTF and the \
-                         running kernel is not {OFFSETS_KERNEL}; file/exec blocking may silently \
-                         fail. Such rows are shown as block~ (not BLOCK) and are NOT receipted. \
-                         Regenerate with scripts/kernel-offsets.sh or enable BTF."
-                    );
+                    notices.push(format!(
+                        "could not resolve LSM struct offsets from BTF and the running kernel is \
+                         not {OFFSETS_KERNEL}; file/exec blocking may silently fail. Such rows are \
+                         shown as block~ until the kernel reports a denial itself."
+                    ));
                 }
             }
         }
@@ -729,15 +771,16 @@ async fn main() -> anyhow::Result<()> {
                 seed_tgid = tgid;
                 ns_mismatch = tgid != self_pid;
                 if ns_mismatch {
-                    eprintln!(
-                        "wardyn: pid namespace detected (self {self_pid}, kernel view {tgid}) — \
-                         relying on in-kernel fork adoption; the feed shows init-ns pids"
-                    );
+                    notices.push(format!(
+                        "pid namespace detected (self {self_pid}, kernel view {tgid}) — relying on \
+                         in-kernel fork adoption; the feed shows init-ns pids"
+                    ));
                 }
             }
-            None => eprintln!(
-                "wardyn: warning: pid-ns handshake failed — assuming no pid namespace; if wardyn \
-                 runs inside a container or WSL distro, `run` scoping will silently fail"
+            None => notices.push(
+                "pid-ns handshake failed — assuming no pid namespace; if wardyn runs inside a \
+                 container or WSL distro, `run` scoping will silently fail"
+                    .into(),
             ),
         }
     }
@@ -753,6 +796,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Kept alive for the whole run so the TUI can grant exceptions into them.
     let mut kernel_maps = KernelMaps::load(&mut ebpf, &policy)?;
+    let stats = ebpf
+        .take_map("STATS")
+        .and_then(|m| PerCpuArray::try_from(m).ok())
+        .map(KernelStats::new);
+    if stats.is_none() {
+        notices.push("STATS map unavailable — dropped events cannot be reported this run".into());
+    }
 
     let ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("EVENTS")?)?;
     let async_fd = AsyncFd::new(ring)?;
@@ -772,13 +822,16 @@ async fn main() -> anyhow::Result<()> {
         if let Some(r) = &receipt {
             cmd.env("WARDYN_DENIALS", r.path());
         }
+        // Its own process group, so `stop_child` can take the whole subtree down
+        // with one signal when wardyn exits.
+        cmd.process_group(0);
         // Drop the watched agent out of root before exec (unless --keep-root): the
         // thing being sandboxed must not run with the privilege that could disable
         // its own warden (bpftool the maps, kill wardyn, read the raw disk).
-        apply_privilege_drop(&mut cmd, &opts)?;
+        apply_privilege_drop(&mut cmd, &opts, &mut notices)?;
         let spawned = cmd
             .spawn()
-            .with_context(|| format!("spawning `{}`", argv[0]))?;
+            .with_context(|| format!("spawning `{}`", argv[0].to_string_lossy()))?;
         if let Some(pid) = spawned.id() {
             // Under a pid namespace the local child pid means nothing to the
             // kernel — worse, it could collide with an unrelated init-ns tgid
@@ -788,7 +841,10 @@ async fn main() -> anyhow::Result<()> {
             if !ns_mismatch {
                 let _ = watched.insert(pid, 1u8, 0);
             }
-            info!("watching `{}` (pid {pid}) and its subtree", argv.join(" "));
+            notices.push(format!(
+                "watching `{}` (pid {pid}) and its subtree",
+                opts.mode.label()
+            ));
         }
         // Self was only seeded so the fork hook would adopt the child at spawn
         // time; the child (and its subtree via fork) is tracked in its own right
@@ -800,7 +856,7 @@ async fn main() -> anyhow::Result<()> {
             watched_map = Some(watched);
         }
     } else {
-        info!("watching exec/open/connect system-wide; Ctrl-C to stop");
+        notices.push("watching exec/open/connect system-wide; Ctrl-C to stop".into());
     }
 
     let mut ctx = RunCtx {
@@ -808,24 +864,40 @@ async fn main() -> anyhow::Result<()> {
         audit: &mut audit,
         receipt: receipt.as_mut(),
         maps: &mut kernel_maps,
+        stats,
         enforce: opts.enforce,
-        // File/exec denials are only reported as real `BLOCK` (and receipted) when
-        // the LSM actually attached AND we trust the dentry offsets; otherwise they
-        // are demoted to block~ so the feed never claims a denial that didn't fire.
+        // File/exec denials are only PREDICTED as `BLOCK` when the LSM attached
+        // and we trust the dentry offsets; otherwise they are demoted to block~.
+        // A `DENY_*` event from the kernel overrides either way.
         enforce_files: opts.enforce && lsm_active && offsets_trusted,
         watched: watched_map,
+        pending: VecDeque::new(),
     };
     let result = if use_tui {
-        tui::run(async_fd, child, opts.mode.label(), &mut ctx).await
+        tui::run(async_fd, &mut child, opts.mode.label(), &mut ctx, notices).await
     } else {
-        run_plain(async_fd, child, &mut ctx).await
+        for n in &notices {
+            eprintln!("wardyn: {n}");
+        }
+        run_plain(async_fd, &mut child, &mut ctx).await
     };
 
+    // Whatever happened above — clean exit, error, or the operator quitting —
+    // the agent must not outlive its warden.
+    let (status, we_stopped_it) = stop_child(&mut child).await;
+
+    let snapshot = ctx.stats.as_ref().map(|s| s.snapshot()).unwrap_or_default();
     eprintln!(
         "wardyn: {} policy violation(s) logged to {}",
         audit.count(),
         audit.path()
     );
+    if let Some(failed) = std::num::NonZeroU64::new(audit.write_failures()) {
+        eprintln!(
+            "wardyn: WARNING: {failed} audit record(s) could NOT be written — the security record \
+             for this run is incomplete."
+        );
+    }
     if let Some(r) = &receipt {
         eprintln!(
             "wardyn: {} denial(s) receipted to {} (WARDYN_DENIALS in the agent's env)",
@@ -833,40 +905,100 @@ async fn main() -> anyhow::Result<()> {
             r.path()
         );
     }
-    result
+    report_kernel_stats(
+        &snapshot,
+        opts.enforce,
+        receipt.as_ref().map(|r| r.count()).unwrap_or(0),
+    );
+    result?;
+    if we_stopped_it {
+        // The agent's status here reports our own SIGTERM, not its outcome.
+        return Ok(0);
+    }
+    Ok(status.map(exit_code_of).unwrap_or(0))
+}
+
+/// Print the counters only the kernel could know. Silence here would mean a full
+/// ring buffer (lost audit records), a full watch set (unenforced children), or
+/// an enforcement path that never fired, all looking exactly like a clean run.
+fn report_kernel_stats(s: &StatSnapshot, enforce: bool, claimed: u64) {
+    if s.ring_drops > 0 {
+        eprintln!(
+            "wardyn: WARNING: {} event(s) were dropped by a full ring buffer — those actions have \
+             no feed row, no audit record and no receipt line.",
+            s.ring_drops
+        );
+    }
+    if s.watch_full > 0 {
+        eprintln!(
+            "wardyn: WARNING: the watch set filled up {} time(s) — those child processes ran \
+             completely unobserved AND unenforced.",
+            s.watch_full
+        );
+    }
+    if enforce {
+        eprintln!(
+            "wardyn: kernel denials — {} file, {} exec, {} network",
+            s.denied_file, s.denied_exec, s.denied_net
+        );
+        // The one cross-check that cannot be fooled by a wrong struct offset or
+        // an LSM that failed to attach: if the receipt told the agent it was
+        // denied N times and the kernel counted none, the receipt was fiction.
+        if claimed > 0 && s.denials() == 0 {
+            eprintln!(
+                "wardyn: WARNING: {claimed} denial(s) were reported to the agent but the kernel \
+                 counted none — enforcement did NOT fire. Treat this run as observe-only."
+            );
+        }
+    }
 }
 
 /// Plain line-printer used when stdout is not a terminal (pipes, CI, `--plain`).
 /// No interactivity, so no exceptions can be granted here.
 async fn run_plain(
     mut async_fd: AsyncFd<RingBuf<MapData>>,
-    mut child: Option<Child>,
+    child: &mut Option<Child>,
     ctx: &mut RunCtx<'_>,
 ) -> anyhow::Result<()> {
-    println!(
-        "{:<7} {:<15} {:<8} {:<6} DETAIL",
-        "PID", "COMM", "EVENT", "ACT"
-    );
-    fn print(d: Desc, enforce: bool) {
-        println!(
-            "{:<7} {:<15} {:<8} {:<6} {}",
-            d.pid,
-            d.comm,
-            d.label,
-            d.act(enforce),
-            d.shown()
-        );
+    use std::io::Write as _;
+    // `println!` panics on a closed pipe (`wardyn --plain | head`) and blocks on
+    // a slow one. Write through a locked handle and treat a broken pipe as a
+    // normal end of output.
+    fn line(out: &mut std::io::StdoutLock<'_>, args: std::fmt::Arguments<'_>) -> bool {
+        match writeln!(out, "{args}") {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => false,
+            Err(_) => false,
+        }
     }
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut open = line(
+        &mut out,
+        format_args!(
+            "{:<7} {:<15} {:<8} {:<6} DETAIL",
+            "PID", "COMM", "EVENT", "ACT"
+        ),
+    );
+
     let enforce = ctx.enforce;
     let exceptions = Exceptions::default();
-    // Periodic WATCHED prune (only does anything when eviction was deferred to
-    // userspace, i.e. ctx.watched is Some).
     let mut sweep = tokio::time::interval(std::time::Duration::from_secs(2));
+    // One Ctrl-C future for the whole loop: recreating it every iteration drops
+    // any signal that arrives in the gap between iterations.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            status = wait_for(&mut child), if child.is_some() => {
-                info!("target exited ({status})");
+            _ = sigint.recv() => break,
+            _ = sigterm.recv() => break,
+            _ = sighup.recv() => break,
+            status = wait_for(child), if child.is_some() => {
+                if let Some(s) = status {
+                    log::info!("target exited ({s})");
+                }
                 break;
             }
             _ = sweep.tick() => {
@@ -876,15 +1008,39 @@ async fn run_plain(
             }
             guard = async_fd.readable_mut() => {
                 let mut guard = guard?;
-                drain(guard.get_inner_mut(), ctx, &exceptions, |d| print(d, enforce));
+                drain(guard.get_inner_mut(), ctx, &exceptions, |d| {
+                    if open {
+                        open = line(&mut out, format_args!(
+                            "{:<7} {:<15} {:<8} {:<6} {}",
+                            d.pid, d.comm_display(), d.label, d.act(enforce), d.shown()
+                        ));
+                    }
+                });
                 guard.clear_ready();
             }
         }
+        if !open {
+            break; // the reader went away
+        }
     }
-    // The exit/Ctrl-C branch can win the select while events still sit in the
+    // The exit/signal branch can win the select while events still sit in the
     // ring (e.g. a secret read immediately before the child exits). Sweep once
     // more so those final events are shown and audited, not dropped.
-    drain(async_fd.get_mut(), ctx, &exceptions, |d| print(d, enforce));
+    drain(async_fd.get_mut(), ctx, &exceptions, |d| {
+        if open {
+            open = line(
+                &mut out,
+                format_args!(
+                    "{:<7} {:<15} {:<8} {:<6} {}",
+                    d.pid,
+                    d.comm_display(),
+                    d.label,
+                    d.act(enforce),
+                    d.shown()
+                ),
+            );
+        }
+    });
     Ok(())
 }
 
@@ -905,23 +1061,59 @@ pub(crate) struct Desc {
     /// The operator granted an exception covering this event: the kernel
     /// allowed it even though the policy objects (or used to).
     pub excepted: bool,
+    /// The kernel itself reported this row (a `DENY_*` event). Not a prediction.
+    pub kernel: bool,
+    /// An operator/diagnostic message, not an observed action: never counted as
+    /// a policy verdict.
+    pub notice: bool,
+}
+
+/// Escape control bytes for terminal display. Paths and `comm` are entirely
+/// attacker-controlled: a watched agent that opens a file whose name contains
+/// `\r` or an ANSI escape could otherwise repaint the feed, forge rows, or hide
+/// its own activity from the operator watching it.
+fn sanitize(s: &str) -> String {
+    if !s
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}'))
+    {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() || matches!(c, '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}') {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl Desc {
     /// Detail annotated with the matched rule when it's a violation (or an
-    /// exception, where the rule string carries the granted key).
+    /// exception, where the rule string carries the granted key). Safe to print.
     pub fn shown(&self) -> String {
-        if self.action == Action::Allow && !self.excepted {
-            self.detail.clone()
+        let detail = sanitize(&self.detail);
+        if self.notice || (self.action == Action::Allow && !self.excepted) {
+            detail
         } else {
-            format!("{}  [{}]", self.detail, self.rule)
+            format!("{detail}  [{}]", self.rule)
         }
     }
 
-    /// ACT column text, honest about enforcement: `BLOCK` = kernel-denied,
-    /// `block~` = flagged under --enforce but the rule can't be enforced,
-    /// `block` = observe-only, `excep` = allowed by an operator exception.
+    pub fn comm_display(&self) -> String {
+        sanitize(&self.comm)
+    }
+
+    /// ACT column text, honest about enforcement: `BLOCK` = the kernel denied
+    /// it (reported or confidently predicted), `block~` = flagged under
+    /// --enforce but not enforceable, `block` = observe-only, `excep` = allowed
+    /// by an operator exception.
     pub fn act(&self, enforce: bool) -> &'static str {
+        if self.notice {
+            return "note";
+        }
         if self.excepted {
             return "excep";
         }
@@ -936,7 +1128,25 @@ impl Desc {
 
     /// Whether the kernel actually denied this event.
     pub fn denied(&self, enforce: bool) -> bool {
-        self.action == Action::Block && enforce && self.enforceable
+        !self.notice && self.action == Action::Block && enforce && self.enforceable
+    }
+}
+
+/// A startup diagnostic rendered as a feed row.
+pub(crate) fn notice_row(text: &str) -> Desc {
+    Desc {
+        pid: 0,
+        comm: "wardyn".into(),
+        kind: KIND_NOTICE,
+        label: "notice",
+        detail: text.to_string(),
+        action: Action::Allow,
+        rule: String::new(),
+        enforceable: false,
+        denial_key: None,
+        excepted: false,
+        kernel: false,
+        notice: true,
     }
 }
 
@@ -954,30 +1164,69 @@ pub(crate) fn drain(
     let enforce = ctx.enforce;
     let enforce_files = ctx.enforce_files;
     while let Some(item) = ring.next() {
-        if let Some(d) = parse_event(&item)
-            .as_ref()
-            .and_then(|ev| describe(ev, ctx.policy, enforce, enforce_files, exceptions))
-        {
-            if d.action != Action::Allow {
-                let _ = ctx.audit.record(
-                    d.pid,
-                    &d.comm,
-                    d.label,
-                    &d.detail,
-                    d.action,
-                    &d.rule,
-                    d.denied(enforce),
-                );
-                // The receipt is the agent's view: only what the kernel really
-                // denied belongs there — not warns, not unenforced `block~`.
-                if d.denied(enforce) {
-                    if let Some(r) = ctx.receipt.as_deref_mut() {
-                        let _ = r.record(d.pid, &d.comm, d.label, &d.detail, &d.rule);
+        let Some(ev) = parse_event(&item) else {
+            continue;
+        };
+        // A kernel `DENY_*` event that merely confirms a row we already reported
+        // must not produce a second row, a second audit record or a second
+        // receipt line. One that does NOT match a prediction is the interesting
+        // case: a denial the observed path never described (dirfd-relative
+        // opens, symlinks, sendmsg) and which used to be invisible.
+        if let Some(key) = confirmation_key(&ev) {
+            let (obs_kind, key_text) = key;
+            if ctx.take_prediction(ev.pid, obs_kind, &key_text) {
+                continue;
+            }
+        }
+        let Some(d) = describe(&ev, ctx.policy, enforce, enforce_files, exceptions) else {
+            continue;
+        };
+        if !d.notice && d.action != Action::Allow {
+            ctx.audit.record(
+                d.pid,
+                &d.comm,
+                d.label,
+                &d.detail,
+                d.action,
+                &d.rule,
+                d.denied(enforce),
+                d.kernel,
+            );
+            // The receipt is the agent's view: only what the kernel really
+            // denied belongs there — not warns, not unenforced `block~`.
+            if d.denied(enforce) {
+                if let Some(r) = ctx.receipt.as_deref_mut() {
+                    let _ = r.record(d.pid, &d.comm, d.label, &d.detail, &d.rule);
+                }
+                if !d.kernel {
+                    if let Some(k) = &d.denial_key {
+                        let text = prediction_key(k);
+                        ctx.remember_prediction(d.pid, d.kind, text);
                     }
                 }
             }
-            sink(d);
         }
+        sink(d);
+    }
+}
+
+/// For a kernel `DENY_*` event, the `(observation kind, key)` pair a predicted
+/// row would have recorded — used to recognise a confirmation.
+fn confirmation_key(ev: &Event) -> Option<(u32, String)> {
+    match ev.kind {
+        kind::DENY_FILE => Some((kind::OPEN, event_key_name(ev))),
+        kind::DENY_EXEC => Some((kind::EXEC, event_key_name(ev))),
+        kind::DENY_NET => Some((kind::CONNECT, deny_net_addr(ev).to_string())),
+        _ => None,
+    }
+}
+
+/// The text form of a predicted denial key, matching [`confirmation_key`].
+fn prediction_key(k: &DenialKey) -> String {
+    match k {
+        DenialKey::FileName(n) | DenialKey::FileDir(n) | DenialKey::Exec(n) => n.clone(),
+        DenialKey::Net4(ip) => ip.to_string(),
+        DenialKey::Net6(ip) => ip.to_string(),
     }
 }
 
@@ -989,6 +1238,19 @@ pub(crate) fn parse_event(bytes: &[u8]) -> Option<Event> {
     Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const Event) })
 }
 
+/// The destination address a `DENY_NET` event refers to.
+fn deny_net_addr(ev: &Event) -> std::net::IpAddr {
+    if ev.family == AF_INET6 {
+        let ip6 = Ipv6Addr::from(ev.daddr6);
+        match ip6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(ip6),
+        }
+    } else {
+        std::net::IpAddr::V4(Ipv4Addr::from(ev.daddr.to_ne_bytes()))
+    }
+}
+
 pub(crate) fn describe(
     ev: &Event,
     policy: &Policy,
@@ -996,29 +1258,102 @@ pub(crate) fn describe(
     enforce_files: bool,
     exc: &Exceptions,
 ) -> Option<Desc> {
-    // `enforce_files` gates whether a kernel file/exec denial is claimed: when the
-    // LSM isn't attached or the offsets aren't trusted, pass `None` so the row is
-    // demoted to `block~` instead of a `BLOCK` that never fired (and isn't receipted).
-    let (label, detail, verdict, denial_key, excepted) = match ev.kind {
-        kind::EXEC => {
-            let d = event_path(ev);
-            let kd = if enforce_files {
-                policy.kernel_exec_denial(&d)
-            } else {
-                None
+    // Kernel-reported denials first: these are decisions, not observations, and
+    // they are reported exactly as made.
+    match ev.kind {
+        kind::DENY_FILE | kind::DENY_EXEC => {
+            let name = event_key_name(ev);
+            let key = match ev.kind {
+                kind::DENY_EXEC => DenialKey::Exec(name.clone()),
+                _ if ev.meta == meta::KEY_DIR => DenialKey::FileDir(name.clone()),
+                _ => DenialKey::FileName(name.clone()),
             };
-            let (v, key, ex) = reconcile(policy.eval_exec(&d), enforce, kd, exc);
-            ("exec", d, v, key, ex)
+            let label = if ev.kind == kind::DENY_EXEC {
+                "exec"
+            } else {
+                "open"
+            };
+            return Some(Desc {
+                pid: ev.pid,
+                comm: field_str(&ev.comm),
+                kind: ev.kind,
+                label,
+                detail: format!("{key} (denied in-kernel; path not observed)"),
+                action: Action::Block,
+                rule: format!("kernel:{key}"),
+                enforceable: true,
+                denial_key: Some(key),
+                excepted: false,
+                kernel: true,
+                notice: false,
+            });
         }
-        kind::OPEN => {
-            let d = event_path(ev);
+        kind::DENY_NET => {
+            let addr = deny_net_addr(ev);
+            let key = match addr {
+                std::net::IpAddr::V4(v4) => DenialKey::Net4(v4),
+                std::net::IpAddr::V6(v6) => DenialKey::Net6(v6),
+            };
+            return Some(Desc {
+                pid: ev.pid,
+                comm: field_str(&ev.comm),
+                kind: ev.kind,
+                label: "connect",
+                detail: format!("{addr}:{}", ev.dport),
+                action: Action::Block,
+                rule: format!("kernel:{key}"),
+                enforceable: true,
+                denial_key: Some(key),
+                excepted: false,
+                kernel: true,
+                notice: false,
+            });
+        }
+        _ => {}
+    }
+
+    // `enforce_files` gates whether a kernel file/exec denial is PREDICTED: when
+    // the LSM isn't attached or the offsets aren't trusted, pass `None` so the
+    // row is demoted to `block~` instead of a `BLOCK` that may never fire.
+    let (label, detail, verdict, denial_key, excepted) = match ev.kind {
+        kind::EXEC | kind::OPEN => {
+            let is_exec = ev.kind == kind::EXEC;
+            let label = if is_exec { "exec" } else { "open" };
+            let Some(d) = event_path(ev) else {
+                // The path was longer than the event buffer or unreadable. It
+                // used to arrive as an empty string and be evaluated against the
+                // policy as "" — a silent allow with a blank DETAIL.
+                return Some(Desc {
+                    pid: ev.pid,
+                    comm: field_str(&ev.comm),
+                    kind: ev.kind,
+                    label,
+                    detail: format!("<path over {PATH_LEN} bytes or unreadable — NOT evaluated>"),
+                    action: Action::Warn,
+                    rule: "unreadable-path".into(),
+                    enforceable: false,
+                    denial_key: None,
+                    excepted: false,
+                    kernel: false,
+                    notice: false,
+                });
+            };
             let kd = if enforce_files {
-                policy.kernel_file_denial(&d)
+                if is_exec {
+                    policy.kernel_exec_denial(&d)
+                } else {
+                    policy.kernel_file_denial(&d)
+                }
             } else {
                 None
             };
-            let (v, key, ex) = reconcile(policy.eval_file(&d), enforce, kd, exc);
-            ("open", d, v, key, ex)
+            let base = if is_exec {
+                policy.eval_exec(&d)
+            } else {
+                policy.eval_file(&d)
+            };
+            let (v, key, ex) = reconcile(base, enforce, kd, exc);
+            (label, d, v, key, ex)
         }
         kind::CONNECT => {
             let (d, mut v, ip_key) = if ev.family == AF_INET6 {
@@ -1078,30 +1413,20 @@ pub(crate) fn describe(
         enforceable: verdict.enforceable,
         denial_key,
         excepted,
+        kernel: false,
+        notice: false,
     })
 }
 
-/// Reconcile the glob verdict against what the kernel's coarse basename/dir
-/// matcher will *actually* do under `--enforce`, so the feed never disagrees
-/// with the syscall's real outcome. `kernel_denial` is `Some(key)` when the LSM
-/// hook would deny this exact path — unless the operator granted that key as an
-/// exception, in which case the kernel allows it again.
+/// Reconcile the glob verdict against what the kernel's coarse name matcher will
+/// *actually* do under `--enforce`, so the feed doesn't disagree with the
+/// syscall's real outcome. `kernel_denial` is `Some(key)` when the LSM hook would
+/// deny this exact path — unless the operator granted that key as an exception,
+/// in which case the kernel allows it again.
 ///
 /// Returns `(verdict, denial_key, excepted)`: `denial_key` is the key the TUI
 /// can offer to except (only when the kernel really denies), `excepted` marks
 /// rows covered by an already-granted exception.
-///
-/// Without enforcement the glob verdict stands (observe-only). With it, the
-/// corrected divergences are:
-///   - glob said allow/warn but the kernel denies (a `block` glob reduced to a
-///     bare basename over-blocks, e.g. `/etc/shadow` → any `shadow`): promote
-///     to an enforced block so the row isn't a green `ok` for a denied open.
-///   - glob said an *enforceable* block but the kernel won't deny this path
-///     (e.g. `**/.ssh/**` matches a deep file whose immediate parent isn't
-///     `.ssh`): demote to `block~` so we don't claim a `BLOCK` that never fired.
-///   - the key is excepted: same demotion, but marked `excep` with the granted
-///     key in the rule, so the override is visible instead of a confusing
-///     `block~`.
 fn reconcile(
     mut v: Verdict,
     enforce: bool,
@@ -1139,7 +1464,7 @@ fn reconcile(
 }
 
 /// Byte offset of `field` in a tracefs event format file, e.g.
-/// `tracefs_field_offset("sched/sched_process_fork", "parent_pid")`. The format
+/// `tracefs_field_offset("sched/sched_process_fork", "child_pid")`. The format
 /// file is the kernel's own declaration of the event layout — the only source
 /// that is correct on every kernel.
 fn tracefs_field_offset(event: &str, field: &str) -> Option<u32> {
@@ -1203,15 +1528,27 @@ fn field_str(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..end]).into_owned()
 }
 
-fn event_path(ev: &Event) -> String {
+/// The matched key carried by a `DENY_FILE` / `DENY_EXEC` event.
+fn event_key_name(ev: &Event) -> String {
     let len = (ev.path_len as usize).min(PATH_LEN);
     field_str(&ev.path[..len])
 }
 
+/// The observed path, or `None` when the kernel could not capture it (a path at
+/// or over `PATH_LEN`, or an unreadable user pointer — both arrive as a zeroed
+/// buffer, which must not be evaluated as the empty path).
+fn event_path(ev: &Event) -> Option<String> {
+    let len = (ev.path_len as usize).min(PATH_LEN);
+    if len == 0 || ev.path[0] == 0 {
+        return None;
+    }
+    Some(field_str(&ev.path[..len]))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_format_offset, reconcile};
-    use crate::policy::{Action, DenialKey, Exceptions, Verdict};
+    use super::*;
+    use wardyn_common::COMM_LEN;
 
     fn block(rule: &str, enforceable: bool) -> Verdict {
         Verdict {
@@ -1276,5 +1613,146 @@ mod tests {
         // `pid` is a suffix of `parent_pid`/`child_pid` and must not match them.
         assert_eq!(parse_format_offset(FORK_6_18, "pid"), None);
         assert_eq!(parse_format_offset(FORK_6_18, "no_such_field"), None);
+    }
+
+    fn ev_with_path(kind_: u32, path: &str, len: u32) -> Event {
+        let mut e = Event::zeroed();
+        e.kind = kind_;
+        e.pid = 7;
+        let b = path.as_bytes();
+        e.path[..b.len()].copy_from_slice(b);
+        e.path_len = len;
+        e
+    }
+
+    #[test]
+    fn an_uncapturable_path_is_flagged_not_silently_allowed() {
+        // The kernel reports PATH_LEN with a zeroed buffer when the path did not
+        // fit (or could not be read).
+        let mut e = Event::zeroed();
+        e.kind = kind::OPEN;
+        e.path_len = PATH_LEN as u32;
+        assert_eq!(event_path(&e), None);
+
+        let p = Policy::from_yaml_str_with(
+            "default_action: allow",
+            &wardyn_policy::policy::null_resolver,
+        )
+        .unwrap();
+        let d = describe(&e, &p, true, true, &Exceptions::default()).unwrap();
+        assert_eq!(d.action, Action::Warn);
+        assert!(d.detail.contains("NOT evaluated"));
+    }
+
+    #[test]
+    fn a_normal_path_still_decodes() {
+        let e = ev_with_path(kind::OPEN, "/home/u/.env", 13);
+        assert_eq!(event_path(&e).unwrap(), "/home/u/.env");
+    }
+
+    #[test]
+    fn kernel_denial_events_are_rendered_as_the_kernels_own_verdict() {
+        let p = Policy::from_yaml_str_with(
+            "default_action: allow",
+            &wardyn_policy::policy::null_resolver,
+        )
+        .unwrap();
+        let mut e = ev_with_path(kind::DENY_FILE, ".ssh", 4);
+        e.meta = meta::KEY_DIR;
+        let d = describe(&e, &p, true, false, &Exceptions::default()).unwrap();
+        assert!(d.kernel, "the hook that denied is the one reporting");
+        assert_eq!(d.action, Action::Block);
+        assert!(d.enforceable, "a reported denial is not a prediction");
+        assert_eq!(d.rule, "kernel:dir=.ssh");
+        assert_eq!(d.denial_key, Some(DenialKey::FileDir(".ssh".into())));
+        // ...even though the policy above blocks nothing at all: the kernel's
+        // report is not re-derived from userspace rules.
+        assert_eq!(p.eval_file("/home/u/.ssh/id").action, Action::Allow);
+    }
+
+    #[test]
+    fn a_denied_exec_event_maps_to_the_exec_key() {
+        let p = Policy::from_yaml_str_with(
+            r#"exec: [{ match: "**/nc", action: block }]"#,
+            &wardyn_policy::policy::null_resolver,
+        )
+        .unwrap();
+        let e = ev_with_path(kind::DENY_EXEC, "nc", 2);
+        let d = describe(&e, &p, true, true, &Exceptions::default()).unwrap();
+        assert_eq!(d.label, "exec");
+        assert_eq!(d.denial_key, Some(DenialKey::Exec("nc".into())));
+    }
+
+    #[test]
+    fn deny_net_unwraps_v4_mapped_addresses_like_the_kernel_hook() {
+        let mut e = Event::zeroed();
+        e.kind = kind::DENY_NET;
+        e.family = AF_INET6;
+        e.daddr6 = Ipv6Addr::from([0, 0, 0, 0, 0, 0xffff, 0x0101, 0x0101]).octets();
+        e.dport = 443;
+        assert_eq!(deny_net_addr(&e).to_string(), "1.1.1.1");
+        let p = Policy::from_yaml_str_with(
+            "default_action: allow",
+            &wardyn_policy::policy::null_resolver,
+        )
+        .unwrap();
+        let d = describe(&e, &p, true, true, &Exceptions::default()).unwrap();
+        assert_eq!(d.detail, "1.1.1.1:443");
+        assert_eq!(d.rule, "kernel:ip=1.1.1.1");
+    }
+
+    #[test]
+    fn control_bytes_in_a_path_cannot_forge_feed_rows() {
+        let hostile = "/tmp/\x1b[2Kfake\r  99999  root  open   ok   /etc/passwd";
+        let out = sanitize(hostile);
+        assert!(!out.contains('\x1b') && !out.contains('\r'));
+        assert!(out.contains("\\u{1b}") && out.contains("\\u{d}"));
+        // Right-to-left overrides can hide a suffix just as effectively.
+        assert!(sanitize("evil\u{202e}txt.exe").contains("\\u{202e}"));
+        // Ordinary paths are untouched (and not reallocated into escapes).
+        assert_eq!(
+            sanitize("/home/u/proj/src/main.rs"),
+            "/home/u/proj/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn comm_is_sanitised_too() {
+        let mut e = Event::zeroed();
+        e.kind = kind::OPEN;
+        let comm = b"ev\x1b[31mil\0";
+        e.comm[..comm.len().min(COMM_LEN)].copy_from_slice(&comm[..comm.len().min(COMM_LEN)]);
+        let b = b"/tmp/x";
+        e.path[..b.len()].copy_from_slice(b);
+        e.path_len = b.len() as u32 + 1;
+        let p = Policy::from_yaml_str_with(
+            "default_action: allow",
+            &wardyn_policy::policy::null_resolver,
+        )
+        .unwrap();
+        let d = describe(&e, &p, false, false, &Exceptions::default()).unwrap();
+        assert!(!d.comm_display().contains('\x1b'));
+    }
+
+    #[test]
+    fn notices_are_never_counted_as_policy_verdicts() {
+        let d = notice_row("BPF LSM unavailable");
+        assert!(d.notice);
+        assert_eq!(d.act(true), "note");
+        assert!(!d.denied(true));
+    }
+
+    #[test]
+    fn exit_code_follows_the_target() {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            exit_code_of(std::process::ExitStatus::from_raw(0)),
+            0,
+            "a clean target run exits 0"
+        );
+        // 0x0100 = exited with code 1 in wait(2) encoding.
+        assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(0x0100)), 1);
+        // 9 = killed by SIGKILL -> 128 + 9.
+        assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
     }
 }

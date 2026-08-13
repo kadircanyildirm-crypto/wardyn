@@ -29,32 +29,67 @@ Requirements:
 ```bash
 ./scripts/setup-vm.sh          # toolchain + bpf-linker (one-time)
 cargo build                    # builds userspace + the eBPF object (via aya-build)
-cargo test                     # policy-engine unit tests (no root needed)
+cargo test                     # unit tests (no root needed)
 sudo ./target/debug/wardyn run -- bash    # smoke-test observation
 ```
 
+### Working without a Linux box (or without `bpf-linker`)
+
+The policy engine and CLI live in `wardyn-policy`, deliberately free of
+`aya`/`libc`, so the semantics stay testable anywhere:
+
+```bash
+just test-portable             # cargo test -p wardyn-policy -p wardyn-common
+just check-nolinker            # type-check the userspace crate with no bpf-linker
+```
+
+`check-nolinker` sets `WARDYN_SKIP_EBPF_BUILD=1`, which makes `build.rs` emit an
+empty placeholder object. The resulting binary refuses to start — it exists to be
+type-checked, never shipped.
+
 ## Before you open a PR
 
-CI runs these and they must pass — run them locally first:
+CI runs these and they must pass — run them locally first (`just lint` does all
+of the checks in one go):
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo build
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+# the eBPF crate builds for a different target, so a plain clippy never sees it
+cargo clippy --locked -p wardyn-ebpf --target bpfel-unknown-none -Zbuild-std=core -- -D warnings
+shellcheck scripts/*.sh tests/e2e/run.sh
+cargo build --locked
+cargo test --locked
 ```
 
 Keep the build **warning-free**, including the eBPF crate.
 
+Changing anything the kernel programs do? CI compiles the eBPF object but cannot
+load it (GitHub runners have no BPF LSM). Run `just e2e` on a kernel booted with
+`lsm=...,bpf` and say so in the PR — the verifier is the only thing that can
+confirm a hook is acceptable, and a rejected program takes the whole tool down.
+
 ## What to know about the codebase
 
-- `wardyn/` — userspace: arg parsing, policy loading, map population, ring-buffer
-  drain, TUI / plain feed, JSONL audit log.
+- `wardyn/` — userspace: map population, ring-buffer drain, TUI / plain feed,
+  JSONL audit log, denial receipt. Linux-only (aya + libc).
 - `wardyn-ebpf/` — the eBPF programs (tracepoints for observation; cgroup + LSM
   hooks for enforcement). `#![no_std]`, verifier-constrained — read the comments.
 - `wardyn-common/` — dependency-free types shared across the kernel/user boundary.
-- `policy.rs` is the single source of truth for policy semantics and is
-  **unit-tested**. If you change how rules resolve, add or update a test there.
+- `wardyn-policy/` — the policy engine and CLI parsing. Pure logic, no OS
+  dependencies, and the **single source of truth for policy semantics**. If you
+  change how rules resolve, add or update a test there.
+
+Two invariants worth stating outright, because breaking either turns wardyn into
+a tool that lies:
+
+- **The userspace mirror must match the kernel matcher.** `kernel_file_denial`
+  reproduces what the LSM hook does (basename, then ancestor directories bounded
+  by `MAX_DIR_WALK`). Change one side and you must change the other, or the feed
+  will show `ok` for a denied open.
+- **Never claim a denial that wasn't made.** A prediction is displayed; only a
+  `DENY_*` event from the deciding hook proves anything. If you add an
+  enforcement path, make it report itself and bump its `STATS` counter.
 
 **Kernel offsets:** the LSM file/exec matcher reads `dentry` fields at offsets
 derived for a specific kernel (currently 6.8). If you build for another kernel,

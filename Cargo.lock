@@ -1303,16 +1303,13 @@ dependencies = [
  "aya-build 0.2.0",
  "chrono",
  "env_logger",
- "globset",
- "ipnet",
  "libc",
  "log",
  "ratatui",
- "serde",
  "serde_json",
- "serde_yaml",
  "tokio",
  "wardyn-common",
+ "wardyn-policy",
 ]
 
 [[package]]
@@ -1325,6 +1322,18 @@ version = "0.1.0"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
+ "wardyn-common",
+]
+
+[[package]]
+name = "wardyn-policy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "globset",
+ "ipnet",
+ "serde",
+ "serde_yaml",
  "wardyn-common",
 ]
 

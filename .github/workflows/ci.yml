@@ -18,13 +18,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The policy engine and CLI are pure logic in `wardyn-policy`, deliberately
+  # free of aya/libc so they can be tested on the machines contributors actually
+  # use. Running them on three OSes also catches accidental Linux-only
+  # assumptions creeping back into the semantics.
+  portable:
+    name: portable tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test the policy engine + CLI
+        run: cargo test --locked -p wardyn-policy -p wardyn-common
+
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
       # nightly + rust-src is required: build.rs (aya-build) compiles the eBPF
-      # crate for bpfel-unknown-none with -Z build-std.
+      # crate for bpfel-unknown-none with -Z build-std. The exact nightly comes
+      # from rust-toolchain.toml — the emitted BPF bytecode depends on the
+      # compiler, so it is pinned rather than floating.
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -32,19 +54,49 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `--locked` so the linker itself is built from a fixed dependency graph.
       - name: Install bpf-linker
-        run: cargo install bpf-linker
+        run: cargo install bpf-linker --locked
 
       - name: Format
         run: cargo fmt --all --check
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (userspace + portable crates)
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-      # Builds userspace + the eBPF object (via aya-build). Does not load it —
-      # GitHub runners have no BPF LSM — so runtime enforcement is tested manually.
+      # The eBPF crate is not in the default workspace members (it builds for a
+      # different target), so a plain `cargo clippy` never sees it — which is how
+      # CONTRIBUTING could promise a warning-free eBPF crate that nothing checked.
+      - name: Clippy (eBPF crate, bpfel target)
+        run: cargo clippy --locked -p wardyn-ebpf --target bpfel-unknown-none -Zbuild-std=core -- -D warnings
+
+      # Builds userspace + the eBPF object (via aya-build). Loading it is the
+      # Enforcement E2E workflow's job.
       - name: Build
-        run: cargo build
+        run: cargo build --locked
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
+
+      # The release profile is what users actually build; nothing checked it.
+      - name: Build (release)
+        run: cargo build --locked --release
+
+      # Every shipped policy must survive the loader, and `--dry-run` is the
+      # command users are told to validate one with. A typo in a preset used to
+      # ship silently.
+      - name: Policy dry-run (all shipped policies)
+        run: |
+          for p in policy.yaml policies/strict.yaml policies/permissive.yaml tests/e2e/policy.yaml; do
+            echo "── $p"
+            ./target/release/wardyn --dry-run --policy "$p"
+          done
+
+  # Four shell scripts ship in this repo, one of which edits GRUB as root.
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh tests/e2e/run.sh

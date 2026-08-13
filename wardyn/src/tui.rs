@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Live ratatui terminal UI: a scrolling event feed coloured by policy verdict
-//! (allow = grey, warn = yellow, block = red/bold, excepted = cyan) with a
-//! counter header — plus approve-once exceptions: under `--enforce`, `a` offers
-//! to allow the last kernel denial, the confirm prompt states the TRUE blast
-//! radius (the kernel matches bare names/addresses, so an exception can't be
-//! narrower), and `y` updates the kernel maps and the userspace mirror
-//! together, so the feed never claims a denial the kernel stopped making.
+//! (allow = grey, warn = yellow, block = red/bold, excepted = cyan, notice =
+//! blue) with a counter header — plus approve-once exceptions: under
+//! `--enforce`, `a` offers to allow the last kernel denial, the confirm prompt
+//! states the TRUE blast radius (the kernel matches bare names/addresses, so an
+//! exception can't be narrower), and `y` updates the kernel maps and the
+//! userspace mirror together, so the feed never claims a denial the kernel
+//! stopped making.
+//!
+//! The terminal is restored by a guard, not by the happy path: every `?` in here
+//! used to return before the restore sequence, leaving the operator in raw mode
+//! inside the alternate screen with no prompt.
 use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
@@ -14,7 +19,7 @@ use anyhow::Result;
 use aya::maps::{MapData, RingBuf};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::{
-    event::{self, Event as CtEvent, KeyCode, KeyModifiers},
+    event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -26,9 +31,9 @@ use ratatui::{Frame, Terminal};
 use tokio::io::unix::AsyncFd;
 use tokio::process::Child;
 use wardyn_common::kind;
+use wardyn_policy::policy::{Action, DenialKey, Exceptions};
 
-use crate::policy::{Action, DenialKey, Exceptions};
-use crate::{drain, prune_watched, wait_for, Desc, RunCtx};
+use crate::{drain, notice_row, prune_watched, wait_for, Desc, RunCtx, StatSnapshot};
 
 const MAX_ROWS: usize = 4096;
 
@@ -43,11 +48,16 @@ struct App {
     block: u64,
     denied: u64,
     granted: u64,
+    stats: StatSnapshot,
     /// The most recent kernel denial (key + the rule that produced it) — what
     /// `a` offers to except.
     last_denial: Option<(DenialKey, String)>,
     /// A pending approve-once confirmation, waiting for y/n.
     confirm: Option<DenialKey>,
+    /// Whether that confirmation has actually been drawn. A pre-typed `a`+`y`
+    /// arriving in one batch must not grant an exception whose blast-radius
+    /// prompt the operator never saw.
+    confirm_shown: bool,
 }
 
 impl App {
@@ -63,27 +73,31 @@ impl App {
             block: 0,
             denied: 0,
             granted: 0,
+            stats: StatSnapshot::default(),
             last_denial: None,
             confirm: None,
+            confirm_shown: false,
         }
     }
 
     fn push(&mut self, d: Desc) {
-        match d.kind {
-            kind::EXEC => self.exec += 1,
-            kind::OPEN => self.open += 1,
-            kind::CONNECT => self.connect += 1,
-            _ => {}
-        }
-        match d.action {
-            Action::Warn => self.warn += 1,
-            Action::Block => self.block += 1,
-            Action::Allow => {}
-        }
-        if d.denied(self.enforce) {
-            self.denied += 1;
-            if let Some(key) = &d.denial_key {
-                self.last_denial = Some((key.clone(), d.rule.clone()));
+        if !d.notice {
+            match d.kind {
+                kind::EXEC | kind::DENY_EXEC => self.exec += 1,
+                kind::OPEN | kind::DENY_FILE => self.open += 1,
+                kind::CONNECT | kind::DENY_NET => self.connect += 1,
+                _ => {}
+            }
+            match d.action {
+                Action::Warn => self.warn += 1,
+                Action::Block => self.block += 1,
+                Action::Allow => {}
+            }
+            if d.denied(self.enforce) {
+                self.denied += 1;
+                if let Some(key) = &d.denial_key {
+                    self.last_denial = Some((key.clone(), d.rule.clone()));
+                }
             }
         }
         self.rows.push_back(d);
@@ -150,6 +164,30 @@ impl App {
                 Style::default().fg(Color::Cyan),
             ));
         }
+        // Losses are not decoration: a dropped event has no feed row, no audit
+        // record and no receipt line, and a full watch set means whole child
+        // processes ran unobserved. Both belong next to the counters they
+        // invalidate.
+        if self.stats.ring_drops > 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("‼ DROPPED {}", self.stats.ring_drops),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if self.stats.watch_full > 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("‼ WATCH-SET FULL {}", self.stats.watch_full),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         let header = Paragraph::new(Line::from(spans))
             .block(Block::default().borders(Borders::ALL).title(" Wardyn "));
         f.render_widget(header, chunks[0]);
@@ -159,8 +197,11 @@ impl App {
         let enforce = self.enforce;
         let rows = self.rows.iter().skip(start).map(|d| {
             // Bold red = actually denied; plain red = block-class but not
-            // enforced; cyan = allowed under an operator exception.
-            let (fg, modifier) = if d.excepted {
+            // enforced; cyan = allowed under an operator exception; blue = a
+            // wardyn notice rather than an observed action.
+            let (fg, modifier) = if d.notice {
+                (Color::Blue, Modifier::empty())
+            } else if d.excepted {
                 (Color::Cyan, Modifier::empty())
             } else {
                 match d.action {
@@ -171,8 +212,12 @@ impl App {
                 }
             };
             Row::new(vec![
-                Cell::from(d.pid.to_string()),
-                Cell::from(d.comm.clone()),
+                Cell::from(if d.notice {
+                    String::new()
+                } else {
+                    d.pid.to_string()
+                }),
+                Cell::from(d.comm_display()),
                 Cell::from(d.label),
                 Cell::from(d.act(enforce)),
                 Cell::from(d.shown()),
@@ -220,7 +265,7 @@ impl App {
         } else {
             let mut spans = vec![
                 Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                Span::raw(" quit"),
+                Span::raw(" quit (stops the agent)"),
             ];
             if self.enforce {
                 spans.push(Span::raw("   "));
@@ -248,82 +293,102 @@ fn grant(app: &mut App, ctx: &mut RunCtx<'_>, exceptions: &mut Exceptions, key: 
     match ctx.maps.apply_exception(&key) {
         Ok(()) => {
             exceptions.grant(key.clone());
-            let _ = ctx
-                .audit
+            ctx.audit
                 .record_exception(&key.to_string(), &key.blast_radius());
             if let Some(r) = ctx.receipt.as_deref_mut() {
                 let _ = r.record_exception(&key.to_string(), &key.blast_radius());
             }
             app.granted += 1;
             app.last_denial = None;
-            app.push(exception_row(&key, None));
+            app.push(exception_row(&key));
         }
-        Err(e) => app.push(exception_row(&key, Some(format!("{e:#}")))),
+        // A failure here is an internal error, not a policy verdict: it must not
+        // inflate the warn counter the operator is reading.
+        Err(e) => app.push(notice_row(&format!(
+            "FAILED to apply exception {key}: {e:#} — the kernel is still denying it"
+        ))),
     }
 }
 
-/// Synthetic feed row announcing an exception grant (or its failure).
-fn exception_row(key: &DenialKey, err: Option<String>) -> Desc {
-    let (detail, action, excepted) = match err {
-        None => (
-            format!("now allowed: {}", key.blast_radius()),
-            Action::Allow,
-            true,
-        ),
-        Some(e) => (
-            format!("FAILED to apply exception: {e}"),
-            Action::Warn,
-            false,
-        ),
-    };
+/// Synthetic feed row announcing an exception grant.
+fn exception_row(key: &DenialKey) -> Desc {
     Desc {
         pid: 0,
         comm: "operator".into(),
-        kind: u32::MAX,
+        kind: u32::MAX - 1,
         label: "except",
-        detail,
-        action,
+        detail: format!("now allowed: {}", key.blast_radius()),
+        action: Action::Allow,
         rule: key.to_string(),
         enforceable: false,
         denial_key: None,
-        excepted,
+        excepted: true,
+        kernel: false,
+        notice: false,
     }
 }
 
-/// Restore the terminal even if we panic mid-draw.
-fn install_panic_hook() {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        prev(info);
-    }));
+/// Restores the terminal on every exit path, including `?` and panics.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<TerminalGuard> {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore();
+            prev(info);
+        }));
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        Ok(TerminalGuard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore();
+    }
+}
+
+fn restore() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), ratatui::crossterm::cursor::Show);
 }
 
 pub async fn run(
     mut async_fd: AsyncFd<RingBuf<MapData>>,
-    mut child: Option<Child>,
+    child: &mut Option<Child>,
     target: String,
     ctx: &mut RunCtx<'_>,
+    notices: Vec<String>,
 ) -> Result<()> {
-    install_panic_hook();
-    enable_raw_mode()?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
-    let mut term = Terminal::new(CrosstermBackend::new(out))?;
+    let _guard = TerminalGuard::enter()?;
+    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut app = App::new(target, ctx.enforce);
+    // Startup diagnostics as the first rows: printing them to stderr moments
+    // before switching to the alternate screen meant nobody ever read them.
+    for n in &notices {
+        app.push(notice_row(n));
+    }
     let mut exceptions = Exceptions::default();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    // Prune WATCHED against /proc every ~2s (20 × 100ms ticks) when eviction is
-    // deferred to userspace; harmless otherwise (ctx.watched is None).
+    // Prune WATCHED against /proc and refresh the kernel counters every ~2s
+    // (20 × 100ms ticks).
     let mut sweeps: u32 = 0;
     let mut quit = false;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     while !quit {
         term.draw(|f| app.draw(f))?;
+        if app.confirm.is_some() {
+            app.confirm_shown = true;
+        }
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => quit = true,
+            _ = sigterm.recv() => quit = true,
+            _ = sighup.recv() => quit = true,
             _ = ticker.tick() => {
                 sweeps += 1;
                 if sweeps >= 20 {
@@ -331,37 +396,52 @@ pub async fn run(
                     if let Some(m) = ctx.watched.as_mut() {
                         prune_watched(m);
                     }
+                    if let Some(s) = ctx.stats.as_ref() {
+                        app.stats = s.snapshot();
+                    }
                 }
                 while event::poll(Duration::ZERO)? {
-                    if let CtEvent::Key(k) = event::read()? {
-                        let ctrl_c = k.code == KeyCode::Char('c')
-                            && k.modifiers.contains(KeyModifiers::CONTROL);
-                        if ctrl_c {
-                            quit = true;
-                        } else if let Some(key) = app.confirm.clone() {
-                            // A confirmation is pending: only y / n / Esc count.
-                            match k.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                    app.confirm = None;
-                                    grant(&mut app, ctx, &mut exceptions, key);
-                                }
-                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                    app.confirm = None;
-                                }
-                                _ => {}
+                    let CtEvent::Key(k) = event::read()? else { continue };
+                    // crossterm reports press *and* release on some terminals;
+                    // acting on both would double every keystroke.
+                    if k.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    let ctrl_c = k.code == KeyCode::Char('c')
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
+                    if ctrl_c {
+                        quit = true;
+                    } else if let Some(key) = app.confirm.clone() {
+                        // A confirmation is pending: only y / n / Esc count, and
+                        // `y` only once the prompt has actually been rendered.
+                        match k.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') if app.confirm_shown => {
+                                app.confirm = None;
+                                app.confirm_shown = false;
+                                grant(&mut app, ctx, &mut exceptions, key);
                             }
-                        } else {
-                            match k.code {
-                                KeyCode::Char('q') | KeyCode::Esc => quit = true,
-                                KeyCode::Char('a') | KeyCode::Char('A') if ctx.enforce => {
-                                    if let Some((key, _)) = app.last_denial.clone() {
-                                        if !exceptions.contains(&key) {
-                                            app.confirm = Some(key);
-                                        }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                app.confirm = None;
+                                app.confirm_shown = false;
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match k.code {
+                            KeyCode::Char('q') | KeyCode::Esc => quit = true,
+                            KeyCode::Char('a') | KeyCode::Char('A') if ctx.enforce => {
+                                if let Some((key, _)) = app.last_denial.clone() {
+                                    if !exceptions.contains(&key) {
+                                        app.confirm = Some(key);
+                                        app.confirm_shown = false;
+                                        // Stop draining this batch: anything
+                                        // already buffered was typed before the
+                                        // prompt existed and must not answer it.
+                                        break;
                                     }
                                 }
-                                _ => {}
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -371,7 +451,7 @@ pub async fn run(
                 drain(guard.get_inner_mut(), ctx, &exceptions, |d| app.push(d));
                 guard.clear_ready();
             }
-            _ = wait_for(&mut child), if child.is_some() => quit = true,
+            _ = wait_for(child), if child.is_some() => quit = true,
         }
     }
 
@@ -379,10 +459,9 @@ pub async fn run(
     // win the select with events (a last secret read, a denied connect) still
     // queued in the ring. Drain + one last render so they are shown and audited.
     drain(async_fd.get_mut(), ctx, &exceptions, |d| app.push(d));
+    if let Some(s) = ctx.stats.as_ref() {
+        app.stats = s.snapshot();
+    }
     term.draw(|f| app.draw(f))?;
-
-    disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    term.show_cursor()?;
     Ok(())
 }

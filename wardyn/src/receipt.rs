@@ -11,26 +11,34 @@
 //! kernel actually denied. Advisory only: the watched tree can read (or even
 //! scribble on) it, but enforcement lives in kernel maps it cannot reach — the
 //! receipt just talks.
-use std::fs::File;
+//!
+//! Creation is deliberately careful. The default path lives in a world-writable
+//! directory, is predictable (`wardyn-denials-<pid>.jsonl`), and is opened by
+//! **root**: a plain `File::create` there follows a symlink an unprivileged
+//! local user planted first, which turns a helpful diagnostic into an arbitrary
+//! root-owned file overwrite. So: `O_CREAT|O_EXCL|O_NOFOLLOW`, mode `0600`, then
+//! `fchown` to the identity the agent will run as — the only user that needs it.
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
 
 /// What the header tells an agent that reads the receipt. Written for an LLM:
-/// imperative, self-contained, and honest about the two ways `rule` can look
-/// and the one denial kind that can't be receipted.
+/// imperative, self-contained, and honest about the two ways `rule` can look.
 const NOTE: &str = "Wardyn is a kernel-level policy warden supervising this process tree. \
     Each line after this header is one action it DENIED in-kernel (EPERM on file \
     open or exec, refused outbound connect/send). If an operation just failed \
     with a permission or network error, match it against these records. Do not \
     retry or work around a denial — report the `rule` to the human operator, who \
     can adjust policy.yaml and re-run. `rule` is the policy pattern that fired; \
-    `kernel:<key>` means the kernel's coarser basename/dir matcher denied beyond \
-    the written glob. A line with event=\"exception\" means the operator granted \
-    an exception: the scope in `now_allowed` is permitted for the rest of this \
-    run, and you MAY retry the operation it covers. Records may lag the syscall \
-    by a few milliseconds; UDP sent via sendmsg() can be denied without a record.";
+    `kernel:<key>` means the kernel reported denying on that key directly, which \
+    can be broader than the written glob. A line with event=\"exception\" means \
+    the operator granted an exception: the scope in `now_allowed` is permitted \
+    for the rest of this run, and you MAY retry the operation it covers. Records \
+    may lag the syscall by a few milliseconds.";
 
 pub struct Receipt {
     writer: BufWriter<File>,
@@ -42,9 +50,30 @@ impl Receipt {
     /// Create the per-run receipt and write the header line. Truncates, unlike
     /// the append-only audit log: the receipt describes THIS run, and an agent
     /// must not read a previous run's denials as current.
-    pub fn create(path: &Path, target: &str, policy_summary: &str) -> Result<Receipt> {
-        let file = File::create(path)
+    ///
+    /// `owner` is the `(uid, gid)` the watched agent will run as; the file is
+    /// chowned to it so that exactly the intended reader — and no one else on
+    /// the machine — can read it.
+    pub fn create(
+        path: &Path,
+        target: &str,
+        policy_summary: &str,
+        owner: Option<(u32, u32)>,
+    ) -> Result<Receipt> {
+        let file = create_exclusive(path)
             .with_context(|| format!("creating denial receipt {}", path.display()))?;
+        if let Some((uid, gid)) = owner {
+            // Best-effort: if we cannot hand it over, the agent simply won't be
+            // able to read it — never a reason to widen the mode instead.
+            let rc = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
+            if rc != 0 {
+                eprintln!(
+                    "wardyn: warning: could not give the denial receipt to uid={uid} \
+                     ({}) — the agent will not be able to read it",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
         let mut receipt = Receipt {
             writer: BufWriter::new(file),
             path: path.display().to_string(),
@@ -113,6 +142,27 @@ impl Receipt {
     }
 }
 
+/// Create `path` fresh, refusing to follow a symlink or reuse an existing file.
+///
+/// A stale receipt from a previous run is removed first — but through the same
+/// `O_EXCL` gate, so the worst an attacker who wins the race can do is make
+/// creation fail loudly, never redirect a root-owned write.
+fn create_exclusive(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    match opts.open(path) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            opts.open(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -120,13 +170,18 @@ fn now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("wardyn-receipt-{tag}-{}.jsonl", std::process::id()))
+    }
 
     #[test]
     fn header_then_one_record_per_denial() {
-        let path =
-            std::env::temp_dir().join(format!("wardyn-receipt-test-{}.jsonl", std::process::id()));
+        let path = temp("basic");
+        std::fs::remove_file(&path).ok();
         {
-            let mut r = Receipt::create(&path, "bash demo.sh", "9 file rule(s)").unwrap();
+            let mut r = Receipt::create(&path, "bash demo.sh", "9 file rule(s)", None).unwrap();
             r.record(42, "cat", "open", "/home/u/.env", "**/.env")
                 .unwrap();
             assert_eq!(r.count(), 1);
@@ -148,10 +203,10 @@ mod tests {
 
     #[test]
     fn exception_records_tell_the_agent_to_retry() {
-        let path =
-            std::env::temp_dir().join(format!("wardyn-receipt-exc-{}.jsonl", std::process::id()));
+        let path = temp("exc");
+        std::fs::remove_file(&path).ok();
         {
-            let mut r = Receipt::create(&path, "t", "p").unwrap();
+            let mut r = Receipt::create(&path, "t", "p", None).unwrap();
             r.record(1, "curl", "connect", "1.1.1.1:443", "cidr:0.0.0.0/0")
                 .unwrap();
             r.record_exception("ip=1.1.1.1", "ALL egress to 1.1.1.1 (any port/protocol)")
@@ -168,14 +223,14 @@ mod tests {
 
     #[test]
     fn create_truncates_stale_receipts() {
-        let path =
-            std::env::temp_dir().join(format!("wardyn-receipt-trunc-{}.jsonl", std::process::id()));
+        let path = temp("trunc");
+        std::fs::remove_file(&path).ok();
         {
-            let mut r = Receipt::create(&path, "run1", "p").unwrap();
+            let mut r = Receipt::create(&path, "run1", "p", None).unwrap();
             r.record(1, "a", "open", "/x", "**").unwrap();
         }
         {
-            Receipt::create(&path, "run2", "p").unwrap();
+            Receipt::create(&path, "run2", "p", None).unwrap();
         }
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -185,5 +240,31 @@ mod tests {
         );
         assert!(text.contains("run2"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_receipt_is_private_and_never_follows_a_symlink() {
+        let path = temp("perm");
+        std::fs::remove_file(&path).ok();
+        Receipt::create(&path, "t", "p", None).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "world-readable receipts leak the agent's activity"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // A symlink planted at the target path must not be written through.
+        let victim = temp("victim");
+        std::fs::write(&victim, "important\n").unwrap();
+        std::fs::remove_file(&path).ok();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        let created = Receipt::create(&path, "t", "p", None);
+        assert!(
+            created.is_err() || std::fs::read_to_string(&victim).unwrap() == "important\n",
+            "the victim file was overwritten through a symlink"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&victim).ok();
     }
 }

@@ -20,11 +20,28 @@ operation by returning an error to the kernel, not after the fact.
 | Capability | Observe hook | Enforce hook | Can block? | Notes |
 |---|---|---|---|---|
 | **exec** | `tracepoint/syscalls/sys_enter_execve` + `sys_enter_execveat` | LSM `bprm_check_security` | ✅ (LSM) | deny returns `-EPERM` to `execve`; both syscall variants observed so a denial can't happen off-feed |
-| **file open** (`.env`, `~/.ssh`) | `tracepoint/syscalls/sys_enter_openat` + `sys_enter_openat2` | LSM `file_open` | ✅ (LSM only) | `bpf_override_return` can't deny `openat` — not on the kernel error-injection allowlist, so blocking *requires* BPF LSM |
-| **outbound connect** | `tracepoint/syscalls/sys_enter_connect` + `sys_enter_sendto` | `cgroup/connect4·6` + `cgroup/sendmsg4·6` | ✅ (cgroup v2) | cgroup hook denies `connect()`/`sendmsg()` **without** LSM — works even on stock WSL2. `sendmsg`'s msghdr destination is enforce-only (not yet observed) |
-| **fork / child tracking** | `tracepoint/sched/sched_process_fork` (+ `sched_process_exit` to evict) | — | — | maintains the watched PID set; pid field offsets read from tracefs at runtime |
+| **file open** (`.env`, `~/.ssh`) | `tracepoint/syscalls/sys_enter_openat` + `sys_enter_openat2` | LSM `file_open` | ✅ (LSM only) | `bpf_override_return` can't deny `openat` — not on the kernel error-injection allowlist, so blocking *requires* BPF LSM. Matches the basename, then **every ancestor directory** (bounded walk) |
+| **outbound connect** | `tracepoint/syscalls/sys_enter_connect` + `sys_enter_sendto` | `cgroup/connect4·6` + `cgroup/sendmsg4·6` | ✅ (cgroup v2) | cgroup hook denies `connect()`/`sendmsg()` **without** LSM — works even on stock WSL2. `sendmsg`'s msghdr destination is enforce-only (not observed), but a denial there still reports itself |
+| **fork / child tracking** | `tracepoint/sched/sched_process_fork` (+ `sched_process_exit` to evict) | — | — | maintains the watched PID set; the parent's tgid comes from `bpf_get_current_pid_tgid` (the hook runs in the parent), the child's pid offset from tracefs at runtime |
 
-> The observe hooks are the `sys_enter_*` variants (not `sched_process_exec`/`kprobe tcp_connect`) so that the common syscalls the enforce hooks act on are also surfaced to the feed. This coverage is **not total**: the LSM/cgroup hooks fire for a strictly larger set of entry points than the attached tracepoints (e.g. the legacy `open(2)`/`creat(2)`, `sendmsg(2)`, io_uring `IORING_OP_*`, and a script interpreter reached via `execve`), so a denial on one of those paths can still happen *off-feed*. The durable fix is to have the deciding hook emit its own verdict event rather than have userspace re-derive it (see "Agent feedback" and `docs/AUDIT.md`).
+> **Observation is not proof; the deciding hook reports its own decision.** The
+> `sys_enter_*` tracepoints exist so the common syscalls also appear in the feed,
+> but that coverage is *not* total: the LSM/cgroup hooks fire for a strictly
+> larger set of entry points (legacy `open(2)`/`creat(2)`, `sendmsg(2)`, io_uring
+> `IORING_OP_*`, a script interpreter reached via `execve`), and the observed path
+> is a *userspace string read at `sys_enter`* — relative, symlinked, or
+> dirfd-relative paths describe a different object than the dentry the LSM
+> matched. So every enforcement hook emits its own `DENY_*` event naming the key
+> it matched. Userspace renders that instead of re-deriving a verdict; where a
+> denial confirms a row the feed already showed, the duplicate is folded away,
+> and where it doesn't, the off-feed denial appears on its own.
+
+> **Losses are counted, not swallowed.** A `PerCpuArray` (`STATS`) counts
+> ring-buffer drops, failed `WATCHED` inserts, and denials per class. A full ring
+> means events with no feed row, no audit record and no receipt line; a full
+> watch set means child processes running *unobserved and unenforced*. Both are
+> surfaced in the TUI header and at exit, and the denial counters are the
+> cross-check that catches a receipt claiming denials the kernel never made.
 
 Two independent enforcement paths on purpose:
 - **Network blocking → cgroup/connect** (needs only cgroup v2).
@@ -52,10 +69,22 @@ Two portability traps live in that seeding, both handled at startup:
   adoption entirely to the in-kernel fork hook (a local child pid could collide
   with an unrelated init-ns tgid). Under a mismatch the feed shows init-ns pids.
 - **Fork tracepoint layout.** `sched_process_fork`'s pid offsets moved when the
-  kernel made comm dynamic (`__data_loc`, observed on 6.18: parent_pid 24→12,
-  child_pid 44→20). Wardyn reads the running kernel's tracefs `format` file and
-  passes the offsets to the hook via `CONFIG` instead of hardcoding one
-  kernel's numbers.
+  kernel made comm dynamic (`__data_loc`, observed on 6.18: child_pid 44→20).
+  Wardyn reads the running kernel's tracefs `format` file and passes the offset
+  to the hook via `CONFIG` instead of hardcoding one kernel's number. The
+  *parent* is not read from the tracepoint at all: its `parent_pid` field is a
+  thread id, and `WATCHED` is keyed by tgid, so the hook takes the parent's tgid
+  from `bpf_get_current_pid_tgid` — it runs synchronously in the parent's
+  context inside `kernel_clone()`.
+- **Threads are not processes.** `sched_process_fork` also fires for
+  `CLONE_THREAD`, and its `child_pid` is then a *thread* id landing in a
+  tgid-keyed map. Left there, a thread-heavy agent fills the map — after which
+  `insert` fails and every subsequently forked child runs completely unwatched,
+  which is a bypass primitive, not merely a leak. `sched_process_exit` therefore
+  removes a thread's own tid as it dies (pid numbers are unique, so this can
+  never remove a live process's entry), the map is sized well above the old
+  8192, and any failed insert increments `STATS[WATCH_FULL]` so saturation is
+  loud rather than silent.
 
 ## Event flow
 
@@ -79,15 +108,30 @@ Two portability traps live in that seeding, both handled at startup:
 
 ## Policy model
 
-See [`policy.yaml`](./policy.yaml). Three rule lists — `files`, `network`, `exec` — each an
-ordered list; **first match wins**; `default_action` is the fallback. Actions: `allow | warn | block`.
+See [`policy.yaml`](./policy.yaml). Three rule lists — `files`, `network`, `exec` —
+with `default_action` as the fallback. Actions: `allow | warn | block`.
+
+Matching order is **not** uniform, and the docs used to claim it was:
+
+| Axis | Order | Why |
+|---|---|---|
+| files / exec | first match wins | ordinary rule-list semantics |
+| network | **longest prefix wins** | the kernel decides egress with an LPM trie; CIDRs covering one address are always nested |
+| files / exec **under `--enforce`** | **no order at all** | the LSM hook holds a *set* of block keys; an `allow` listed before a `block` does not protect what that block's key covers |
+
+`wardyn --dry-run` prints exactly which keys the kernel will hold, which rules
+are flagged-but-never-denied, which enforce more broadly than written, and which
+allow rules the kernel's unordered set overrides.
 
 ## Crate layout
 
 ```
 wardyn-common/   no_std, #[repr(C)] event & verdict structs shared kernel↔user
 wardyn-ebpf/     no_std no_main; the eBPF programs (target bpfel-unknown-none)
-wardyn/          userspace: loader, RingBuf reader, policy compiler, ratatui TUI, audit log
+wardyn-policy/   the policy engine + CLI parsing — pure logic, no aya/libc, so
+                 `cargo test -p wardyn-policy` runs on any OS
+wardyn/          userspace: loader, RingBuf reader, map population, ratatui TUI,
+                 audit log, denial receipt
 ```
 Built with [aya](https://aya-rs.dev) (pure-Rust eBPF — no libbpf/C toolchain). eBPF crate is
 compiled by `wardyn`'s `build.rs` via `aya-build`.

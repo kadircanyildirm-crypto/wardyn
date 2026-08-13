@@ -13,18 +13,16 @@ categories = ["command-line-utilities", "development-tools", "os::linux-apis"]
 [dependencies]
 aya = { workspace = true }
 wardyn-common = { workspace = true }
+# The policy engine and CLI live in a portable crate so they stay testable off
+# Linux; this crate is the Linux-only half that talks to the kernel.
+wardyn-policy = { workspace = true }
 anyhow = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt", "signal", "net", "process", "time"] }
 ratatui = "0.29"
 log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
-# policy engine
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
 serde_json = "1"
-globset = "0.4"
-ipnet = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [build-dependencies]
