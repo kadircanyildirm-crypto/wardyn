@@ -1,0 +1,45 @@
+{
+  "name": "Wardyn (eBPF dev)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "ubuntu",
+
+  // Loading eBPF needs CAP_BPF + CAP_SYS_ADMIN, and attaching LSM/cgroup hooks
+  // needs an unconfined seccomp/apparmor profile (Docker's default profile
+  // blocks bpf(2) outright). This container can therefore do everything root on
+  // the host can — treat it as such, and do not point it at a machine you would
+  // not run `sudo ./target/release/wardyn` on.
+  "privileged": true,
+  "runArgs": [
+    "--security-opt", "seccomp=unconfined",
+    "--security-opt", "apparmor=unconfined",
+    // Pre-5.11 kernels charge BPF maps against RLIMIT_MEMLOCK; newer ones use
+    // memcg and ignore this. Harmless either way, and it removes a confusing
+    // "failed to create map" from old hosts.
+    "--ulimit", "memlock=-1:-1"
+  ],
+
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  "waitFor": "postStartCommand",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "timonwong.shellcheck",
+        "nefrob.vscode-just-syntax"
+      ],
+      "settings": {
+        // The eBPF crate builds for bpfel-unknown-none with -Z build-std, which
+        // rust-analyzer cannot check with a plain `cargo check`; pointing it at
+        // clippy over the default members keeps diagnostics honest instead of
+        // filling the eBPF files with phantom errors.
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.check.extraArgs": ["--locked"]
+      }
+    }
+  }
+}

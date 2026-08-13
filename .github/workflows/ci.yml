@@ -92,11 +92,12 @@ jobs:
             ./target/release/wardyn --dry-run --policy "$p"
           done
 
-  # Four shell scripts ship in this repo, one of which edits GRUB as root.
+  # Several shell scripts ship in this repo, one of which edits GRUB as root and
+  # one of which runs on every dev-container start.
   shellcheck:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck
-        run: shellcheck scripts/*.sh tests/e2e/run.sh
+        run: shellcheck scripts/*.sh tests/e2e/run.sh .devcontainer/*.sh

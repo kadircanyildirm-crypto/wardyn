@@ -46,7 +46,7 @@ lint:
     cargo fmt --all --check
     cargo clippy --locked --all-targets -- -D warnings
     cargo clippy --locked -p wardyn-ebpf --target bpfel-unknown-none -Zbuild-std=core -- -D warnings
-    shellcheck scripts/*.sh tests/e2e/run.sh
+    shellcheck scripts/*.sh tests/e2e/run.sh .devcontainer/*.sh
 
 # Type-check the userspace crate WITHOUT bpf-linker (macOS/Windows laptops).
 # The resulting artifacts cannot run — see wardyn/build.rs.

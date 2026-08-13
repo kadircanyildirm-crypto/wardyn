@@ -80,6 +80,20 @@ process on the host reaches it fine.
 Wardyn needs Linux with **BTF**, **cgroup v2**, and — for file/exec blocking —
 **BPF LSM** enabled. On macOS/Windows, run it in a Linux VM.
 
+**Prebuilt binary** (x86_64, statically linked — no toolchain, no glibc floor;
+the eBPF object is compiled into it, so this one file is the whole tool):
+
+```bash
+# from https://github.com/kadircanyildirm-crypto/wardyn/releases
+tar xzf wardyn-*-x86_64-unknown-linux-musl.tar.gz && cd wardyn-*/
+sha256sum -c ../wardyn-*.tar.gz.sha256        # verify what you downloaded
+./wardyn --dry-run --policy policy.yaml       # what will this policy do? (no root)
+```
+
+**Or build it** — and if you just want the toolchain without provisioning a VM,
+the repo ships a [dev container](./.devcontainer/README.md) (it builds and
+enforces egress; file/exec blocking needs a host booted with `lsm=...,bpf`):
+
 ```bash
 # 1. one-time: enable BPF LSM (adds `lsm=...,bpf` to the kernel cmdline) + reboot
 sudo ./scripts/enable-bpf-lsm.sh && sudo reboot
@@ -263,7 +277,9 @@ Full design, hook map, and the eBPF-verifier war stories are in
   & blocked execs (LSM).
 - [ ] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓,
   presets ✓, `--dry-run` policy checker ✓, portable policy tests on Linux/macOS/
-  Windows ✓)_
+  Windows ✓, dev container ✓, static musl release builds ✓)_ Next: the demo GIF
+  — the tapes are checked in ([`docs/RECORDING.md`](./docs/RECORDING.md)), the
+  recording needs a BPF-LSM kernel so the `⛔BLOCK` rows are real.
 - [ ] **M5 — Agent feedback:** the agent learns what was denied and why, instead
   of flailing at a bare `EPERM`. _(denial receipts ✓, approve-once exceptions
   from the TUI ✓, kernel-reported denials ✓)_ Next: persistent overrides kept

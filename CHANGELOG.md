@@ -84,6 +84,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Community & security infrastructure: `SECURITY.md`, `CONTRIBUTING.md`,
   `CODE_OF_CONDUCT.md`, issue/PR templates, Dependabot, and a `cargo-deny`
   supply-chain audit workflow.
+- **Release builds (`.github/workflows/release.yml`).** A `v*` tag builds a
+  statically linked `x86_64-unknown-linux-musl` binary, refuses to publish if
+  the tag disagrees with the workspace version, *runs the artifact* (`--help`
+  plus `--dry-run` over every shipped policy) before packaging it, and attaches
+  the tarball with a SHA-256 next to it. Static because wardyn runs as root on
+  whatever machine hosts the agent and a glibc binary built on the newest runner
+  will not start on an older one; the eBPF object is already compiled in, so the
+  download is one self-contained file. `workflow_dispatch` runs everything
+  except the publish, so the path can be exercised before a tag depends on it.
+- **Dev container (`.devcontainer/`).** The toolchain from `scripts/setup-vm.sh`
+  — Ubuntu 24.04, LLVM, the pinned nightly with `rust-src`, `bpf-linker`, `just`,
+  `shellcheck` — without provisioning a VM. It is privileged with seccomp
+  unconfined, because Docker's default profile blocks `bpf(2)` outright. On
+  start it reports which of the three enforcement axes the *host* kernel can
+  actually exercise: a container cannot turn on the BPF LSM (a kernel
+  command-line setting), so file/exec blocking is normally unavailable there and
+  now says so instead of surfacing as skipped e2e assertions an hour later.
+- Checked-in VHS tapes for the README demo (`docs/demo.tape` for the live TUI,
+  `docs/demo-plain.tape` for the `--plain` fallback).
 
 ### Changed
 
@@ -114,6 +133,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit log is opened for **append** instead of truncated on each run, so the
   security record survives across invocations.
 - README and roadmap updated to reflect completed IPv6 egress and UDP gating.
+- `scripts/setup-vm.sh` installs the toolchain `rust-toolchain.toml` pins
+  (via `rustup show` from the repo root) instead of a floating `nightly`. It was
+  downloading a second toolchain that nothing then built with, and reporting its
+  version as if it were the one in use — which defeats the point of pinning.
+  `bpf-linker` is installed `--locked`, as CI does.
+- ShellCheck (CI and `just lint`) also covers `.devcontainer/*.sh`.
 
 ### Fixed
 

@@ -16,15 +16,24 @@ fi
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"
 
-echo "== nightly + rust-src (eBPF crate is built with -Z build-std) =="
-rustup toolchain install nightly --component rust-src
+echo "== pinned nightly + rust-src (eBPF crate is built with -Z build-std) =="
+# Install the toolchain rust-toolchain.toml pins, not a floating `nightly`:
+# `rustup show` inside the repo reads that file and materialises exactly it,
+# with its rust-src component. Installing plain `nightly` here would download a
+# second toolchain that nothing then builds with — the BPF bytecode is a
+# function of the compiler, which is why the version is pinned at all.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+(cd "$REPO_ROOT" && rustup show)
 
 echo "== bpf-linker (links the eBPF object) =="
-cargo install bpf-linker
+# --locked, as CI does: the linker that produces the kernel-side artifact is
+# built from a fixed dependency graph rather than whatever resolves today.
+cargo install bpf-linker --locked
 
 echo
 echo "== versions =="
-rustc --version
-rustc +nightly --version
+# From the repo root, so this reports the pinned toolchain that will actually
+# build wardyn — not whatever rustup's global default happens to be.
+(cd "$REPO_ROOT" && rustc --version && cargo --version)
 bpf-linker --version || true
 echo "SETUP DONE"

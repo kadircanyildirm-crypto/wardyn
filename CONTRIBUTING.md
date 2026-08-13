@@ -33,6 +33,22 @@ cargo test                     # unit tests (no root needed)
 sudo ./target/debug/wardyn run -- bash    # smoke-test observation
 ```
 
+### Dev container
+
+[`.devcontainer/`](./.devcontainer/) builds the same toolchain in a container, so
+"open the repo, run `just build`" works without provisioning a VM. It runs
+privileged with seccomp unconfined, because Docker's default profile blocks
+`bpf(2)`.
+
+Know what it can and cannot prove: a container shares the **host's** kernel.
+Building, unit tests, `--dry-run` and (given cgroup v2) egress enforcement all
+work; **file/exec blocking does not**, because BPF LSM is a host boot-time
+setting — `lsm=...,bpf` — that nothing inside a container can turn on, and the VM
+kernels behind Docker Desktop on macOS/Windows lack it. `post-start.sh` prints
+which axes the host supports on every start. For a kernel-side change, the verdict
+still comes from `just e2e` on a machine booted with the BPF LSM enabled.
+See [`.devcontainer/README.md`](./.devcontainer/README.md).
+
 ### Working without a Linux box (or without `bpf-linker`)
 
 The policy engine and CLI live in `wardyn-policy`, deliberately free of
@@ -57,7 +73,7 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 # the eBPF crate builds for a different target, so a plain clippy never sees it
 cargo clippy --locked -p wardyn-ebpf --target bpfel-unknown-none -Zbuild-std=core -- -D warnings
-shellcheck scripts/*.sh tests/e2e/run.sh
+shellcheck scripts/*.sh tests/e2e/run.sh .devcontainer/*.sh
 cargo build --locked
 cargo test --locked
 ```

@@ -1,0 +1,184 @@
+# Cuts a release: builds the binary users are told to download, proves it runs,
+# and publishes it with checksums.
+#
+# Two entry points:
+#   * push a `v*` tag   -> build, verify, and publish a GitHub Release.
+#   * workflow_dispatch -> build and verify only; the tarball lands in the run's
+#     artifacts. Use this to exercise the whole path before tagging, because a
+#     release workflow that has never run is a release workflow that does not work.
+#
+# The artifact is a **statically linked musl binary**. Wardyn runs as root on
+# whatever machine hosts the agent, and a glibc binary built on the newest runner
+# refuses to start on anything older; a static binary has no such trapdoor. The
+# eBPF object is embedded in it (aya-build links it in at compile time), so this
+# single file is the whole tool.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    name: build + verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      pkg: ${{ steps.package.outputs.pkg }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The action installs *a* nightly; rust-toolchain.toml then pins the one
+      # cargo actually uses, because the BPF bytecode that ends up in the kernel
+      # is a function of the compiler and a release artifact is exactly where
+      # that must not drift. So the musl std is added with `rustup target add`
+      # from inside the repo (which resolves the pinned toolchain) rather than
+      # via the action's `targets:` input (which would install it for the wrong
+      # toolchain and fail the build with a confusing "can't find crate `std`").
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Add the musl target to the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustup show                       # installs the toolchain pinned in rust-toolchain.toml
+          rustup target add "$TARGET"
+          rustup show active-toolchain
+
+      - name: Install musl toolchain
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      # A tag that disagrees with Cargo.toml ships a binary whose version lies
+      # about which source built it. Refuse rather than publish that.
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | python3 -c '
+          import json, sys
+          pkgs = json.load(sys.stdin)["packages"]
+          print(next(p["version"] for p in pkgs if p["name"] == "wardyn"))
+          ')"
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ "$tag_version" != "$cargo_version" ]]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${cargo_version}"
+              exit 1
+            fi
+          fi
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+          echo "version: ${cargo_version}"
+
+      - name: Build (release, static musl)
+        run: cargo build --locked --release --target "$TARGET"
+
+      # Everything below runs the artifact itself. A release that was only
+      # compiled is a release nobody has started.
+      - name: Verify the binary is static and runs
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/wardyn"
+          file "$bin"
+          # Rust's musl target emits a static-PIE by default, which `file`
+          # describes as "static-pie linked" rather than "statically linked" —
+          # accept both, and treat anything else as dynamically linked.
+          if ! file "$bin" | grep -Eq 'statically linked|static-pie linked'; then
+            echo "::error::binary is not statically linked — it will not run on older hosts"
+            exit 1
+          fi
+          "$bin" --help > /dev/null
+          # --dry-run needs no root, no eBPF and no target, so it is the deepest
+          # check a runner can make: it loads and resolves every shipped policy.
+          for p in policy.yaml policies/strict.yaml policies/permissive.yaml; do
+            echo "── $p"
+            "$bin" --dry-run --policy "$p" > /dev/null
+          done
+          echo "verified: static, starts, and resolves every shipped policy"
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          pkg="wardyn-v${{ steps.version.outputs.version }}-${TARGET}"
+          mkdir -p "dist/$pkg"
+          cp "target/$TARGET/release/wardyn" "dist/$pkg/"
+          cp README.md LICENSE SECURITY.md CHANGELOG.md policy.yaml "dist/$pkg/"
+          cp -r policies "dist/$pkg/"
+          tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
+          (cd dist && sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256")
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.pkg }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.pkg }}
+          path: dist
+
+      - name: Write release notes
+        run: |
+          cat > /tmp/notes.md <<'NOTES'
+          See [CHANGELOG.md](CHANGELOG.md) for what changed.
+
+          **Install** — Linux x86_64, statically linked, no glibc requirement.
+          The eBPF object is embedded; this one file is the whole tool.
+
+          ```bash
+          tar xzf wardyn-*-x86_64-unknown-linux-musl.tar.gz
+          cd wardyn-*/
+          ./wardyn --dry-run --policy policy.yaml     # what will this policy do? (no root)
+          sudo ./wardyn --enforce run -- bash         # watch and block an agent's subtree
+          ```
+
+          Running it for real needs a kernel with BTF and cgroup v2, plus
+          `lsm=...,bpf` for file/exec blocking — see the README's Requirements.
+
+          Verify the download against the `.sha256` file published beside it:
+
+          ```bash
+          sha256sum -c wardyn-*.tar.gz.sha256
+          ```
+          NOTES
+
+      # `gh` ships on the runner and authenticates with the job's own token, so
+      # no third-party action sits in the path that signs off on what users download.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/notes.md \
+            dist/*.tar.gz dist/*.tar.gz.sha256
