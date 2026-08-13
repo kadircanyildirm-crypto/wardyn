@@ -32,7 +32,7 @@
 //! compiled at all.
 #![allow(dead_code)]
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
