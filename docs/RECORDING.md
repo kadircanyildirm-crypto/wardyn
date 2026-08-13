@@ -22,23 +22,37 @@ asciinema rec demo.cast -c 'sudo ./target/release/wardyn --enforce run -- bash s
 agg --font-size 22 --theme monokai demo.cast docs/wardyn-demo.gif
 ```
 
-## Option B — VHS (scripted, deterministic)
+## Option B — VHS (scripted, deterministic) — recommended
 
 [charmbracelet/vhs](https://github.com/charmbracelet/vhs) renders a GIF from a
-`.tape` script — reproducible, no manual timing. A starting `demo.tape`:
+`.tape` script — reproducible, no manual timing. Two ready-made tapes are
+checked in:
 
-```tape
-Output docs/wardyn-demo.gif
-Set FontSize 22
-Set Width 1200
-Set Height 700
-Type "sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh"
-Enter
-Sleep 10s
-```
+- [`demo.tape`](./demo.tape) — the live colored **TUI** (the hero GIF).
+- [`demo-plain.tape`](./demo-plain.tape) — `--plain` scrolling table; use it if
+  the full-screen TUI capture looks jittery in the GIF.
+
+Install VHS + ffmpeg, then **from the repo root, inside the VM** (after
+`cargo build --release`):
 
 ```bash
-vhs demo.tape
+# in the VM: install vhs (see charmbracelet/vhs releases) + ffmpeg
+sudo -v && vhs docs/demo.tape        # sudo -v caches creds so the tape's
+                                     # typed `sudo` never blocks on a prompt
 ```
 
-Keep the GIF under ~3 MB (trim length / palette) so it loads fast on the README.
+`sudo -v` primes sudo's credential cache (valid ~15 min) so recording is
+non-interactive. If it still prompts mid-tape, add a scoped NOPASSWD rule:
+
+```bash
+echo "$USER ALL=(root) NOPASSWD: $(pwd)/target/release/wardyn" \
+  | sudo tee /etc/sudoers.d/wardyn-demo
+```
+
+Each tape writes both `docs/wardyn-demo.gif` and `docs/wardyn-demo.mp4` (the mp4
+is far smaller — handy for Twitter/X). Keep the GIF under ~3 MB so it loads fast
+on the README; if it's over, shrink it losslessly:
+
+```bash
+gifsicle -O3 --colors 128 docs/wardyn-demo.gif -o docs/wardyn-demo.gif
+```
