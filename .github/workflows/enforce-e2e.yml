@@ -6,6 +6,13 @@
 # load/verifier path, and privilege drop are all exercised) but NOT BPF-LSM, so
 # the file/exec assertions self-skip. For full file/exec coverage, run this on a
 # self-hosted runner (or a VM) booted with `lsm=...,bpf` — see scripts/enable-bpf-lsm.sh.
+#
+# BE CLEAR ABOUT WHAT THAT SKIP COSTS: everything the LSM decides is unverified
+# here — the whole file and exec axis, the (dev, ino) identity rules, the access
+# mask, and the control run that proves identity is what closes the rename and
+# hard-link bypasses. A green tick on this workflow is NOT evidence that those
+# work. On Windows/macOS, `docs/WSL2.md` gets the full suite running locally with
+# 0 skipped; that is currently the cheapest way to check them before merging.
 name: Enforcement E2E
 
 # Every branch: this workflow is the only thing that loads the eBPF object into a
@@ -32,10 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
+      # `rustup show` materialises exactly the toolchain rust-toolchain.toml pins,
+      # with its components. build.rs hands that same channel to aya-build, so the
+      # bytecode this workflow loads is the bytecode the pin describes.
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show
 
       - uses: Swatinem/rust-cache@v2
 
@@ -45,7 +53,7 @@ jobs:
         run: cargo install bpf-linker --locked --version "$(cat BPF_LINKER_VERSION)"
 
       - name: Build (release — userspace + eBPF object)
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Show kernel / capability context
         run: |
@@ -62,7 +70,7 @@ jobs:
       - name: Verifier smoke (every program, load-only)
         run: |
           set -euo pipefail
-          bin="$(cargo test --release --test verifier_smoke --no-run --message-format=json \
+          bin="$(cargo test --locked --release --test verifier_smoke --no-run --message-format=json \
                  | jq -r 'select(.executable != null and .target.name == "verifier_smoke") | .executable')"
           test -n "$bin"
           sudo "$bin" --nocapture
