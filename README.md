@@ -52,9 +52,16 @@ For the process subtree you launch (`wardyn run -- <cmd>`, followed across `fork
 
 | Axis | Observe | Enforce (`--enforce`) | eBPF hook |
 |---|---|---|---|
-| **exec** — programs run | ✅ path + comm | ⛔ deny blocked binaries | `tracepoint/execve` + LSM `bprm_check_security` |
-| **file** — files opened | ✅ path | ⛔ deny secret reads (`.env`, `.ssh/*`) | `tracepoint/openat` + LSM `file_open` |
+| **exec** — programs run | ✅ path + comm | ⛔ deny blocked binaries, by name **or identity** | `tracepoint/execve` + LSM `bprm_check_security` |
+| **file** — files opened | ✅ path + access | ⛔ deny secret reads (`.env`, `.ssh/*`), by name **or identity**, and per read/write | `tracepoint/openat` + LSM `file_open` |
 | **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs (TCP + UDP, IPv4/IPv6) | `tracepoint/connect` + `cgroup/connect4·6` + `sendmsg4·6` |
+
+**Rules match names or identities.** A `match:` rule is a glob over the path —
+it covers files that do not exist yet, and it comes off with a single `mv`. A
+`path:` rule pins the object itself: wardyn resolves it to `(dev, ino)` when the
+policy loads, and the kernel keys on that. Renaming the file does not help, hard
+-linking it does not help, and copying it does not help either — a copy has to
+*read* the source, and the read is exactly what is denied.
 
 Every action is checked against a [`policy.yaml`](#policy) → `allow` / `warn` /
 `block`, shown live (coloured) and written to a JSONL audit log. Under
@@ -78,7 +85,10 @@ process on the host reaches it fine.
 ## Quickstart
 
 Wardyn needs Linux with **BTF**, **cgroup v2**, and — for file/exec blocking —
-**BPF LSM** enabled. On macOS/Windows, run it in a Linux VM.
+**BPF LSM** enabled. On macOS, run it in a Linux VM. **On Windows, use WSL2** —
+its kernel already ships BTF, cgroup v2 and `CONFIG_BPF_LSM=y`, and one line in
+`.wslconfig` turns the LSM on, so the full tool (file and exec blocking included)
+runs and is testable there. See [`docs/WSL2.md`](./docs/WSL2.md).
 
 **Prebuilt binary** (x86_64, statically linked — no toolchain, no glibc floor;
 the eBPF object is compiled into it, so this one file is the whole tool):
@@ -139,6 +149,11 @@ saying "first match wins" everywhere would be wrong:
 | `network` | **longest prefix wins** (the kernel uses an LPM trie) |
 | `files` / `exec` under `--enforce` | **no order** — the kernel holds a *set* of block keys, so an earlier `allow` does not exempt what a later `block` covers |
 
+A file or exec rule is written with **either** `match:` (a glob over names) or
+`path:` (one concrete object, pinned by identity) — never both. File rules also
+take `access: read | write | any` (default `any`), so a policy can protect a
+secret from being *read* without forbidding the tools that write it.
+
 `wardyn --dry-run` prints exactly which keys the kernel will hold, which rules are
 flagged but never denied, which enforce more broadly than written, and which
 `allow` rules the kernel's unordered set overrides. Unknown keys and unsupported
@@ -148,10 +163,18 @@ disable a whole rule class silently.
 ```yaml
 default_action: allow
 
-files:                                   # glob against the opened path (** spans dirs)
+files:
+  # `match:` — a glob over names. Covers files that do not exist yet.
   - { match: "**/.env",      action: block }   # any file named .env
   - { match: "**/.ssh/**",   action: block }   # anything under a dir named .ssh, at any depth
   - { match: "/etc/shadow",  action: block }
+  # `path:` — one object, pinned by (dev, ino) at load. `mv` and `ln` do not
+  # shake it off. `~` is the AGENT's home; a bare name is relative to where
+  # wardyn was launched. `wardyn --dry-run` prints what each one resolved to.
+  - { path:  "~/.ssh",       action: block }
+  - { path:  ".env",         action: block }
+  # `access:` narrows a rule to reads or writes (default: any).
+  - { match: "**/id_rsa",    action: block, access: read }
   - { match: "**",           action: allow }
 
 network:                                 # cidr, or domain (resolved at load)
@@ -259,15 +282,24 @@ Full design, hook map, and the eBPF-verifier war stories are in
 - Works from inside pid namespaces (containers, WSL2 distros): wardyn learns its
   kernel-view pid via an in-kernel handshake and says so when it differs.
 
-> The LSM file/exec matcher reads a few `dentry` fields by offset. Wardyn now
-> resolves those offsets **at runtime from the kernel's own BTF**
-> (`/sys/kernel/btf/vmlinux`) and passes them to the eBPF program, so it adapts to
-> the running kernel instead of being pinned to one layout; if BTF resolution
-> fails it falls back to the built-in kernel-6.8 offsets and says so. (True
-> CO-RE — compiler-emitted BTF relocations — is *not* available for the Rust BPF
-> target; this is a `rustc`/LLVM limitation, not an aya one, so runtime resolution
-> is the portable answer.) [`scripts/kernel-offsets.sh`](./scripts/kernel-offsets.sh)
-> remains a manual cross-check.
+> The LSM file/exec matcher reads a few `struct file`, `dentry` and `inode`
+> fields by offset. Wardyn resolves those offsets **at runtime from the kernel's
+> own BTF** (`/sys/kernel/btf/vmlinux`), so it adapts to the running kernel
+> instead of being pinned to one layout; if resolution fails it falls back to the
+> built-in kernel-6.8 offsets, **names the reason**, and demotes file/exec rows to
+> `block~` unless the running kernel really is 6.8. (True CO-RE — compiler-emitted
+> BTF relocations — is *not* available for the Rust BPF target; this is a
+> `rustc`/LLVM limitation, not an aya one, so runtime resolution is the portable
+> answer.) [`scripts/kernel-offsets.sh`](./scripts/kernel-offsets.sh) remains a
+> manual cross-check.
+>
+> The resolver descends into **anonymous** struct members, which is not a detail:
+> Linux 6.13 moved `f_path` inside an anonymous union in `struct file`, and a
+> resolver that only inspected direct members found nothing, fell back to the 6.8
+> offsets, read the wrong words, and failed open — with the feed still looking
+> healthy. Every kernel from 6.13 on was silently unenforced for files and execs
+> until this was fixed; `cargo test -p wardyn --bin wardyn btf::` now checks
+> resolution against the kernel the tests are running on.
 
 ## Roadmap
 
@@ -284,9 +316,13 @@ Full design, hook map, and the eBPF-verifier war stories are in
   of flailing at a bare `EPERM`. _(denial receipts ✓, approve-once exceptions
   from the TUI ✓, kernel-reported denials ✓)_ Next: persistent overrides kept
   outside the watched tree's reach.
-- [ ] **M6 — Match on identity, not names:** full-path (`bpf_d_path`) and
-  `(dev, ino)` keying, a read/write/create axis, and port/protocol in network
-  rules. Until then a rename or a copy defeats a file rule — see
+- [ ] **M6 — Match on identity, not names:** _(`(dev, ino)` keying for files,
+  directories and executables ✓, read/write axis ✓, offsets resolved from the
+  running kernel's BTF ✓, e2e proof that rename/hard-link/copy no longer defeat a
+  rule — including a control run showing they still do without it ✓)_ Next:
+  port/protocol in network rules, and a create/unlink axis. Copying a *blocked
+  binary* to a new name still runs it — a copy is a different object with a
+  different name, and unlike a secret there is no read to deny; see
   [`SECURITY.md`](./SECURITY.md).
 
 ## Contributing

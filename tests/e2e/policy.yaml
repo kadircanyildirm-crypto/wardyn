@@ -11,6 +11,15 @@ files:
   # Directory form: the LSM hook walks every ancestor, so this must cover a file
   # nested several levels below `.ssh`, not just its direct children.
   - { match: "**/.ssh/**", action: block }
+  # Identity rules (M6). `path:` pins the OBJECT — resolved to (dev, ino) when
+  # the policy loads — so renaming or hard-linking it does not shake the rule
+  # off. Written relatively, they resolve against the directory wardyn is
+  # launched in, i.e. the project the agent is working in.
+  - { path: ".env", action: block }
+  - { path: ".ssh", action: block }
+  # Access axis: this file may be appended to, but not read back. `block` used to
+  # mean "cannot be opened at all", which forbade both.
+  - { match: "**/writable.log", action: block, access: read }
   - { match: "**", action: allow }
 
 network:
@@ -21,4 +30,6 @@ network:
 
 exec:
   - { match: "**/nc", action: block }
+  # Same, for the executable: a renamed or hard-linked copy is the same inode.
+  - { path: "nc", action: block }
   - { match: "**", action: allow }

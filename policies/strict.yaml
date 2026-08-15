@@ -21,6 +21,26 @@ files:
   - { match: "**/.pypirc", action: block }
   - { match: "/etc/shadow", action: block }
   - { match: "**/.git/config", action: warn }
+
+  # Identity rules. Every `match:` rule above keys on a NAME, and a name comes
+  # off with one `mv`. These pin the same secrets by `(dev, ino)` — the object
+  # itself — so a rename or a hard link does not shake the rule off, and a copy
+  # cannot help either because copying means reading, and the read is denied.
+  #
+  # They resolve when the policy loads: `~` is the *agent's* home (not root's,
+  # even under sudo) and a bare name is relative to the directory wardyn is
+  # launched in. A path that does not exist is reported at startup and by
+  # `--dry-run`, and pins nothing — the `match:` rule above still covers it if
+  # it appears later. Run `wardyn --dry-run` from your project to see exactly
+  # which objects these landed on.
+  - { path: "~/.ssh", action: block }
+  - { path: "~/.aws", action: block }
+  - { path: "~/.kube", action: block }
+  - { path: "~/.docker", action: block }
+  - { path: "~/.netrc", action: block }
+  - { path: ".env", action: block }
+  - { path: "/etc/shadow", action: block }
+
   - { match: "**", action: allow }
 
 network:

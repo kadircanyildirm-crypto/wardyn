@@ -14,7 +14,7 @@
 //!   block keys: an `allow` rule listed before a `block` rule does **not** save
 //!   a path the block rule's key covers. [`Policy::shadowed_by_kernel`] finds
 //!   those rules so startup can say so out loud.
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
@@ -23,7 +23,9 @@ use anyhow::{Context as _, Result};
 use globset::{Glob, GlobMatcher};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use wardyn_common::NAME_LEN;
+use wardyn_common::{fmode, InodeKey, NAME_LEN};
+
+use crate::identity::{self, Anchor, AnchorBase, AnchorKind, ResolveOutcome, UnresolvedAnchor};
 
 /// The policy schema version this build understands.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -35,6 +37,50 @@ pub enum Action {
     Allow,
     Warn,
     Block,
+}
+
+/// Which access a file rule applies to.
+///
+/// `block` used to mean "this file cannot be opened at all", which also forbids
+/// *writing* it — so a policy could not say "the agent may create a `.env`, it
+/// just may not read one", and a rule meant to protect a secret also broke the
+/// tools that write it. The kernel has always known the difference (`f_mode`
+/// carries `FMODE_READ`/`FMODE_WRITE` at `file_open`); the policy simply had no
+/// way to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    /// Every open, whatever it asked for. The default, and exactly the
+    /// behaviour of a rule written before this axis existed.
+    #[default]
+    Any,
+    Read,
+    Write,
+}
+
+impl Access {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Access::Any => "any",
+            Access::Read => "read",
+            Access::Write => "write",
+        }
+    }
+
+    /// The mask stored beside a block key in the kernel maps; see
+    /// [`wardyn_common::fmode`].
+    pub fn mask(self) -> u8 {
+        match self {
+            Access::Any => fmode::MASK_ANY,
+            Access::Read => fmode::READ as u8,
+            Access::Write => fmode::WRITE as u8,
+        }
+    }
+
+    /// Does an open requesting `requested` (raw `f_mode` bits) match this rule?
+    pub fn matches(self, requested: u32) -> bool {
+        fmode::matches(self.mask(), requested)
+    }
 }
 
 impl Action {
@@ -85,6 +131,23 @@ pub enum DenialKey {
     /// cgroup connect/sendmsg: destination address (NET_RULES LPM trie).
     Net4(Ipv4Addr),
     Net6(Ipv6Addr),
+    /// LSM `file_open`: the opened object's own `(dev, ino)` matched
+    /// `BLOCK_INODES` — the rule found the file regardless of its current name.
+    FileInode {
+        dev: u32,
+        ino: u64,
+    },
+    /// LSM `file_open`: an ancestor directory's `(dev, ino)` matched
+    /// `BLOCK_DIR_INODES`.
+    DirInode {
+        dev: u32,
+        ino: u64,
+    },
+    /// LSM `bprm_check`: the executable's `(dev, ino)` matched.
+    ExecInode {
+        dev: u32,
+        ino: u64,
+    },
 }
 
 impl DenialKey {
@@ -100,8 +163,82 @@ impl DenialKey {
             DenialKey::Exec(n) => format!("executing ANY program named `{n}` (any path)"),
             DenialKey::Net4(ip) => format!("ALL egress to {ip} (any port/protocol)"),
             DenialKey::Net6(ip) => format!("ALL egress to [{ip}] (any port/protocol)"),
+            // An identity key is the one exception to "the honest scope is
+            // always broader": it names exactly one object. Saying so is the
+            // point — approving it is a far smaller decision than approving a
+            // name, and an operator should be able to see that.
+            DenialKey::FileInode { dev, ino } => {
+                format!(
+                    "opening ONE file — {} — under any name",
+                    dev_ino(*dev, *ino)
+                )
+            }
+            DenialKey::DirInode { dev, ino } => format!(
+                "opening ANY file under ONE directory — {} — under any name",
+                dev_ino(*dev, *ino)
+            ),
+            DenialKey::ExecInode { dev, ino } => format!(
+                "executing ONE program — {} — under any name",
+                dev_ino(*dev, *ino)
+            ),
         }
     }
+
+    /// The kernel-map identity this key addresses, if it is an identity key.
+    pub fn inode(&self) -> Option<InodeKey> {
+        match self {
+            DenialKey::FileInode { dev, ino }
+            | DenialKey::DirInode { dev, ino }
+            | DenialKey::ExecInode { dev, ino } => Some(InodeKey::new(*dev, *ino)),
+            _ => None,
+        }
+    }
+}
+
+/// A kernel name key with the access mask stored beside it — the exact shape of
+/// one `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_EXEC` entry.
+pub type NameEntry = ([u8; NAME_LEN], u8);
+
+/// The identity keys a policy compiles to, split by the kernel map each set
+/// goes into. Each entry is `(key, access mask)`.
+#[derive(Default, Debug)]
+pub struct InodeKeys {
+    pub files: Vec<(InodeKey, u8)>,
+    pub dirs: Vec<(InodeKey, u8)>,
+    pub execs: Vec<(InodeKey, u8)>,
+}
+
+impl InodeKeys {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.dirs.is_empty() && self.execs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len() + self.dirs.len() + self.execs.len()
+    }
+}
+
+/// "opening" / "reading" / "writing", for an access mask in a sentence.
+fn opening(mask: u8) -> &'static str {
+    match mask {
+        fmode::MASK_ANY => "opening",
+        m if m == fmode::READ as u8 => "READS of",
+        m if m == fmode::WRITE as u8 => "WRITES to",
+        _ => "reads or writes of",
+    }
+}
+
+/// Name → fixed-width kernel key, carrying the access mask.
+fn keyed(map: &BTreeMap<String, u8>) -> Vec<NameEntry> {
+    map.iter()
+        .filter_map(|(s, &mask)| name_key(s).map(|k| (k, mask)))
+        .collect()
+}
+
+/// `dev 8:1 ino 4242`, the form `stat` and `/proc/self/mountinfo` also speak.
+fn dev_ino(dev: u32, ino: u64) -> String {
+    let (maj, min) = crate::identity::split_dev(dev);
+    format!("dev {maj}:{min} ino {ino}")
 }
 
 impl fmt::Display for DenialKey {
@@ -112,6 +249,9 @@ impl fmt::Display for DenialKey {
             DenialKey::Exec(n) => write!(f, "exec={n}"),
             DenialKey::Net4(ip) => write!(f, "ip={ip}"),
             DenialKey::Net6(ip) => write!(f, "ip=[{ip}]"),
+            DenialKey::FileInode { dev, ino } => write!(f, "ino={}", dev_ino(*dev, *ino)),
+            DenialKey::DirInode { dev, ino } => write!(f, "dir-ino={}", dev_ino(*dev, *ino)),
+            DenialKey::ExecInode { dev, ino } => write!(f, "exec-ino={}", dev_ino(*dev, *ino)),
         }
     }
 }
@@ -159,12 +299,18 @@ struct RawPolicy {
     exec: Vec<PathRuleRaw>,
 }
 
+/// A file or exec rule. Exactly one of `match:` (a glob over names) and `path:`
+/// (a concrete object, pinned by identity) — they are different questions, and a
+/// rule that tried to be both would have to lie about one of them.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PathRuleRaw {
     #[serde(rename = "match")]
-    pattern: String,
+    pattern: Option<String>,
+    path: Option<String>,
     action: Action,
+    #[serde(default)]
+    access: Access,
 }
 
 #[derive(Deserialize)]
@@ -177,12 +323,54 @@ struct NetRuleRaw {
 
 // ── compiled policy ─────────────────────────────────────────────────────────
 
+/// How a compiled rule decides whether it covers a path.
+enum Matcher {
+    /// A `match:` glob, over the path as the syscall reported it.
+    Glob(GlobMatcher),
+    /// A `path:` rule, resolved to a concrete location. Compared exactly rather
+    /// than compiled to a glob, so a literal `[` or `*` in a filename means
+    /// itself.
+    ///
+    /// This is only the *userspace prediction*: the observed path can be
+    /// relative, or reach the object through a symlink, and then it will not
+    /// compare equal even though the kernel denies the open. The kernel's own
+    /// `DENY_FILE` event remains the authority — which is exactly why identity
+    /// rules are enforced by inode and not by this comparison.
+    Path {
+        exact: std::path::PathBuf,
+        subtree: bool,
+    },
+}
+
+impl Matcher {
+    fn is_match(&self, path: &str) -> bool {
+        match self {
+            Matcher::Glob(g) => g.is_match(path),
+            Matcher::Path { exact, subtree } => {
+                let p = Path::new(path);
+                p == exact || (*subtree && p.starts_with(exact))
+            }
+        }
+    }
+}
+
 struct PathRule {
     pattern: String,
-    matcher: GlobMatcher,
+    matcher: Matcher,
     action: Action,
-    /// `action == block` AND the pattern reduces to a kernel-enforceable key.
+    access: Access,
+    /// `action == block` AND the rule reduces to a kernel-enforceable key —
+    /// a basename/directory name, or a resolved `(dev, ino)`.
     enforceable: bool,
+}
+
+impl PathRule {
+    /// Whether this came from `match:`. The name-key analyses (over-broad keys,
+    /// kernel shadowing) only apply to globs — a `path:` rule has no basename
+    /// semantics to over-reach with.
+    fn is_glob(&self) -> bool {
+        matches!(self.matcher, Matcher::Glob(_))
+    }
 }
 
 enum NetMatch {
@@ -223,13 +411,21 @@ pub struct Policy {
     files: Vec<PathRule>,
     exec: Vec<PathRule>,
     network: Vec<NetRule>,
-    /// Mirror of the kernel's `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_EXEC` maps.
-    /// The LSM hook can only see dentry names, so these are what it *actually*
-    /// matches on — kept here so userspace can reproduce the kernel's verdict
-    /// instead of guessing from the glob.
-    kern_names: BTreeSet<String>,
-    kern_dirs: BTreeSet<String>,
-    kern_execs: BTreeSet<String>,
+    /// Mirror of the kernel's `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_EXEC` maps:
+    /// name → the access mask stored with it. The LSM hook can only see dentry
+    /// names, so these are what it *actually* matches on — kept here so
+    /// userspace can reproduce the kernel's verdict instead of guessing from the
+    /// glob.
+    kern_names: BTreeMap<String, u8>,
+    kern_dirs: BTreeMap<String, u8>,
+    kern_execs: BTreeMap<String, u8>,
+    /// Mirror of `BLOCK_INODES` / `BLOCK_DIR_INODES` / `BLOCK_EXEC_INODES`:
+    /// every `path:` rule that resolved to a real object.
+    anchors: Vec<Anchor>,
+    /// `path:` rules that resolved to nothing. They enforce nothing, and a
+    /// policy whose identity rules quietly evaporated is worse than one that
+    /// never had them — startup and `--dry-run` name every one.
+    unresolved_anchors: Vec<UnresolvedAnchor>,
     /// `domain:` rules that resolved to nothing at load time — they enforce
     /// nothing at all, so startup says so instead of leaving a silent hole.
     unresolved_domains: Vec<String>,
@@ -271,24 +467,26 @@ impl Policy {
 
     /// Load from an explicit path, else `./policy.yaml`, else the embedded default.
     pub fn load(path: Option<&Path>) -> Result<Policy> {
-        if let Some(p) = path {
-            let text = std::fs::read_to_string(p)
-                .with_context(|| format!("reading policy {}", p.display()))?;
-            return Policy::from_yaml_str(&text)
-                .with_context(|| format!("parsing {}", p.display()));
-        }
-        if let Ok(text) = std::fs::read_to_string("policy.yaml") {
-            return Policy::from_yaml_str(&text).context("parsing ./policy.yaml");
-        }
-        Policy::from_yaml_str(DEFAULT_POLICY).context("parsing embedded default policy")
+        Loader::new().load(path)
     }
 
     /// Parse with the system DNS resolver (what the binary uses).
     pub fn from_yaml_str(text: &str) -> Result<Policy> {
-        Policy::from_yaml_str_with(text, &system_resolver)
+        Loader::new().from_str(text)
     }
 
+    /// Parse with a custom DNS resolver and no identity resolution — the shape
+    /// most tests want.
     pub fn from_yaml_str_with(text: &str, resolve: Resolver<'_>) -> Result<Policy> {
+        Loader::offline().resolver(resolve).from_str(text)
+    }
+
+    fn compile(
+        text: &str,
+        resolve: Resolver<'_>,
+        stat: identity::Stat<'_>,
+        base: &AnchorBase,
+    ) -> Result<Policy> {
         let raw: RawPolicy = serde_yaml::from_str(text).context("invalid policy YAML")?;
         if let Some(v) = raw.version {
             if v != SCHEMA_VERSION {
@@ -299,33 +497,28 @@ impl Policy {
             }
         }
 
-        // `dir_capable` files support the `**/dir/**` parent-directory form; exec
-        // rules are basename-only.
-        let compile_paths = |rules: Vec<PathRuleRaw>, dir_capable: bool| -> Result<Vec<PathRule>> {
-            rules
-                .into_iter()
-                .map(|r| {
-                    let matcher = Glob::new(&r.pattern)
-                        .with_context(|| format!("bad glob `{}`", r.pattern))?
-                        .compile_matcher();
-                    let enforceable = r.action == Action::Block
-                        && if dir_capable {
-                            file_key(&r.pattern).is_some()
-                        } else {
-                            last_segment(&r.pattern).and_then(name_key).is_some()
-                        };
-                    Ok(PathRule {
-                        pattern: r.pattern,
-                        matcher,
-                        action: r.action,
-                        enforceable,
-                    })
-                })
-                .collect()
-        };
-
-        let files = compile_paths(raw.files, true)?;
-        let exec = compile_paths(raw.exec, false)?;
+        let mut anchors = Vec::new();
+        let mut unresolved_anchors = Vec::new();
+        let files = compile_rules(
+            raw.files,
+            true,
+            false,
+            base,
+            stat,
+            &mut anchors,
+            &mut unresolved_anchors,
+        )
+        .context("in `files:`")?;
+        let exec = compile_rules(
+            raw.exec,
+            false,
+            true,
+            base,
+            stat,
+            &mut anchors,
+            &mut unresolved_anchors,
+        )
+        .context("in `exec:`")?;
 
         // Network: cidr rules compile directly; domain rules resolve (best effort)
         // at load time, expanding to one Ip rule per resolved address, preserving
@@ -375,27 +568,34 @@ impl Policy {
         }
 
         // Compile the kernel-side matcher once, from the same rules, so the
-        // feed and the LSM hook can never drift apart.
-        let mut kern_names = BTreeSet::new();
-        let mut kern_dirs = BTreeSet::new();
+        // feed and the LSM hook can never drift apart. Only `match:` rules
+        // contribute names; a `path:` rule deliberately does not, because it
+        // means "this object", and turning it into a basename would silently
+        // widen it back into the thing it exists to replace.
+        let mut kern_names = BTreeMap::new();
+        let mut kern_dirs = BTreeMap::new();
         for r in &files {
-            if r.action != Action::Block {
+            if r.action != Action::Block || !matches!(r.matcher, Matcher::Glob(_)) {
                 continue;
             }
             if let Some((is_dir, seg)) = file_seg(&r.pattern) {
-                if is_dir {
-                    kern_dirs.insert(seg.to_string());
+                let target = if is_dir {
+                    &mut kern_dirs
                 } else {
-                    kern_names.insert(seg.to_string());
-                }
+                    &mut kern_names
+                };
+                merge_mask(target, seg, r.access.mask());
             }
         }
-        let kern_execs = exec
-            .iter()
-            .filter(|r| r.action == Action::Block)
-            .filter_map(|r| last_segment(&r.pattern).filter(|s| name_key(s).is_some()))
-            .map(str::to_string)
-            .collect();
+        let mut kern_execs = BTreeMap::new();
+        for r in &exec {
+            if r.action != Action::Block || !matches!(r.matcher, Matcher::Glob(_)) {
+                continue;
+            }
+            if let Some(seg) = last_segment(&r.pattern).filter(|s| name_key(s).is_some()) {
+                merge_mask(&mut kern_execs, seg, r.access.mask());
+            }
+        }
 
         Ok(Policy {
             fingerprint: crate::overrides::fingerprint(text),
@@ -406,6 +606,8 @@ impl Policy {
             kern_names,
             kern_dirs,
             kern_execs,
+            anchors,
+            unresolved_anchors,
             unresolved_domains,
         })
     }
@@ -469,11 +671,54 @@ impl Policy {
     /// (e.g. `.env`, `shadow`) and exact directory names (e.g. `.ssh`), the
     /// latter matched against every ancestor of the opened file.
     /// Patterns that can't reduce to a literal segment stay observe/warn only.
-    pub fn file_enforcement(&self) -> (Vec<[u8; NAME_LEN]>, Vec<[u8; NAME_LEN]>) {
-        let keys = |set: &BTreeSet<String>| -> Vec<[u8; NAME_LEN]> {
-            set.iter().filter_map(|s| name_key(s)).collect()
-        };
-        (keys(&self.kern_names), keys(&self.kern_dirs))
+    pub fn file_enforcement(&self) -> (Vec<NameEntry>, Vec<NameEntry>) {
+        (keyed(&self.kern_names), keyed(&self.kern_dirs))
+    }
+
+    /// Identity keys for `BLOCK_INODES` / `BLOCK_DIR_INODES` / `BLOCK_EXEC_INODES`,
+    /// each with the access mask stored beside it.
+    pub fn inode_enforcement(&self) -> InodeKeys {
+        let mut out = InodeKeys::default();
+        for a in &self.anchors {
+            let entry = (a.key, a.access_mask);
+            match (a.exec, a.kind) {
+                (true, _) => out.execs.push(entry),
+                (false, AnchorKind::Dir) => out.dirs.push(entry),
+                (false, AnchorKind::File) => out.files.push(entry),
+            }
+        }
+        out
+    }
+
+    /// Every resolved identity anchor, for `--dry-run` and startup reporting.
+    pub fn anchors(&self) -> &[Anchor] {
+        &self.anchors
+    }
+
+    /// Does any block rule narrow itself to reads or writes?
+    ///
+    /// Narrowing needs the kernel to read `file->f_mode`, which needs an offset
+    /// resolved from BTF. When that is unavailable the rule still fires — it
+    /// just covers every open, i.e. it is broader than written. Over-blocking is
+    /// the safe direction, but it is not what the policy says, so startup has to
+    /// be able to say so.
+    pub fn uses_access_narrowing(&self) -> bool {
+        self.files
+            .iter()
+            .any(|r| r.action == Action::Block && r.access != Access::Any)
+    }
+
+    /// `path:` block rules that resolved to nothing — they enforce nothing.
+    pub fn unresolved_anchors(&self) -> &[UnresolvedAnchor] {
+        &self.unresolved_anchors
+    }
+
+    /// The anchor a kernel identity denial refers to, so a `DENY_FILE` carrying
+    /// only `(dev, ino)` can be rendered as the path the operator wrote in the
+    /// policy — which is the whole story: *this* is the file you named, whatever
+    /// it is called now.
+    pub fn anchor_for(&self, key: &InodeKey) -> Option<&Anchor> {
+        self.anchors.iter().find(|a| a.key == *key)
     }
 
     /// The key the LSM `file_open` hook would deny `path` on, if any — the
@@ -487,15 +732,29 @@ impl Policy {
     /// always claimed. Consult this (not just the glob) before reporting a
     /// verdict, otherwise the feed says `ok` for an open the kernel actually
     /// turned into `-EPERM`.
-    pub fn kernel_file_denial(&self, path: &str) -> Option<DenialKey> {
+    ///
+    /// `requested` is the access the open asked for ([`fmode`] bits, derived
+    /// from the syscall's flags). A key whose rule only covers reads must not
+    /// predict a denial for a write-only open — the kernel would not have made
+    /// one, and a claimed denial that never happened is the failure mode this
+    /// whole mirror exists to avoid.
+    ///
+    /// Identity keys are deliberately absent here: this mirror only has the
+    /// path string, and the point of an identity rule is that the path string
+    /// is not what decides. Those denials arrive as kernel `DENY_FILE` events.
+    pub fn kernel_file_denial(&self, path: &str, requested: u32) -> Option<DenialKey> {
+        let hit = |m: &BTreeMap<String, u8>, k: &str| -> bool {
+            m.get(k)
+                .is_some_and(|&mask| fmode::matches(mask, requested))
+        };
         let mut segs = path.rsplit('/').filter(|s| !s.is_empty());
         let name = segs.next()?;
-        if self.kern_names.contains(name) {
+        if hit(&self.kern_names, name) {
             return Some(DenialKey::FileName(name.to_string()));
         }
         // Ancestors, nearest first, bounded exactly like the kernel walk.
         for dir in segs.take(MAX_DIR_WALK) {
-            if self.kern_dirs.contains(dir) {
+            if hit(&self.kern_dirs, dir) {
                 return Some(DenialKey::FileDir(dir.to_string()));
             }
         }
@@ -505,7 +764,7 @@ impl Policy {
     /// Same, for the LSM `bprm_check_security` hook (exec basenames).
     pub fn kernel_exec_denial(&self, path: &str) -> Option<DenialKey> {
         let name = last_segment(path)?;
-        if self.kern_execs.contains(name) {
+        if self.kern_execs.contains_key(name) {
             return Some(DenialKey::Exec(name.to_string()));
         }
         None
@@ -516,10 +775,12 @@ impl Policy {
     /// `**/dir/**` survive the reduction intact; anything more specific
     /// (`/etc/shadow`, `**/.aws/credentials`) loses its directory context and
     /// over-blocks. Startup prints these so the over-reach is never a surprise.
+    /// A `path:` rule is never over-broad — it names exactly one object — so
+    /// only glob rules are considered here and in [`Self::shadowed_by_kernel`].
     pub fn overbroad_block_keys(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for r in &self.files {
-            if r.action != Action::Block {
+            if r.action != Action::Block || !r.is_glob() {
                 continue;
             }
             if let Some((is_dir, seg)) = file_seg(&r.pattern) {
@@ -537,7 +798,7 @@ impl Policy {
             }
         }
         for r in &self.exec {
-            if r.action != Action::Block {
+            if r.action != Action::Block || !r.is_glob() {
                 continue;
             }
             if let Some(seg) = last_segment(&r.pattern) {
@@ -557,36 +818,38 @@ impl Policy {
     /// covers. Each entry is `(allow-rule pattern, the key that beats it)`.
     pub fn shadowed_by_kernel(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        let mut check = |rules: &[PathRule], names: &BTreeSet<String>, dirs: &BTreeSet<String>| {
-            for (i, r) in rules.iter().enumerate() {
-                if r.action == Action::Block {
-                    continue;
-                }
-                // Does a *later* block rule's key cover paths this rule matches?
-                let later_blocks = rules[i + 1..].iter().any(|b| b.action == Action::Block);
-                if !later_blocks {
-                    continue;
-                }
-                if let Some(seg) = last_segment(&r.pattern) {
-                    if names.contains(seg) {
-                        out.push((r.pattern.clone(), format!("name={seg}")));
+        let empty = BTreeMap::new();
+        let mut check =
+            |rules: &[PathRule], names: &BTreeMap<String, u8>, dirs: &BTreeMap<String, u8>| {
+                for (i, r) in rules.iter().enumerate() {
+                    if r.action == Action::Block || !r.is_glob() {
                         continue;
                     }
+                    // Does a *later* block rule's key cover paths this rule matches?
+                    let later_blocks = rules[i + 1..].iter().any(|b| b.action == Action::Block);
+                    if !later_blocks {
+                        continue;
+                    }
+                    if let Some(seg) = last_segment(&r.pattern) {
+                        if names.contains_key(seg) {
+                            out.push((r.pattern.clone(), format!("name={seg}")));
+                            continue;
+                        }
+                    }
+                    // Any literal segment of this pattern that is a blocked dir name
+                    // makes the whole subtree denied, wherever it appears.
+                    if let Some(seg) = r
+                        .pattern
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .find(|s| dirs.contains_key(*s))
+                    {
+                        out.push((r.pattern.clone(), format!("dir={seg}")));
+                    }
                 }
-                // Any literal segment of this pattern that is a blocked dir name
-                // makes the whole subtree denied, wherever it appears.
-                if let Some(seg) = r
-                    .pattern
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .find(|s| dirs.contains(*s))
-                {
-                    out.push((r.pattern.clone(), format!("dir={seg}")));
-                }
-            }
-        };
+            };
         check(&self.files, &self.kern_names, &self.kern_dirs);
-        check(&self.exec, &self.kern_execs, &BTreeSet::new());
+        check(&self.exec, &self.kern_execs, &empty);
         out
     }
 
@@ -669,23 +932,33 @@ impl Policy {
         let _ = writeln!(s, "policy: {}", self.summary());
 
         let _ = writeln!(s, "\nkernel-enforced under --enforce:");
-        for n in &self.kern_names {
+        for (n, &mask) in &self.kern_names {
             let _ = writeln!(
                 s,
-                "  file  name={n:<24} denies opening ANY file named `{n}`"
+                "  file  name={n:<24} denies {} ANY file named `{n}`",
+                opening(mask)
             );
         }
-        for d in &self.kern_dirs {
+        for (d, &mask) in &self.kern_dirs {
             let _ = writeln!(
                 s,
-                "  file  dir={d:<25} denies ANY file under a directory named `{d}` (any depth)"
+                "  file  dir={d:<25} denies {} ANY file under a directory named `{d}` (any depth)",
+                opening(mask)
             );
         }
-        for e in &self.kern_execs {
+        for e in self.kern_execs.keys() {
             let _ = writeln!(
                 s,
                 "  exec  name={e:<24} denies executing ANY program named `{e}`"
             );
+        }
+        // Identity keys, which is where the operator can see that a rule follows
+        // the object rather than the label — and see the exact object it landed
+        // on, so a mis-resolved `~` or a wrong working directory is visible here
+        // rather than after an incident.
+        for a in &self.anchors {
+            let axis = if a.exec { "exec" } else { "file" };
+            let _ = writeln!(s, "  {axis}  {:<29} {}", a.to_string(), a.blast_radius());
         }
         let blocked_nets: Vec<&str> = self
             .network
@@ -698,11 +971,26 @@ impl Policy {
         } else {
             let _ = writeln!(s, "  net   blocked: {}", blocked_nets.join(", "));
         }
-        if self.kern_names.is_empty() && self.kern_dirs.is_empty() && self.kern_execs.is_empty() {
+        if self.kern_names.is_empty()
+            && self.kern_dirs.is_empty()
+            && self.kern_execs.is_empty()
+            && self.anchors.is_empty()
+        {
             let _ = writeln!(
                 s,
-                "  file/exec: NOTHING is kernel-enforced (no block rule reduces to a name or dir)"
+                "  file/exec: NOTHING is kernel-enforced (no block rule reduces to a name, a dir, \
+                 or a resolved object)"
             );
+        }
+
+        if !self.unresolved_anchors.is_empty() {
+            let _ = writeln!(
+                s,
+                "\n`path:` rules that resolved to NOTHING (they enforce nothing):"
+            );
+            for u in &self.unresolved_anchors {
+                let _ = writeln!(s, "  {}  ->  {} — {}", u.rule, u.path.display(), u.reason);
+            }
         }
 
         // A name-form rule (`**/.aws`) denies opening the entry itself; it does
@@ -710,8 +998,8 @@ impl Policy {
         // write believing the opposite, so state it per rule rather than guess.
         let name_only: Vec<&String> = self
             .kern_names
-            .iter()
-            .filter(|n| !self.kern_dirs.contains(*n))
+            .keys()
+            .filter(|n| !self.kern_dirs.contains_key(*n))
             .collect();
         if !name_only.is_empty() {
             let _ = writeln!(
@@ -764,18 +1052,22 @@ impl Policy {
     /// Patterns of `block` file/exec rules that CANNOT be kernel-enforced (glob
     /// segments, or a name at/over the [`NAME_LEN`] key width). The feed flags
     /// these distinctly and startup warns about them.
+    /// Glob rules only: an unenforceable `path:` rule has a different cause (it
+    /// resolved to nothing) and its own report, and listing it here as well —
+    /// under a heading that explains it as a glob problem — would be two wrong
+    /// answers where one right one exists.
     pub fn observe_only_blocks(&self) -> Vec<String> {
         self.files
             .iter()
             .chain(&self.exec)
-            .filter(|r| r.action == Action::Block && !r.enforceable)
+            .filter(|r| r.action == Action::Block && !r.enforceable && r.is_glob())
             .map(|r| r.pattern.clone())
             .collect()
     }
 
     /// Exec block rules compiled to exact basenames for the LSM bprm_check matcher.
-    pub fn exec_enforcement(&self) -> Vec<[u8; NAME_LEN]> {
-        self.kern_execs.iter().filter_map(|s| name_key(s)).collect()
+    pub fn exec_enforcement(&self) -> Vec<NameEntry> {
+        keyed(&self.kern_execs)
     }
 
     pub fn eval_file(&self, path: &str) -> Verdict {
@@ -856,6 +1148,217 @@ fn eval_path(rules: &[PathRule], path: &str, default: Action) -> Verdict {
     }
 }
 
+/// Assemble a policy: where DNS comes from, where `stat` comes from, and what a
+/// relative or `~` path is relative to.
+///
+/// A struct rather than more `from_yaml_str_*` overloads because identity
+/// resolution needs three injectables, and every one of them touches the outside
+/// world — a test that could not replace them would depend on the machine it
+/// runs on.
+pub struct Loader<'a> {
+    resolve: Resolver<'a>,
+    stat: identity::Stat<'a>,
+    base: AnchorBase,
+}
+
+impl Default for Loader<'_> {
+    fn default() -> Self {
+        Loader::new()
+    }
+}
+
+impl<'a> Loader<'a> {
+    /// The real thing: system DNS, real `stat`, relative paths anchored at the
+    /// current working directory.
+    pub fn new() -> Self {
+        Loader {
+            resolve: &system_resolver,
+            stat: &identity::system_stat,
+            base: AnchorBase {
+                cwd: std::env::current_dir().ok(),
+                home: None,
+            },
+        }
+    }
+
+    /// Touches nothing outside the process: no DNS, no filesystem. What
+    /// `--dry-run` and the tests want.
+    pub fn offline() -> Self {
+        Loader {
+            resolve: &null_resolver,
+            stat: &identity::null_stat,
+            base: AnchorBase::default(),
+        }
+    }
+
+    pub fn resolver(mut self, r: Resolver<'a>) -> Self {
+        self.resolve = r;
+        self
+    }
+
+    pub fn stat(mut self, s: identity::Stat<'a>) -> Self {
+        self.stat = s;
+        self
+    }
+
+    pub fn base(mut self, b: AnchorBase) -> Self {
+        self.base = b;
+        self
+    }
+
+    pub fn from_str(&self, text: &str) -> Result<Policy> {
+        Policy::compile(text, self.resolve, self.stat, &self.base)
+    }
+
+    /// From an explicit path, else `./policy.yaml`, else the embedded default.
+    pub fn load(&self, path: Option<&Path>) -> Result<Policy> {
+        if let Some(p) = path {
+            let text = std::fs::read_to_string(p)
+                .with_context(|| format!("reading policy {}", p.display()))?;
+            return self
+                .from_str(&text)
+                .with_context(|| format!("parsing {}", p.display()));
+        }
+        if let Ok(text) = std::fs::read_to_string("policy.yaml") {
+            return self.from_str(&text).context("parsing ./policy.yaml");
+        }
+        self.from_str(DEFAULT_POLICY)
+            .context("parsing embedded default policy")
+    }
+}
+
+/// Compile one axis' rules. `dir_capable` files support the `**/dir/**`
+/// parent-directory form; exec rules are basename-only.
+#[allow(clippy::too_many_arguments)]
+fn compile_rules(
+    rules: Vec<PathRuleRaw>,
+    dir_capable: bool,
+    is_exec: bool,
+    base: &AnchorBase,
+    stat: identity::Stat<'_>,
+    anchors: &mut Vec<Anchor>,
+    unresolved: &mut Vec<UnresolvedAnchor>,
+) -> Result<Vec<PathRule>> {
+    let mut out = Vec::with_capacity(rules.len());
+    for r in rules {
+        let compiled = match (r.pattern, r.path) {
+            (Some(p), Some(q)) => anyhow::bail!(
+                "rule has both `match: {p}` and `path: {q}` — a glob describes names, a path \
+                 describes one object; pick one"
+            ),
+            (None, None) => {
+                anyhow::bail!("rule needs `match:` (a glob) or `path:` (one concrete object)")
+            }
+            (Some(pattern), None) => {
+                let glob = Glob::new(&pattern)
+                    .with_context(|| format!("bad glob `{pattern}`"))?
+                    .compile_matcher();
+                let enforceable = r.action == Action::Block
+                    && if dir_capable {
+                        file_key(&pattern).is_some()
+                    } else {
+                        last_segment(&pattern).and_then(name_key).is_some()
+                    };
+                PathRule {
+                    pattern,
+                    matcher: Matcher::Glob(glob),
+                    action: r.action,
+                    access: r.access,
+                    enforceable,
+                }
+            }
+            (None, Some(raw)) => {
+                let label = format!("path:{raw}");
+                let outcome = identity::resolve(&label, &raw, base, stat);
+                match outcome {
+                    // An exec rule names a program. Anchoring it to a directory
+                    // would put the inode in a map the bprm hook never consults,
+                    // which reads as "enforced" and is not.
+                    ResolveOutcome::Anchored(a) if is_exec && a.kind == AnchorKind::Dir => {
+                        if r.action == Action::Block {
+                            unresolved.push(UnresolvedAnchor {
+                                rule: label.clone(),
+                                path: a.path.clone(),
+                                reason: "is a directory; an `exec:` rule must name a program"
+                                    .into(),
+                            });
+                        }
+                        PathRule {
+                            pattern: label,
+                            matcher: Matcher::Path {
+                                exact: a.path,
+                                subtree: false,
+                            },
+                            action: r.action,
+                            access: r.access,
+                            enforceable: false,
+                        }
+                    }
+                    ResolveOutcome::Anchored(mut a) => {
+                        a.exec = is_exec;
+                        a.access_mask = r.access.mask();
+                        let subtree = a.kind == AnchorKind::Dir;
+                        let exact = a.path.clone();
+                        if r.action == Action::Block {
+                            anchors.push(a);
+                        }
+                        PathRule {
+                            pattern: label,
+                            matcher: Matcher::Path { exact, subtree },
+                            action: r.action,
+                            access: r.access,
+                            enforceable: r.action == Action::Block,
+                        }
+                    }
+                    ResolveOutcome::Unresolved(u) => {
+                        let exact = base
+                            .expand(&raw)
+                            .unwrap_or_else(|| std::path::PathBuf::from(&raw));
+                        if r.action == Action::Block {
+                            unresolved.push(u);
+                        }
+                        PathRule {
+                            pattern: label,
+                            matcher: Matcher::Path {
+                                exact,
+                                subtree: false,
+                            },
+                            action: r.action,
+                            access: r.access,
+                            enforceable: false,
+                        }
+                    }
+                }
+            }
+        };
+        out.push(compiled);
+    }
+    Ok(out)
+}
+
+/// Fold a rule's access mask into a kernel key set.
+///
+/// One key, one value: if two rules name the same basename with different
+/// access, the kernel map can only hold one mask. [`fmode::MASK_ANY`] is zero
+/// and means "every open", so it absorbs anything else; otherwise the masks are
+/// OR'd, which denies an open asking for either. Both directions widen rather
+/// than narrow — the alternative is a rule that silently stops applying because
+/// an unrelated rule was added next to it.
+fn merge_mask(map: &mut BTreeMap<String, u8>, key: &str, mask: u8) {
+    match map.get_mut(key) {
+        Some(existing) => {
+            *existing = if *existing == fmode::MASK_ANY || mask == fmode::MASK_ANY {
+                fmode::MASK_ANY
+            } else {
+                *existing | mask
+            };
+        }
+        None => {
+            map.insert(key.to_string(), mask);
+        }
+    }
+}
+
 /// Last non-empty `/`-separated segment of a glob pattern.
 fn last_segment(p: &str) -> Option<&str> {
     p.rsplit('/').find(|s| !s.is_empty())
@@ -902,6 +1405,7 @@ pub fn name_key(seg: &str) -> Option<[u8; NAME_LEN]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const P: &str = r#"
 version: 1
@@ -937,6 +1441,201 @@ exec:
         let mut k = [0u8; NAME_LEN];
         k[..s.len()].copy_from_slice(s.as_bytes());
         k
+    }
+
+    /// "Would the kernel deny *reading* this?" — the question every one of these
+    /// assertions is really asking, now that a rule can name an access.
+    fn denies_read(p: &Policy, path: &str) -> Option<DenialKey> {
+        p.kernel_file_denial(path, fmode::READ)
+    }
+
+    /// A filesystem for identity tests: `/proj/.env` and `/proj/nc` are files,
+    /// `/home/a/.ssh` is a directory, and nothing else exists.
+    fn fake_fs(p: &Path) -> Option<(u64, u64, bool)> {
+        match p.to_str()? {
+            "/proj/.env" => Some((0x801, 100, false)),
+            "/proj/nc" => Some((0x801, 101, false)),
+            "/home/a/.ssh" => Some((0x801, 200, true)),
+            _ => None,
+        }
+    }
+
+    fn identity_loader<'a>() -> Loader<'a> {
+        Loader::offline().stat(&fake_fs).base(AnchorBase {
+            cwd: Some(PathBuf::from("/proj")),
+            home: Some(PathBuf::from("/home/a")),
+        })
+    }
+
+    #[test]
+    fn path_rules_resolve_to_identity_keys() {
+        let p = identity_loader()
+            .from_str(
+                r#"
+files:
+  - { path: ".env",  action: block }
+  - { path: "~/.ssh", action: block }
+exec:
+  - { path: "nc", action: block }
+"#,
+            )
+            .expect("parses");
+
+        let keys = p.inode_enforcement();
+        assert_eq!(keys.files, vec![(InodeKey::new(0x0080_0001, 100), 0)]);
+        assert_eq!(keys.dirs, vec![(InodeKey::new(0x0080_0001, 200), 0)]);
+        assert_eq!(keys.execs, vec![(InodeKey::new(0x0080_0001, 101), 0)]);
+
+        // The whole claim: the rule is about the object, so it does NOT put a
+        // basename in the name maps where a rename could shake it off.
+        let (names, dirs) = p.file_enforcement();
+        assert!(names.is_empty(), "{names:?}");
+        assert!(dirs.is_empty(), "{dirs:?}");
+        assert!(p.exec_enforcement().is_empty());
+    }
+
+    /// A `path:` rule that resolves to nothing enforces nothing, and must say so
+    /// rather than look like coverage.
+    #[test]
+    fn unresolved_path_rules_are_reported_not_silently_dropped() {
+        let p = identity_loader()
+            .from_str("files:\n  - { path: \"nope.txt\", action: block }\n")
+            .expect("parses");
+        assert!(p.inode_enforcement().is_empty());
+        let u = p.unresolved_anchors();
+        assert_eq!(u.len(), 1);
+        assert!(u[0].reason.contains("does not exist"), "{:?}", u[0]);
+        assert!(
+            p.explain().contains("resolved to NOTHING"),
+            "{}",
+            p.explain()
+        );
+    }
+
+    #[test]
+    fn a_rule_must_be_either_a_glob_or_a_path_never_both_and_never_neither() {
+        let err = |yaml: &str| -> String {
+            match identity_loader().from_str(yaml) {
+                Ok(_) => panic!("expected a parse error for: {yaml}"),
+                Err(e) => format!("{e:?}"),
+            }
+        };
+        assert!(
+            err("files:\n  - { match: \"**/.env\", path: \".env\", action: block }\n")
+                .contains("pick one")
+        );
+        assert!(err("files:\n  - { action: block }\n").contains("needs `match:`"));
+    }
+
+    /// The access axis: a read-only rule must not claim a denial for an open
+    /// that only asked to write, because the kernel would not have made one.
+    #[test]
+    fn access_narrows_which_opens_a_key_denies() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/secret", action: block, access: read }
+  - { match: "**/logfile", action: block, access: write }
+"#,
+            )
+            .expect("parses");
+
+        assert!(p.kernel_file_denial("/x/secret", fmode::READ).is_some());
+        assert!(p.kernel_file_denial("/x/secret", fmode::WRITE).is_none());
+        assert!(p.kernel_file_denial("/x/logfile", fmode::WRITE).is_some());
+        assert!(p.kernel_file_denial("/x/logfile", fmode::READ).is_none());
+        // O_RDWR asks for both, so either rule fires.
+        let rw = fmode::READ | fmode::WRITE;
+        assert!(p.kernel_file_denial("/x/secret", rw).is_some());
+        assert!(p.kernel_file_denial("/x/logfile", rw).is_some());
+    }
+
+    /// A rule with no `access:` must behave exactly as it did before the axis
+    /// existed — including for an open that requests neither read nor write
+    /// (`O_PATH`), which a naive `READ|WRITE` mask would have stopped covering.
+    #[test]
+    fn omitting_access_still_means_every_open() {
+        let p = Loader::offline()
+            .from_str("files:\n  - { match: \"**/secret\", action: block }\n")
+            .expect("parses");
+        for requested in [fmode::READ, fmode::WRITE, fmode::READ | fmode::WRITE, 0] {
+            assert!(
+                p.kernel_file_denial("/x/secret", requested).is_some(),
+                "an unqualified block must cover fmode {requested}"
+            );
+        }
+    }
+
+    /// Two rules naming the same basename with different access collapse into
+    /// one kernel key, and the merge must widen — never silently drop one.
+    #[test]
+    fn masks_for_the_same_key_merge_by_widening() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/secret", action: block, access: read }
+  - { match: "/etc/secret", action: block, access: write }
+"#,
+            )
+            .expect("parses");
+        let (names, _) = p.file_enforcement();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].1, (fmode::READ | fmode::WRITE) as u8);
+    }
+
+    /// An `exec:` rule pointing at a directory can never be enforced — the
+    /// bprm hook never consults the directory map — so it must be reported
+    /// rather than counted as coverage.
+    #[test]
+    fn an_exec_path_rule_naming_a_directory_is_refused() {
+        let p = identity_loader()
+            .from_str("exec:\n  - { path: \"~/.ssh\", action: block }\n")
+            .expect("parses");
+        assert!(p.inode_enforcement().is_empty());
+        assert!(
+            p.unresolved_anchors()[0].reason.contains("directory"),
+            "{:?}",
+            p.unresolved_anchors()
+        );
+    }
+
+    /// An unresolved `path:` rule has its own report, with its own reason. It
+    /// must not ALSO appear under "no kernel key — glob segment, or name too
+    /// long", which is a different problem and a wrong explanation.
+    #[test]
+    fn an_unresolved_path_rule_is_reported_once_and_for_the_right_reason() {
+        let p = identity_loader()
+            .from_str(
+                "files:\n  - { path: \"nope.txt\", action: block }\n  \
+                 - { match: \"**/*.pem\", action: block }\n",
+            )
+            .expect("parses");
+        // The glob still belongs there — it genuinely reduces to no kernel key.
+        assert_eq!(p.observe_only_blocks(), vec!["**/*.pem".to_string()]);
+        let text = p.explain();
+        // Counted by LINE: the one legitimate report names both the rule and the
+        // path it expanded to, so the substring appears twice on it.
+        let lines = text.lines().filter(|l| l.contains("nope.txt")).count();
+        assert_eq!(
+            lines, 1,
+            "the unresolved path rule is reported twice:\n{text}"
+        );
+    }
+
+    /// `--dry-run` must show the object an identity rule landed on: a wrong
+    /// working directory or an unexpanded `~` is otherwise invisible until an
+    /// incident.
+    #[test]
+    fn explain_names_the_object_each_identity_rule_resolved_to() {
+        let p = identity_loader()
+            .from_str("files:\n  - { path: \".env\", action: block }\n")
+            .expect("parses");
+        let text = p.explain();
+        assert!(text.contains("/proj/.env"), "{text}");
+        assert!(text.contains("ino 100"), "{text}");
+        assert!(text.contains("ANY name"), "{text}");
     }
 
     #[test]
@@ -1028,14 +1727,21 @@ exec:
     fn file_enforcement_compiles_block_rules() {
         let p = policy();
         let (names, dirs) = p.file_enforcement();
-        assert!(names.contains(&key(".env"))); // **/.env
-        assert!(names.contains(&key("shadow"))); // /etc/shadow
-        assert!(dirs.contains(&key(".ssh"))); // **/.ssh/**
-        assert!(!names.contains(&key(".env.*"))); // glob segment -> not enforced
+        let has = |v: &[([u8; NAME_LEN], u8)], s: &str| v.iter().any(|(k, _)| *k == key(s));
+        assert!(has(&names, ".env")); // **/.env
+        assert!(has(&names, "shadow")); // /etc/shadow
+        assert!(has(&dirs, ".ssh")); // **/.ssh/**
+        assert!(!has(&names, ".env.*")); // glob segment -> not enforced
 
         let execs = p.exec_enforcement();
-        assert!(execs.contains(&key("nc"))); // **/nc block
-        assert!(!execs.contains(&key("curl"))); // curl is warn, not block
+        assert!(has(&execs, "nc")); // **/nc block
+        assert!(!has(&execs, "curl")); // curl is warn, not block
+
+        // Every key here is stored with MASK_ANY: none of these rules named an
+        // access, so they must behave exactly as they did before the axis existed.
+        for (_, mask) in names.iter().chain(&dirs).chain(&execs) {
+            assert_eq!(*mask, fmode::MASK_ANY);
+        }
     }
 
     #[test]
@@ -1072,17 +1778,17 @@ exec:
         // ANYWHERE, even where the glob-based eval says allow.
         assert_eq!(p.eval_file("/home/u/shadow").action, Action::Allow);
         assert_eq!(
-            p.kernel_file_denial("/home/u/shadow"),
+            denies_read(&p, "/home/u/shadow"),
             Some(DenialKey::FileName("shadow".into()))
         );
         // A file directly in `.ssh` IS denied by the kernel.
         assert_eq!(
-            p.kernel_file_denial("/home/u/.ssh/id_ed25519"),
+            denies_read(&p, "/home/u/.ssh/id_ed25519"),
             Some(DenialKey::FileDir(".ssh".into()))
         );
         // `.env.*` is a glob segment: never a kernel key, so never denied here.
-        assert_eq!(p.kernel_file_denial("/home/u/.env.local"), None);
-        assert_eq!(p.kernel_file_denial("/home/u/src/main.rs"), None);
+        assert_eq!(denies_read(&p, "/home/u/.env.local"), None);
+        assert_eq!(denies_read(&p, "/home/u/src/main.rs"), None);
     }
 
     #[test]
@@ -1095,7 +1801,7 @@ exec:
         );
         // ...and the kernel now agrees, because the hook walks every ancestor.
         assert_eq!(
-            p.kernel_file_denial("/home/u/.ssh/sub/deep/id"),
+            denies_read(&p, "/home/u/.ssh/sub/deep/id"),
             Some(DenialKey::FileDir(".ssh".into()))
         );
     }
@@ -1106,13 +1812,13 @@ exec:
         // `secret` sits MAX_DIR_WALK levels above the file: still caught.
         let just_inside = format!("/secret{}/f", "/d".repeat(MAX_DIR_WALK - 1));
         assert_eq!(
-            p.kernel_file_denial(&just_inside),
+            denies_read(&p, &just_inside),
             Some(DenialKey::FileDir("secret".into()))
         );
         // One level deeper than the kernel walks: not claimed, because the hook
         // would not have seen it either.
         let too_deep = format!("/secret{}/f", "/d".repeat(MAX_DIR_WALK));
-        assert_eq!(p.kernel_file_denial(&too_deep), None);
+        assert_eq!(denies_read(&p, &too_deep), None);
     }
 
     #[test]
@@ -1354,7 +2060,7 @@ files:
         ))
         .unwrap();
         assert!(p.observe_only_blocks().len() == 1);
-        assert_eq!(p.kernel_file_denial(&format!("/x/{long}")), None);
+        assert_eq!(denies_read(&p, &format!("/x/{long}")), None);
     }
 
     // ── the policies actually shipped ───────────────────────────────────────
@@ -1398,7 +2104,7 @@ files:
                     "{name} does not block {secret}"
                 );
                 assert!(
-                    p.kernel_file_denial(secret).is_some(),
+                    denies_read(&p, secret).is_some(),
                     "{name} blocks {secret} only in userspace — the kernel would allow it"
                 );
             }
@@ -1417,7 +2123,7 @@ files:
                 "/home/u/proj/Cargo.toml",
             ] {
                 assert_eq!(
-                    p.kernel_file_denial(ordinary),
+                    denies_read(&p, ordinary),
                     None,
                     "{name} would make the kernel deny {ordinary}"
                 );

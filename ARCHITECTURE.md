@@ -123,6 +123,34 @@ Matching order is **not** uniform, and the docs used to claim it was:
 are flagged-but-never-denied, which enforce more broadly than written, and which
 allow rules the kernel's unordered set overrides.
 
+### Names vs identity
+
+A file/exec rule is written with **one** of two keys, and they answer different
+questions:
+
+| Form | Kernel key | Covers | Defeated by |
+|---|---|---|---|
+| `match: "**/.env"` | basename / ancestor-dir name | files that do not exist yet, anywhere on the system | `mv`, `ln` |
+| `path: "~/.ssh"` | `(dev, ino)`, resolved at load | *that object*, under any later name | nothing that keeps the object; only replacing it |
+
+The two are complementary and additive — a policy with both loses nothing. The
+resolution happens once, in userspace, when the policy loads: wardyn `stat`s the
+path and converts glibc's 64-bit `st_dev` into the kernel's `s_dev` packing
+(`major << 20 | minor`), which is *not* the same number. Getting that wrong
+produces a key that matches nothing, silently, so the conversion is pinned by
+tests in both directions.
+
+Why identity is worth the machinery, when `cp` still produces a new inode: to
+copy a secret you must read it, and the read is precisely what is denied. The
+loop closes. It does not close for a *binary* — that is world-readable, so there
+is no read to deny — which is why copy-then-exec remains a documented limitation
+rather than a bug.
+
+`access: read | write | any` narrows a rule to what the open asked for. The mask
+lives beside the key in the kernel map; `any` is encoded as **zero**, not
+`READ|WRITE`, because an `O_PATH` open requests neither bit and the obvious
+encoding would have quietly narrowed every pre-existing rule.
+
 ## Crate layout
 
 ```
@@ -159,19 +187,37 @@ claiming to).
   The trie is **longest-prefix-match**, so the userspace feed evaluates network
   rules most-specific-first (not first-match) to report the same verdict the kernel
   enforces — a broad `block` CIDR before a narrow `allow` no longer disagree.
-- **File** — LSM `file_open` reads `file->f_path.dentry->d_name` (basename) and its
-  parent-dir name and returns `-EPERM` if either is in the `BLOCK_NAMES` /
-  `BLOCK_DIRS` set. Matching is **exact basename/dir**, not full-path glob (so it
-  stops accidental/naive access but is bypassable by renaming or hard-linking the
-  target — see `SECURITY.md`). Full-path matching via `bpf_d_path` is on the
-  roadmap. The `dentry`-field offsets are resolved **at runtime from the kernel's
-  BTF** (`/sys/kernel/btf/vmlinux`) and passed via `CONFIG`, falling back to the
-  built-in kernel-6.8 offsets if BTF resolution fails. (Compiler-emitted CO-RE
-  relocations are unavailable for the Rust BPF target — a `rustc`/LLVM limitation —
-  so userspace-side BTF resolution is the portable substitute.) `scripts/kernel-offsets.sh`
-  remains a manual cross-check.
-- **Exec** — LSM `bprm_check_security` applies the same basename match to
-  `linux_binprm->file` against `BLOCK_EXEC`.
+- **File** — LSM `file_open` checks, in this order:
+  1. **Identity.** `file->f_inode` → `(i_ino, i_sb->s_dev)` against `BLOCK_INODES`.
+     Checked first because it is the more specific statement: a file matched by
+     inode matches whatever it is currently called, and reporting the *name* rule
+     for it would tell the operator the wrong story.
+  2. **Basename.** `file->f_path.dentry->d_name` against `BLOCK_NAMES`.
+  3. **Ancestors.** Walking `d_parent` up to `MAX_DIR_WALK` levels, checking each
+     ancestor's inode against `BLOCK_DIR_INODES` and its name against `BLOCK_DIRS`
+     — so `mv .ssh dotssh` does not expose the subtree.
+
+  Each hit is gated on the access the open requested (`file->f_mode`) matching the
+  mask stored with the key. Every offset — `f_path.dentry`, `d_name.name`,
+  `d_parent`, `f_inode`, `f_mode`, `i_ino`, `i_sb`, `s_dev`, `d_inode` — is
+  resolved **at runtime from the kernel's BTF** (`/sys/kernel/btf/vmlinux`) and
+  passed via `CONFIG`, falling back to the built-in kernel-6.8 offsets (and saying
+  why) if resolution fails. The identity reads are additionally gated on
+  `CONFIG[identity_on]`, so an unresolved offset can never become a wild kernel
+  probe. (Compiler-emitted CO-RE relocations are unavailable for the Rust BPF
+  target — a `rustc`/LLVM limitation — so userspace-side BTF resolution is the
+  portable substitute.) `scripts/kernel-offsets.sh` remains a manual cross-check.
+
+  > The BTF walker must descend into **anonymous** members. Linux 6.13 moved
+  > `f_path` into an anonymous union inside `struct file`; a walker that only
+  > inspects direct members finds nothing, falls back to the 6.8 offsets, reads
+  > the wrong words, and fails open — with the feed still looking healthy. That
+  > was live on every kernel from 6.13 until it was fixed, and is now covered by
+  > a test that resolves against the kernel the tests are running on.
+
+- **Exec** — LSM `bprm_check_security` applies the same two-step to
+  `linux_binprm->file`: `BLOCK_EXEC_INODES` by identity, then `BLOCK_EXEC` by
+  basename.
 
 **Feed/kernel reconciliation.** The basename/dir reduction is coarser than the glob
 a rule was written as (`/etc/shadow` → deny any file named `shadow`; `**/.ssh/**`

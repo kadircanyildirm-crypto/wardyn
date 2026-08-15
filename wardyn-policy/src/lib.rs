@@ -8,9 +8,11 @@
 //! trapping them inside a Linux-only binary crate meant `cargo test` could not
 //! run on a contributor's macOS or Windows laptop at all.
 pub mod cli;
+pub mod identity;
 pub mod overrides;
 pub mod policy;
 
 pub use cli::{Mode, Opts, ParseOutcome};
+pub use identity::{Anchor, AnchorBase, AnchorKind};
 pub use overrides::{OverrideStore, DEFAULT_TTL_DAYS};
-pub use policy::{Action, DenialKey, Exceptions, Policy, Verdict};
+pub use policy::{Access, Action, DenialKey, Exceptions, Policy, Verdict};

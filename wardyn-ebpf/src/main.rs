@@ -28,7 +28,8 @@ use aya_ebpf::{
     programs::{LsmContext, SockAddrContext, TracePointContext},
 };
 use wardyn_common::{
-    action, kind, meta, stat, Event, Ip6Key, NameKey, COMM_LEN, MAX_DIR_WALK, NAME_LEN, PATH_LEN,
+    action, fmode, kind, meta, stat, Event, InodeKey, Ip6Key, NameKey, COMM_LEN, MAX_DIR_WALK,
+    NAME_LEN, PATH_LEN,
 };
 
 /// The kernel refuses GPL-only helpers (`bpf_probe_read_kernel`, which every
@@ -65,9 +66,12 @@ static WATCHED: HashMap<u32, u8> = HashMap::with_max_entries(65536, 0);
 /// instead — avoids the pthread_exit-from-leader escape), [8]/[9]/[10]/[11] LSM
 /// struct offsets (file→dentry, dentry→name, dentry→parent, binprm→file)
 /// resolved at runtime from BTF; 0 means "fall back to the built-in kernel-6.8
-/// constants".
+/// constants". [12]..[17] the identity offsets (file→inode, file→f_mode,
+/// inode→i_ino, inode→i_sb, super_block→s_dev, dentry→d_inode), and [18] the
+/// flag that says they are all trustworthy — no identity read happens unless it
+/// is set, so an unresolved offset can never turn into a wild kernel probe.
 #[map]
-static CONFIG: Array<u32> = Array::with_max_entries(16, 0);
+static CONFIG: Array<u32> = Array::with_max_entries(32, 0);
 
 /// Per-CPU counters; see [`stat`]. Per-CPU because a shared `Array` counter
 /// incremented from several CPUs loses exactly the events it is meant to count.
@@ -82,6 +86,11 @@ static NET_RULES: LpmTrie<u32, u32> = LpmTrie::with_max_entries(1024, 0);
 #[map]
 static NET_RULES6: LpmTrie<Ip6Key, u32> = LpmTrie::with_max_entries(1024, 0);
 
+// The three name maps and the three identity maps below all store an **access
+// mask** as their value (see `wardyn_common::fmode`), not a presence flag: 0
+// means "every open", and READ/WRITE narrow the key to opens that asked for
+// that access. A rule protecting a secret should not also forbid writing it.
+
 /// Blocked file basenames (e.g. `.env`, `shadow`) — exact match, NUL-padded.
 #[map]
 static BLOCK_NAMES: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
@@ -95,6 +104,31 @@ static BLOCK_DIRS: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 #[map]
 static BLOCK_EXEC: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 
+// ── identity maps (M6) ──────────────────────────────────────────────────────
+//
+// Keyed by `(dev, ino)` — the object, not its label. A name key is shaken off by
+// a single `mv`; an inode key is not, because nothing about the object changed.
+// Nor does a hard link help: two names, one inode, one key. And a copy is not an
+// escape either, because copying a file means reading it, and the read is what
+// gets denied.
+//
+// Only `path:` rules land here, and only when userspace could `stat` them at
+// load; the hooks consult these maps in addition to the name maps, never
+// instead, so a policy that gains identity rules loses no name coverage.
+
+/// Blocked file identities.
+#[map]
+static BLOCK_INODES: HashMap<InodeKey, u8> = HashMap::with_max_entries(1024, 0);
+
+/// Blocked directory identities — matched against every ancestor of the opened
+/// file, in the same bounded walk as `BLOCK_DIRS`.
+#[map]
+static BLOCK_DIR_INODES: HashMap<InodeKey, u8> = HashMap::with_max_entries(1024, 0);
+
+/// Blocked executable identities, consulted by `bprm_check_security`.
+#[map]
+static BLOCK_EXEC_INODES: HashMap<InodeKey, u8> = HashMap::with_max_entries(1024, 0);
+
 const CFG_WATCH_ALL: u32 = 0;
 const CFG_ENFORCE: u32 = 1;
 const CFG_NET_DEFAULT: u32 = 2;
@@ -106,6 +140,23 @@ const CFG_FILE_DENTRY_OFF: u32 = 8;
 const CFG_DENTRY_NAME_OFF: u32 = 9;
 const CFG_DENTRY_PARENT_OFF: u32 = 10;
 const CFG_BPRM_FILE_OFF: u32 = 11;
+const CFG_FILE_INODE_OFF: u32 = 12;
+const CFG_FILE_MODE_OFF: u32 = 13;
+const CFG_INODE_INO_OFF: u32 = 14;
+const CFG_INODE_SB_OFF: u32 = 15;
+const CFG_SB_DEV_OFF: u32 = 16;
+const CFG_DENTRY_INODE_OFF: u32 = 17;
+/// Set when userspace resolved the extended offsets (`f_mode`, `f_inode`,
+/// `i_ino`, `i_sb`, `s_dev`, `d_inode`) from BTF. Nothing below dereferences one
+/// unless it is set, so a kernel whose layout we could not read degrades to name
+/// matching instead of probing arbitrary addresses.
+const CFG_EXT_OFFSETS: u32 = 18;
+/// Set when the extended offsets are usable **and** the policy actually has
+/// identity keys. Separate from [`CFG_EXT_OFFSETS`] so a policy with no `path:`
+/// rules skips the inode reads entirely — three per open plus four per ancestor
+/// level is not free on the hot path — while `access:` narrowing, which only
+/// needs `f_mode`, keeps working.
+const CFG_IDENTITY_ON: u32 = 19;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
 // personality(persona) — persona is the 1st arg, same slot as execve's filename.
@@ -113,6 +164,9 @@ const PERSONALITY_ARG_OFFSET: usize = 16;
 // execveat(fd, filename, ...) — filename is the 2nd arg, so one slot further in.
 const EXECVEAT_FILENAME_OFFSET: usize = 24;
 const OPENAT_FILENAME_OFFSET: usize = 24;
+// openat(dfd, filename, flags, mode) — flags is the 3rd arg, one slot past the
+// filename. Same ABI-stable 16 + 8·n layout as every other syscall tracepoint.
+const OPENAT_FLAGS_OFFSET: usize = 32;
 const CONNECT_USERVADDR_OFFSET: usize = 24;
 // sendto(fd, buf, len, flags, dest_addr, addrlen) — dest_addr is the 5th arg.
 const SENDTO_UADDR_OFFSET: usize = 48;
@@ -200,13 +254,18 @@ fn in_scope(pid: u32) -> bool {
 
 #[tracepoint]
 pub fn wardyn_execve(ctx: TracePointContext) -> u32 {
-    let _ = emit_path_event(&ctx, kind::EXEC, EXECVE_FILENAME_OFFSET);
+    let _ = emit_path_event(&ctx, kind::EXEC, EXECVE_FILENAME_OFFSET, NO_FLAGS);
     0
 }
 
 #[tracepoint]
 pub fn wardyn_openat(ctx: TracePointContext) -> u32 {
-    let _ = emit_path_event(&ctx, kind::OPEN, OPENAT_FILENAME_OFFSET);
+    let _ = emit_path_event(
+        &ctx,
+        kind::OPEN,
+        OPENAT_FILENAME_OFFSET,
+        OPENAT_FLAGS_OFFSET,
+    );
     0
 }
 
@@ -215,22 +274,58 @@ pub fn wardyn_openat(ctx: TracePointContext) -> u32 {
 // never showed up in the feed. Same filename slot as openat (2nd syscall arg).
 #[tracepoint]
 pub fn wardyn_openat2(ctx: TracePointContext) -> u32 {
-    let _ = emit_path_event(&ctx, kind::OPEN, OPENAT_FILENAME_OFFSET);
+    // openat2 hides its flags inside a `struct open_how` behind a pointer, so
+    // the access is not readable from the argument slots. Reported as unknown,
+    // which makes userspace predict conservatively rather than guess.
+    let _ = emit_path_event(&ctx, kind::OPEN, OPENAT_FILENAME_OFFSET, NO_FLAGS);
     0
 }
 
 #[tracepoint]
 pub fn wardyn_execveat(ctx: TracePointContext) -> u32 {
-    let _ = emit_path_event(&ctx, kind::EXEC, EXECVEAT_FILENAME_OFFSET);
+    let _ = emit_path_event(&ctx, kind::EXEC, EXECVEAT_FILENAME_OFFSET, NO_FLAGS);
     0
 }
 
-fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -> Result<(), i64> {
+/// `flags_off` value meaning "this syscall's access mode is not readable here".
+const NO_FLAGS: usize = 0;
+
+/// The kernel's `OPEN_FMODE`: `O_RDONLY`/`O_WRONLY`/`O_RDWR` (0/1/2) become
+/// `FMODE_READ`/`FMODE_WRITE`/both, which is literally `(flags + 1) & O_ACCMODE`.
+/// Doing the same arithmetic here is what lets the feed's prediction agree with
+/// the `f_mode` the LSM hook will read.
+#[inline(always)]
+fn open_fmode(flags: u32) -> u32 {
+    (flags + 1) & 0b11
+}
+
+fn emit_path_event(
+    ctx: &TracePointContext,
+    ev_kind: u32,
+    filename_off: usize,
+    flags_off: usize,
+) -> Result<(), i64> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if !in_scope(pid) {
         return Ok(());
     }
     let filename = unsafe { ctx.read_at::<u64>(filename_off) }? as *const u8;
+    // The access the open asked for, so the feed's own verdict can honour a
+    // rule that only covers reads. Unknown (no flags slot, or an unreadable
+    // one) is reported as "both", the conservative direction: userspace then
+    // predicts as it did before rules could name an access.
+    let requested = if flags_off == NO_FLAGS {
+        if ev_kind == kind::OPEN {
+            fmode::READ | fmode::WRITE
+        } else {
+            0
+        }
+    } else {
+        match unsafe { ctx.read_at::<u64>(flags_off) } {
+            Ok(flags) => open_fmode(flags as u32),
+            Err(_) => fmode::READ | fmode::WRITE,
+        }
+    };
 
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
         bump(stat::RING_DROPS);
@@ -248,6 +343,9 @@ fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -
         (*e).daddr6 = [0u8; 16];
         (*e).dport = 0;
         (*e).family = 0;
+        (*e).dev = 0;
+        (*e).ino = 0;
+        (*e).fmode = requested;
         (*e).comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
         let dst = core::slice::from_raw_parts_mut((*e).path.as_mut_ptr(), PATH_LEN);
         (*e).path_len = match bpf_probe_read_user_str_bytes(filename, dst) {
@@ -323,6 +421,9 @@ fn emit_connect(ctx: &TracePointContext, uaddr_off: usize) -> Result<(), i64> {
         (*e).daddr6 = daddr6;
         (*e).dport = dport;
         (*e).family = family;
+        (*e).dev = 0;
+        (*e).ino = 0;
+        (*e).fmode = 0;
     }
     entry.submit(0);
     Ok(())
@@ -353,11 +454,59 @@ fn emit_deny_name(ev_kind: u32, key: &[u8; NAME_LEN], meta_val: u32) {
         (*e).daddr6 = [0u8; 16];
         (*e).dport = 0;
         (*e).family = 0;
+        (*e).dev = 0;
+        (*e).ino = 0;
+        (*e).fmode = 0;
         // Fixed-width copy, no data-dependent indexing: the key is already
         // NUL-padded and userspace stops at the NUL, and a constant-length
         // memcpy is what the verifier is happiest with.
         let dst = core::slice::from_raw_parts_mut((*e).path.as_mut_ptr(), PATH_LEN);
         dst[..NAME_LEN].copy_from_slice(key);
+        (*e).path_len = NAME_LEN as u32;
+    }
+    entry.submit(0);
+}
+
+/// Emit a `DENY_FILE`/`DENY_EXEC` for an **identity** match.
+///
+/// Carries the key that matched *and* the name the object has right now. Both
+/// halves matter: userspace maps the key back to the path the policy named, and
+/// the current name is what shows the operator that the rename did not work —
+/// `hidden.txt [ino:/home/me/.env]` reads as a story, `ino 4242` does not.
+#[inline(always)]
+fn emit_deny_ident(
+    ev_kind: u32,
+    dentry: *const u8,
+    name_off: usize,
+    key: &InodeKey,
+    meta_val: u32,
+) {
+    // Read the name BEFORE reserving, so a failed read cannot leak a ring entry.
+    let mut name = [0u8; NAME_LEN];
+    let _ = read_name(dentry, name_off, &mut name);
+
+    let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        bump(stat::RING_DROPS);
+        return;
+    };
+    let e = entry.as_mut_ptr();
+    unsafe {
+        (*e).kind = ev_kind;
+        (*e).action = action::BLOCK;
+        (*e).meta = meta_val;
+        (*e).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).ppid = 0;
+        (*e).uid = bpf_get_current_uid_gid() as u32;
+        (*e).comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
+        (*e).daddr = 0;
+        (*e).daddr6 = [0u8; 16];
+        (*e).dport = 0;
+        (*e).family = 0;
+        (*e).dev = key.dev;
+        (*e).ino = key.ino;
+        (*e).fmode = 0;
+        let dst = core::slice::from_raw_parts_mut((*e).path.as_mut_ptr(), PATH_LEN);
+        dst[..NAME_LEN].copy_from_slice(&name);
         (*e).path_len = NAME_LEN as u32;
     }
     entry.submit(0);
@@ -576,18 +725,49 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
 
     let name_off = off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF);
     let parent_off = off(CFG_DENTRY_PARENT_OFF, DENTRY_PARENT_OFF);
+    let ext = cfg(CFG_EXT_OFFSETS) != 0;
+    let identity = ext && cfg(CFG_IDENTITY_ON) != 0;
 
     // struct file* -> f_path.dentry
     let file: *const u8 = unsafe { ctx.arg(0) };
     let dentry = read_ptr(file, off(CFG_FILE_DENTRY_OFF, FILE_DENTRY_OFF))?;
 
+    // What did this open ask for? Only meaningful once `f_mode`'s offset is
+    // known; otherwise every mask matches, which is exactly how rules behaved
+    // before the access axis existed. Gated on `ext`, NOT on `identity`: a policy
+    // can use `access:` without a single `path:` rule, and tying the two would
+    // silently stop narrowing such a rule.
+    let requested = if ext {
+        read_u32(file, cfg(CFG_FILE_MODE_OFF) as usize).unwrap_or(ANY_ACCESS)
+    } else {
+        ANY_ACCESS
+    };
+
+    // Identity first: it is the more specific statement. A file that matches by
+    // inode matches whatever it is currently called, and reporting the *name*
+    // rule for it would tell the operator the wrong story.
+    if identity {
+        if let Ok(key) = inode_key_of_file(file) {
+            if let Some(&mask) = unsafe { BLOCK_INODES.get(&key) } {
+                if access_matches(mask, requested) {
+                    bump(stat::DENIED_FILE);
+                    bump(stat::DENIED_IDENTITY);
+                    emit_deny_ident(kind::DENY_FILE, dentry, name_off, &key, meta::KEY_INO);
+                    return Ok(EPERM);
+                }
+            }
+        }
+    }
+
     // basename: dentry->d_name.name
     let mut name = [0u8; NAME_LEN];
     read_name(dentry, name_off, &mut name)?;
-    if unsafe { BLOCK_NAMES.get(&NameKey(name)).is_some() } {
-        bump(stat::DENIED_FILE);
-        emit_deny_name(kind::DENY_FILE, &name, meta::KEY_NAME);
-        return Ok(EPERM);
+    if let Some(&mask) = unsafe { BLOCK_NAMES.get(&NameKey(name)) } {
+        if access_matches(mask, requested) {
+            bump(stat::DENIED_FILE);
+            emit_deny_name(kind::DENY_FILE, &name, meta::KEY_NAME);
+            return Ok(EPERM);
+        }
     }
 
     // Ancestor directories: dentry->d_parent->...->d_name.name. Walking the whole
@@ -603,19 +783,81 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         if parent.is_null() || parent == cur {
             break;
         }
+        // The ancestor's identity, for a `path:` rule naming a directory: this is
+        // what keeps `mv .ssh dotssh` from exposing the subtree.
+        if identity {
+            if let Ok(key) = inode_key_of_dentry(parent) {
+                if let Some(&mask) = unsafe { BLOCK_DIR_INODES.get(&key) } {
+                    if access_matches(mask, requested) {
+                        bump(stat::DENIED_FILE);
+                        bump(stat::DENIED_IDENTITY);
+                        emit_deny_ident(kind::DENY_FILE, parent, name_off, &key, meta::KEY_DIR_INO);
+                        return Ok(EPERM);
+                    }
+                }
+            }
+        }
         let mut dir = [0u8; NAME_LEN];
         if read_name(parent, name_off, &mut dir).is_err() {
             break;
         }
-        if unsafe { BLOCK_DIRS.get(&NameKey(dir)).is_some() } {
-            bump(stat::DENIED_FILE);
-            emit_deny_name(kind::DENY_FILE, &dir, meta::KEY_DIR);
-            return Ok(EPERM);
+        if let Some(&mask) = unsafe { BLOCK_DIRS.get(&NameKey(dir)) } {
+            if access_matches(mask, requested) {
+                bump(stat::DENIED_FILE);
+                emit_deny_name(kind::DENY_FILE, &dir, meta::KEY_DIR);
+                return Ok(EPERM);
+            }
         }
         cur = parent;
     }
 
     Ok(OK)
+}
+
+/// Every access a rule can name. Used when the hook could not read `f_mode`, so
+/// an unresolved offset never turns a rule OFF — it just stops narrowing it.
+const ANY_ACCESS: u32 = fmode::READ | fmode::WRITE;
+
+/// Does a key stored with `mask` cover an open that asked for `requested`?
+#[inline(always)]
+fn access_matches(mask: u8, requested: u32) -> bool {
+    fmode::matches(mask, requested)
+}
+
+/// `(dev, ino)` of the object a `struct file` refers to.
+#[inline(always)]
+fn inode_key_of_file(file: *const u8) -> Result<InodeKey, i64> {
+    let inode = read_ptr(file, cfg(CFG_FILE_INODE_OFF) as usize)?;
+    inode_key(inode)
+}
+
+/// Same, reached through a dentry (used for ancestor directories).
+#[inline(always)]
+fn inode_key_of_dentry(dentry: *const u8) -> Result<InodeKey, i64> {
+    let inode = read_ptr(dentry, cfg(CFG_DENTRY_INODE_OFF) as usize)?;
+    inode_key(inode)
+}
+
+/// `inode->i_ino` plus `inode->i_sb->s_dev`. The device matters: inode numbers
+/// are only unique within a filesystem, and without it a rule pinning
+/// `/home/agent/.env` would also deny an unrelated file that happens to have the
+/// same inode number on another mount.
+#[inline(always)]
+fn inode_key(inode: *const u8) -> Result<InodeKey, i64> {
+    if inode.is_null() {
+        return Err(0);
+    }
+    let ino: u64 = unsafe {
+        bpf_probe_read_kernel(inode.wrapping_add(cfg(CFG_INODE_INO_OFF) as usize) as *const u64)
+    }?;
+    let sb = read_ptr(inode, cfg(CFG_INODE_SB_OFF) as usize)?;
+    let dev = read_u32(sb, cfg(CFG_SB_DEV_OFF) as usize)?;
+    Ok(InodeKey { dev, _pad: 0, ino })
+}
+
+#[inline(always)]
+fn read_u32(base: *const u8, off: usize) -> Result<u32, i64> {
+    unsafe { bpf_probe_read_kernel(base.wrapping_add(off) as *const u32) }
 }
 
 #[inline(always)]
@@ -658,8 +900,22 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     let bprm: *const u8 = unsafe { ctx.arg(0) };
     let file = read_ptr(bprm, off(CFG_BPRM_FILE_OFF, BPRM_FILE_OFF))?;
     let dentry = read_ptr(file, off(CFG_FILE_DENTRY_OFF, FILE_DENTRY_OFF))?;
+    let name_off = off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF);
+
+    // Identity first — renaming a blocked binary is the cheapest bypass there is.
+    if cfg(CFG_EXT_OFFSETS) != 0 && cfg(CFG_IDENTITY_ON) != 0 {
+        if let Ok(key) = inode_key_of_file(file) {
+            if unsafe { BLOCK_EXEC_INODES.get(&key).is_some() } {
+                bump(stat::DENIED_EXEC);
+                bump(stat::DENIED_IDENTITY);
+                emit_deny_ident(kind::DENY_EXEC, dentry, name_off, &key, meta::KEY_INO);
+                return Ok(EPERM);
+            }
+        }
+    }
+
     let mut name = [0u8; NAME_LEN];
-    read_name(dentry, off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF), &mut name)?;
+    read_name(dentry, name_off, &mut name)?;
     if unsafe { BLOCK_EXEC.get(&NameKey(name)).is_some() } {
         bump(stat::DENIED_EXEC);
         emit_deny_name(kind::DENY_EXEC, &name, meta::KEY_NAME);

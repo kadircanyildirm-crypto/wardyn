@@ -7,7 +7,17 @@ version: 1
 default_action: allow
 
 # ── File access ────────────────────────────────────────────────
-# `match` is a glob (** spans directories) against the absolute path opened.
+# Two forms, answering two different questions:
+#
+#   match:  a glob over the path's NAMES (** spans directories). Covers files
+#           that do not exist yet — but a name comes off with one `mv`.
+#   path:   one concrete object, pinned by `(dev, ino)` when the policy loads.
+#           Survives rename and hard-link; cannot cover what is not there yet.
+#           `~` is the agent's home; a bare name is relative to where wardyn was
+#           launched. `wardyn --dry-run` prints exactly which objects it found.
+#
+# They complement each other, so use both for anything that matters. See
+# policies/strict.yaml for a fuller identity-pinned set.
 files:
   - { match: "**/.env", action: block }
   - { match: "**/.env.*", action: block }
@@ -15,6 +25,9 @@ files:
   - { match: "**/.aws/credentials", action: block }
   - { match: "**/.config/gcloud/**", action: block }
   - { match: "/etc/shadow", action: block }
+  # The same secrets, pinned by identity rather than by name.
+  - { path: "~/.ssh", action: block }
+  - { path: "/etc/shadow", action: block }
   - { match: "**/.npmrc", action: warn }
   - { match: "**/.git/config", action: warn }
   - { match: "**", action: allow } # everything else: reading is fine

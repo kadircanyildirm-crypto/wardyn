@@ -63,9 +63,15 @@ Out of scope (known limitations, documented, not vulnerabilities):
   basename or parent-directory name, and default-deny on files/exec, are flagged
   in the feed but **not** kernel-enforced. The feed labels these honestly
   (`block~`).
-- **Kernel-offset drift.** File/exec enforcement reads `dentry` fields at offsets
-  derived for a specific kernel. On a mismatched kernel these reads may silently
-  fail; Wardyn warns at startup. Regenerate with `scripts/kernel-offsets.sh`.
+- **Kernel-offset drift.** File/exec enforcement reads `struct file`, `dentry` and
+  `inode` fields by byte offset. Wardyn resolves them from the running kernel's
+  BTF, including through anonymous members (Linux 6.13 moved `f_path` into an
+  anonymous union — a resolver that missed that failed open on every kernel since,
+  which is why the resolution is now tested against the kernel the tests run on).
+  If resolution fails, Wardyn falls back to built-in kernel-6.8 offsets, names the
+  reason at startup, and stops predicting `BLOCK` for file/exec rows unless the
+  running kernel really is 6.8. `scripts/kernel-offsets.sh` is a manual
+  cross-check.
 - **Requires privilege you already granted.** Wardyn needs root to load eBPF; it
   does not defend against an attacker who is already root outside the watched
   subtree. To keep the watched subtree from being that attacker, `run` now drops
@@ -74,14 +80,33 @@ Out of scope (known limitations, documented, not vulnerabilities):
   choose the target identity. A child kept at root can still reach the enforcement
   maps and disable itself — do not run untrusted agents with `--keep-root`.
 
-- **Name-based file/exec matching is content-blind.** The LSM matcher keys on a
-  file's basename and on the names of its ancestor directories (a bounded walk, so
-  a `**/dir/**` rule does cover the whole subtree). It stops *accidental and naive*
-  access but is **bypassable** by renaming or hard-linking the target before
-  opening it (`mv`/`link()` are not hooked) or by copying a blocked binary to a new
-  name. Treat it as a guard against mistakes, not a defence against deliberate
-  exfiltration. Full-path matching (`bpf_d_path`) and `(dev, ino)` keying are on the
-  roadmap.
+- **`match:` rules are name-based, and a name comes off with one `mv`.** The LSM
+  matcher keys a glob rule on the file's basename and on the names of its ancestor
+  directories (a bounded walk, so a `**/dir/**` rule does cover the whole subtree).
+  That stops *accidental and naive* access, and is **bypassable** by renaming or
+  hard-linking the target before opening it — `mv` and `link()` are not hooked.
+  Write a `path:` rule alongside it for anything that matters: those are pinned to
+  `(dev, ino)` at load and follow the object through renames and hard links.
+
+- **What identity matching still does not cover.**
+  - **Objects that do not exist when the policy loads** cannot be pinned. A `path:`
+    rule for a file created later resolves to nothing and says so at startup and
+    in `--dry-run`; only the `match:` rule covers it. Keep both.
+  - **Copying a blocked *binary*** to a new name still runs it: the copy is a
+    different inode with a different name, and — unlike a secret — a binary is
+    world-readable, so there is no read to deny. Closing this needs content or
+    provenance matching, not identity. The e2e suite pins this as a known limit,
+    so it cannot quietly start being claimed as fixed.
+  - **Copying a blocked *secret*** is not a bypass: `cp` has to read the source,
+    and that read is denied. This is asserted end-to-end.
+  - **Filesystems that report a different `(dev, ino)` to userspace than the
+    inode carries** — overlayfs without `xino`, most visibly inside containers —
+    can make an anchor fail to match. It fails *open*, degrading to the name rule,
+    and never denies the wrong object: the key simply matches nothing.
+
+- **Rules are matched, not the intent behind them.** `access: read` narrows a rule
+  to opens requesting `FMODE_READ`. An `O_PATH` open requests neither read nor
+  write and is covered only by a rule with no `access:` (the default).
 
 - **Rule *order* does not survive into the kernel.** Under `--enforce` the LSM hook
   holds an unordered set of block keys, so an `allow` rule listed before a `block`

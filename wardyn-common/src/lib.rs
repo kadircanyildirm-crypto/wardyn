@@ -20,6 +20,34 @@ pub const NAME_LEN: usize = 40;
 #[derive(Clone, Copy)]
 pub struct NameKey(pub [u8; NAME_LEN]);
 
+/// The identity of a filesystem object: `(dev, ino)` — the pair `stat(2)`
+/// returns and the kernel keeps on the inode itself.
+///
+/// This is what a *name* is not. A name rule (`**/.env`) describes a label that
+/// `mv` detaches in one syscall; an inode rule describes the object, and follows
+/// it through renames and hard links because there is nothing to follow — the
+/// object never moved. Copying is not an escape either: `cp` has to *read* the
+/// source first, and that read is the thing being denied.
+///
+/// `dev` is the kernel's own `super_block->s_dev` encoding (`major << 20 |
+/// minor`), NOT glibc's 64-bit `dev_t`. Userspace converts when it stats a path
+/// — see `wardyn_policy::identity::kernel_dev`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct InodeKey {
+    pub dev: u32,
+    /// Explicit, so the 8-byte alignment of `ino` is not silently satisfied by
+    /// compiler padding that the two sides could disagree about.
+    pub _pad: u32,
+    pub ino: u64,
+}
+
+impl InodeKey {
+    pub const fn new(dev: u32, ino: u64) -> Self {
+        InodeKey { dev, _pad: 0, ino }
+    }
+}
+
 /// What kind of syscall/LSM event this is.
 ///
 /// `EXEC` / `OPEN` / `CONNECT` are *observations*: a syscall entered the kernel.
@@ -48,6 +76,41 @@ pub mod meta {
     pub const KEY_NAME: u32 = 0;
     /// `DENY_FILE`: an ancestor directory matched `BLOCK_DIRS`.
     pub const KEY_DIR: u32 = 1;
+    /// `DENY_FILE`/`DENY_EXEC`: the object's own `(dev, ino)` matched
+    /// `BLOCK_INODES`. `Event::dev`/`ino` carry the key; `path` still carries
+    /// the basename the file has *right now*, which is the interesting part —
+    /// it is how the operator sees that a rename did not help.
+    pub const KEY_INO: u32 = 2;
+    /// `DENY_FILE`: an ancestor directory's `(dev, ino)` matched
+    /// `BLOCK_DIR_INODES` — the directory rule survived the directory being
+    /// renamed.
+    pub const KEY_DIR_INO: u32 = 3;
+}
+
+/// Bits of [`Event::fmode`], mirroring the kernel's `FMODE_*`. Only the two that
+/// a policy can express are carried across.
+///
+/// The distinction matters because `block` on a secret used to mean "cannot be
+/// opened at all", which also forbids *writing* it — so a policy could not say
+/// "the agent may create `.env`, it just may not read one".
+pub mod fmode {
+    /// The open requested read access (kernel `FMODE_READ`).
+    pub const READ: u32 = 0x1;
+    /// The open requested write access (kernel `FMODE_WRITE`).
+    pub const WRITE: u32 = 0x2;
+    /// The mask stored with a block key that does not care which access was
+    /// requested: **zero**, meaning "every open matches".
+    ///
+    /// Not `READ | WRITE`, which looks equivalent and is not: an `O_PATH` open
+    /// sets neither bit, so a `READ|WRITE` mask would silently stop covering it
+    /// and a rule written today would get weaker than the same rule before the
+    /// access axis existed. Zero preserves the old behaviour exactly.
+    pub const MASK_ANY: u8 = 0;
+
+    /// Does an open requesting `requested` match a key stored with `mask`?
+    pub const fn matches(mask: u8, requested: u32) -> bool {
+        mask == MASK_ANY || (requested & mask as u32) != 0
+    }
 }
 
 /// Slots of the per-CPU `STATS` map. Counters the kernel keeps and userspace
@@ -65,8 +128,14 @@ pub mod stat {
     pub const DENIED_EXEC: u32 = 3;
     /// Destinations refused by the cgroup `connect*`/`sendmsg*` hooks.
     pub const DENIED_NET: u32 = 4;
+    /// Denials that matched on `(dev, ino)` rather than on a name — a SUBSET of
+    /// [`DENIED_FILE`]/[`DENIED_EXEC`], not an addition to them, so it must not
+    /// be summed into a denial total. It exists because "the rename didn't help"
+    /// is the one claim identity matching makes, and a counter is the only way
+    /// to show it fired rather than assume it did.
+    pub const DENIED_IDENTITY: u32 = 5;
     /// Number of slots (the map's `max_entries`).
-    pub const COUNT: u32 = 5;
+    pub const COUNT: u32 = 6;
 }
 
 /// How many ancestor directories the LSM `file_open` hook walks when matching
@@ -118,6 +187,15 @@ pub struct Event {
 
     /// Kind-specific discriminator; see [`meta`]. 0 for observation events.
     pub meta: u32,
+
+    /// For an identity match (`meta` = [`meta::KEY_INO`] / [`meta::KEY_DIR_INO`]):
+    /// the inode number of the object that matched. 0 otherwise.
+    pub ino: u64,
+    /// The device of that same object (kernel `s_dev` encoding). 0 otherwise.
+    pub dev: u32,
+    /// For `OPEN` observations and `DENY_FILE`: the access the open asked for,
+    /// as [`fmode`] bits. 0 when the hook could not read it.
+    pub fmode: u32,
 }
 
 impl Event {
@@ -137,6 +215,9 @@ impl Event {
             dport: 0,
             family: 0,
             meta: 0,
+            ino: 0,
+            dev: 0,
+            fmode: 0,
         }
     }
 }

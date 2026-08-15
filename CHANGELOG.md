@@ -7,7 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **File and exec enforcement was silently off on every kernel newer than 6.12.**
+  The LSM matcher reads `struct file` / `dentry` fields by byte offset, resolved
+  at runtime from the kernel's BTF. Linux 6.13 reorganised `struct file` and moved
+  `f_path` inside an **anonymous union**; the BTF walker only inspected direct
+  members, so it reported "no such member", resolution failed, wardyn fell back to
+  offsets baked in for 6.8, the hook read the wrong words, every read returned
+  `EFAULT`, and the hook failed open. Nothing looked wrong from the outside: the
+  feed still rendered, egress was still enforced, and file/exec rows were quietly
+  demoted to `block~`. The walker now descends into anonymous members, and
+  `resolve_offsets` returns the *reason* it failed instead of a bare `None`.
+
+  Two tests exist so this cannot come back quietly: one reconstructs the 6.13
+  shape from a synthetic BTF blob, and one resolves against
+  `/sys/kernel/btf/vmlinux` on whatever kernel the tests are running on — the
+  check that was missing, since every previous test used a blob the test itself
+  had written.
+
+- **The pinned nightly did not pin the eBPF bytecode.** `rust-toolchain.toml`
+  governs the userspace build, but `build.rs` passed `Toolchain::default()` to
+  aya-build, which is the *floating* `nightly` — so the one artifact the pin
+  exists to protect, the bytecode that goes into the kernel and gets verified, was
+  built by whatever `rustup` had that day. `build.rs` now reads the channel out of
+  `rust-toolchain.toml`, keeping one source of truth.
+
 ### Added
+
+- **Identity matching — `path:` rules (M6).** A file or exec rule can now name one
+  concrete object instead of a glob over names:
+
+  ```yaml
+  files:
+    - { match: "**/.env", action: block }   # names: covers files not created yet
+    - { path:  "~/.ssh",  action: block }   # identity: survives rename and hard-link
+  ```
+
+  A `path:` rule is resolved to `(dev, ino)` when the policy loads and enforced by
+  new `BLOCK_INODES` / `BLOCK_DIR_INODES` / `BLOCK_EXEC_INODES` maps, consulted by
+  the same LSM hooks. `mv` does not shake it off, `ln` gives a second name to the
+  same key, and `cp` is not an escape either — copying a secret means reading it,
+  and the read is what gets denied. `~` expands to the *agent's* home (read from
+  `/etc/passwd` for the drop-target uid, not `$HOME`, which under `sudo` is
+  root's); a bare name is relative to the directory wardyn was launched in.
+
+  Identity is **additive**: name maps are unchanged, so no policy loses coverage.
+  A `path:` that resolves to nothing pins nothing, and says so at startup and in
+  `--dry-run` rather than looking like protection.
+
+  Proven end-to-end, not asserted: `tests/e2e/run.sh` renames the secret, hard-links
+  it, copies it, renames the blocked directory and renames the blocked binary — and
+  then re-runs the *same agent* against the *same policy with the `path:` rules
+  stripped out*, requiring all four bypasses to reopen. Without that control run, an
+  identity assertion that passed because some name rule happened to cover the
+  renamed file would be indistinguishable from a working inode match.
+
+- **A read/write axis for file rules.** `access: read | write | any` (default
+  `any`). `block` used to mean "cannot be opened at all", which also forbade
+  *writing* the file, so a policy could not say "the agent may create a `.env`, it
+  just may not read one". The kernel always knew the difference (`f_mode` at
+  `file_open`); the policy had no way to ask. The access mask is stored beside each
+  key in the kernel maps, and the `openat` tracepoint now carries the requested
+  access so the feed's own prediction agrees with what the hook will decide.
+
+  `any` is stored as a zero mask, not `READ|WRITE`: an `O_PATH` open requests
+  neither, and the obvious encoding would have quietly narrowed every existing rule.
+
+- **`DENIED_IDENTITY` counter.** Denials that matched on `(dev, ino)` rather than a
+  name are counted separately and reported at exit — "the rename didn't help" is a
+  claim, and a counter is the difference between a claim and a measurement. It is a
+  subset of the file/exec totals, never added to them.
+
+- **Identity denials read as a story.** A kernel denial that matched an inode is
+  rendered with the name the object has *now* and the path the policy named:
+  `hidden.txt (same object as /home/me/project/.env)`.
+
+- **`docs/WSL2.md` — Windows is a first-class dev environment.** The WSL2 kernel
+  already ships BTF, cgroup v2 and `CONFIG_BPF_LSM=y`; one `kernelCommandLine` line
+  in `.wslconfig` activates the LSM, and mounting `securityfs` makes it visible.
+  The full e2e suite passes there with **0 skipped** — the README previously told
+  Windows users to provision a VM. The document also explains why a *skip* in that
+  suite is the dangerous result: it looks like success and means the file/exec
+  assertions never ran.
 
 - **The kernel reports its own denials.** Every enforcement hook
   (`lsm/file_open`, `lsm/bprm_check_security`, `cgroup/connect4·6`,
