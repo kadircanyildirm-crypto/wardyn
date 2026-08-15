@@ -23,7 +23,7 @@ use anyhow::{Context as _, Result};
 use globset::{Glob, GlobMatcher};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use wardyn_common::{fmode, InodeKey, NAME_LEN};
+use wardyn_common::{fmode, InodeKey, PortKey4, PortKey6, NAME_LEN, PORT_BITS};
 
 use crate::identity::{self, Anchor, AnchorBase, AnchorKind, ResolveOutcome, UnresolvedAnchor};
 
@@ -131,6 +131,19 @@ pub enum DenialKey {
     /// cgroup connect/sendmsg: destination address (NET_RULES LPM trie).
     Net4(Ipv4Addr),
     Net6(Ipv6Addr),
+    /// The same hooks, but the decision came from the **port** trie
+    /// (`NET_PORT_RULES`). A separate key because an exception has to be written
+    /// into the trie that denied — an allow in the address trie would be
+    /// overruled by the port rule on the very next connect, and the operator
+    /// would watch their approval do nothing.
+    Net4Port {
+        ip: Ipv4Addr,
+        port: u16,
+    },
+    Net6Port {
+        ip: Ipv6Addr,
+        port: u16,
+    },
     /// LSM `file_open`: the opened object's own `(dev, ino)` matched
     /// `BLOCK_INODES` — the rule found the file regardless of its current name.
     FileInode {
@@ -163,6 +176,12 @@ impl DenialKey {
             DenialKey::Exec(n) => format!("executing ANY program named `{n}` (any path)"),
             DenialKey::Net4(ip) => format!("ALL egress to {ip} (any port/protocol)"),
             DenialKey::Net6(ip) => format!("ALL egress to [{ip}] (any port/protocol)"),
+            // Narrower than the address form, and saying so matters: this is a
+            // smaller thing to approve, and an operator who has been told "ALL
+            // egress to this host" for a single-port denial will approve less
+            // than they safely could — or trust the prompt less next time.
+            DenialKey::Net4Port { ip, port } => format!("egress to {ip} on port {port} only"),
+            DenialKey::Net6Port { ip, port } => format!("egress to [{ip}] on port {port} only"),
             // An identity key is the one exception to "the honest scope is
             // always broader": it names exactly one object. Saying so is the
             // point — approving it is a far smaller decision than approving a
@@ -249,6 +268,8 @@ impl fmt::Display for DenialKey {
             DenialKey::Exec(n) => write!(f, "exec={n}"),
             DenialKey::Net4(ip) => write!(f, "ip={ip}"),
             DenialKey::Net6(ip) => write!(f, "ip=[{ip}]"),
+            DenialKey::Net4Port { ip, port } => write!(f, "ip={ip}:{port}"),
+            DenialKey::Net6Port { ip, port } => write!(f, "ip=[{ip}]:{port}"),
             DenialKey::FileInode { dev, ino } => write!(f, "ino={}", dev_ino(*dev, *ino)),
             DenialKey::DirInode { dev, ino } => write!(f, "dir-ino={}", dev_ino(*dev, *ino)),
             DenialKey::ExecInode { dev, ino } => write!(f, "exec-ino={}", dev_ino(*dev, *ino)),
@@ -318,6 +339,10 @@ struct PathRuleRaw {
 struct NetRuleRaw {
     cidr: Option<String>,
     domain: Option<String>,
+    /// Destination port. A rule that names one is treated as more specific than
+    /// any rule that does not, whatever their address prefixes — see
+    /// [`Policy::eval_connect`].
+    port: Option<u16>,
     action: Action,
 }
 
@@ -383,6 +408,9 @@ enum NetMatch {
 struct NetRule {
     label: String,
     which: NetMatch,
+    /// `Some(p)` puts this rule in the port trie, which the kernel consults
+    /// before the address-only one.
+    port: Option<u16>,
     action: Action,
 }
 
@@ -403,6 +431,10 @@ impl NetRule {
             NetMatch::V6Ip(a) if *a == ip => Some(128),
             _ => None,
         }
+    }
+    /// Does this rule's port constraint (if any) admit `dport`?
+    fn port_matches(&self, dport: u16) -> bool {
+        self.port.is_none_or(|p| p == dport)
     }
 }
 
@@ -526,6 +558,10 @@ impl Policy {
         let mut network = Vec::new();
         let mut unresolved_domains = Vec::new();
         for r in raw.network {
+            let suffix = match r.port {
+                Some(p) => format!(" port {p}"),
+                None => String::new(),
+            };
             match (&r.cidr, &r.domain) {
                 (Some(cidr), Some(domain)) => {
                     anyhow::bail!(
@@ -539,8 +575,9 @@ impl Policy {
                         IpNet::V6(n) => NetMatch::V6Cidr(n),
                     };
                     network.push(NetRule {
-                        label: format!("cidr:{cidr}"),
+                        label: format!("cidr:{cidr}{suffix}"),
                         which,
+                        port: r.port,
                         action: r.action,
                     });
                 }
@@ -555,14 +592,33 @@ impl Policy {
                             IpAddr::V6(v6) => NetMatch::V6Ip(v6),
                         };
                         network.push(NetRule {
-                            label: format!("domain:{domain}"),
+                            label: format!("domain:{domain}{suffix}"),
                             which,
+                            port: r.port,
                             action: r.action,
                         });
                     }
                 }
+                // `port:` on its own means "this port, anywhere" — the most
+                // useful port rule there is ("never SMTP"). It covers BOTH
+                // families: a v4-only reading would leave the same port open
+                // over IPv6, which is the exact shape of the hole the `::/0`
+                // rule had to be added for.
                 (None, None) => {
-                    anyhow::bail!("network rule needs `cidr` or `domain`");
+                    let Some(port) = r.port else {
+                        anyhow::bail!("network rule needs `cidr`, `domain`, or `port`");
+                    };
+                    for which in [
+                        NetMatch::V4Cidr("0.0.0.0/0".parse().expect("valid")),
+                        NetMatch::V6Cidr("::/0".parse().expect("valid")),
+                    ] {
+                        network.push(NetRule {
+                            label: format!("port:{port}"),
+                            which,
+                            port: Some(port),
+                            action: r.action,
+                        });
+                    }
                 }
             }
         }
@@ -636,6 +692,10 @@ impl Policy {
         self.network
             .iter()
             .rev()
+            // Port-qualified rules live in their own trie; leaving them here as
+            // well would make `{ cidr: "0.0.0.0/0", port: 25, action: block }`
+            // read as a deny-all for every port.
+            .filter(|r| r.port.is_none())
             .filter_map(|r| {
                 let (plen, data) = match &r.which {
                     NetMatch::V4Cidr(net) => (
@@ -650,12 +710,66 @@ impl Policy {
             .collect()
     }
 
+    /// Port-qualified IPv4 rules for `NET_PORT_RULES`, as
+    /// `(prefix_len, key, action)`.
+    ///
+    /// The prefix covers the whole 16-bit port plus however much of the address
+    /// the rule constrained, so two rules for different ports can never match
+    /// each other and, within one port, the more specific address still wins.
+    pub fn port_entries(&self) -> Vec<(u32, PortKey4, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter_map(|r| {
+                let port = r.port?;
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V4Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V4Ip(a) => (32u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PORT_BITS + addr_bits,
+                    PortKey4::new(port, octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Same, for IPv6.
+    pub fn port_entries6(&self) -> Vec<(u32, PortKey6, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter_map(|r| {
+                let port = r.port?;
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V6Ip(a) => (128u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PORT_BITS + addr_bits,
+                    PortKey6::new(port, octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Whether any rule names a port — i.e. whether the kernel needs to consult
+    /// the port tries at all.
+    pub fn has_port_rules(&self) -> bool {
+        self.network.iter().any(|r| r.port.is_some())
+    }
+
     /// IPv6 network rules as `(prefix_len, address bytes (network order), action
     /// code)` for the v6 LPM trie.
     pub fn net_entries6(&self) -> Vec<(u32, [u8; 16], u32)> {
         self.network
             .iter()
             .rev()
+            .filter(|r| r.port.is_none())
             .filter_map(|r| {
                 let (plen, data) = match &r.which {
                     NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
@@ -862,7 +976,9 @@ impl Policy {
     pub fn net_coverage_gaps(&self) -> Vec<String> {
         let has_block_all = |v6: bool| {
             self.network.iter().any(|r| {
+                // A port-qualified `0.0.0.0/0` denies one port, not all egress.
                 r.action == Action::Block
+                    && r.port.is_none()
                     && match &r.which {
                         NetMatch::V4Cidr(n) => !v6 && n.prefix_len() == 0,
                         NetMatch::V6Cidr(n) => v6 && n.prefix_len() == 0,
@@ -960,16 +1076,39 @@ impl Policy {
             let axis = if a.exec { "exec" } else { "file" };
             let _ = writeln!(s, "  {axis}  {:<29} {}", a.to_string(), a.blast_radius());
         }
-        let blocked_nets: Vec<&str> = self
-            .network
-            .iter()
-            .filter(|r| r.action == Action::Block)
-            .map(|r| r.label.as_str())
-            .collect();
-        if blocked_nets.is_empty() {
+        // Deduplicated: a bare `port:` rule is compiled into one entry per
+        // address family, and a rule listed twice reads as two rules.
+        let blocked = |ported: bool| -> Vec<&str> {
+            let mut out: Vec<&str> = Vec::new();
+            for r in &self.network {
+                if r.action == Action::Block
+                    && r.port.is_some() == ported
+                    && !out.contains(&r.label.as_str())
+                {
+                    out.push(&r.label);
+                }
+            }
+            out
+        };
+        let (addr_blocks, port_blocks) = (blocked(false), blocked(true));
+        if addr_blocks.is_empty() && port_blocks.is_empty() {
             let _ = writeln!(s, "  net   (no block rules — no egress is denied)");
         } else {
-            let _ = writeln!(s, "  net   blocked: {}", blocked_nets.join(", "));
+            if !addr_blocks.is_empty() {
+                let _ = writeln!(s, "  net   blocked: {}", addr_blocks.join(", "));
+            }
+            if !port_blocks.is_empty() {
+                let _ = writeln!(s, "  net   blocked by port: {}", port_blocks.join(", "));
+            }
+        }
+        // The one thing about port rules that cannot be inferred from the list.
+        if self.has_port_rules() {
+            let _ = writeln!(
+                s,
+                "\nnote: a rule naming a `port:` is consulted BEFORE any rule that does not, \
+                 whatever\n      their address prefixes. `{{ port: 25, action: block }}` denies \
+                 SMTP even to a\n      network another rule allows in full."
+            );
         }
         if self.kern_names.is_empty()
             && self.kern_dirs.is_empty()
@@ -1078,48 +1217,59 @@ impl Policy {
         eval_path(&self.exec, path, self.default_action)
     }
 
-    pub fn eval_connect(&self, ip: Ipv4Addr) -> Verdict {
-        self.net_verdict(
-            self.network
-                .iter()
-                .filter_map(|r| Some((r, r.v4_prefix(ip)?))),
-        )
+    pub fn eval_connect(&self, ip: Ipv4Addr, dport: u16) -> Verdict {
+        self.net_verdict(|r| r.v4_prefix(ip), dport)
     }
 
-    pub fn eval_connect6(&self, ip: Ipv6Addr) -> Verdict {
-        self.net_verdict(
-            self.network
-                .iter()
-                .filter_map(|r| Some((r, r.v6_prefix(ip)?))),
-        )
+    pub fn eval_connect6(&self, ip: Ipv6Addr, dport: u16) -> Verdict {
+        self.net_verdict(|r| r.v6_prefix(ip), dport)
     }
 
-    /// Pick the verdict for a connect from the matching `(rule, prefix_len)`
-    /// pairs, MOST-SPECIFIC first (longest prefix wins), ties broken by policy
-    /// order. This is longest-prefix-match, not first-match — the kernel decides
-    /// egress with an LPM trie, and CIDRs matching one IP are always nested, so
-    /// this is the semantics the kernel actually enforces. Evaluating it any
-    /// other way would make the feed disagree with the block that really fired.
-    fn net_verdict<'a>(&self, matches: impl Iterator<Item = (&'a NetRule, u8)>) -> Verdict {
-        let mut best: Option<(&NetRule, u8)> = None;
-        for (r, plen) in matches {
-            // Strictly-greater keeps the earliest rule on a prefix-length tie,
-            // matching the kernel trie (net_entries inserts earliest rule last).
-            if best.is_none_or(|(_, bp)| plen > bp) {
-                best = Some((r, plen));
+    /// Pick the verdict for a connect, mirroring what the kernel will do.
+    ///
+    /// Two passes, and the order between them is the one thing about port rules
+    /// that has to be stated rather than guessed:
+    ///
+    /// 1. **Rules that name this port**, most-specific address first.
+    /// 2. **Rules that name no port**, most-specific address first.
+    /// 3. `default_action`.
+    ///
+    /// So a rule that names a port beats one that does not, whatever their
+    /// address prefixes — `{ port: 25, action: block }` denies SMTP even to a
+    /// `/8` the policy otherwise allows. That is what the kernel does, because
+    /// port rules live in their own trie which the hook consults first, and it
+    /// is also what people mean when they write "never SMTP". Within each pass
+    /// it is longest-prefix-match, not first-match, because the kernel decides
+    /// with an LPM trie; ties keep the earliest rule.
+    fn net_verdict(&self, prefix_of: impl Fn(&NetRule) -> Option<u8>, dport: u16) -> Verdict {
+        for ported in [true, false] {
+            let mut best: Option<(&NetRule, u8)> = None;
+            for r in &self.network {
+                if r.port.is_some() != ported || !r.port_matches(dport) {
+                    continue;
+                }
+                let Some(plen) = prefix_of(r) else {
+                    continue;
+                };
+                // Strictly-greater keeps the earliest rule on a prefix-length
+                // tie, matching the kernel trie (the entry lists insert the
+                // earliest rule last, and LPM `insert` overwrites on collision).
+                if best.is_none_or(|(_, bp)| plen > bp) {
+                    best = Some((r, plen));
+                }
+            }
+            if let Some((r, _)) = best {
+                return Verdict {
+                    action: r.action,
+                    rule: r.label.clone(),
+                    enforceable: true,
+                };
             }
         }
-        match best {
-            Some((r, _)) => Verdict {
-                action: r.action,
-                rule: r.label.clone(),
-                enforceable: true,
-            },
-            None => Verdict {
-                action: self.default_action,
-                rule: "default".to_string(),
-                enforceable: true,
-            },
+        Verdict {
+            action: self.default_action,
+            rule: "default".to_string(),
+            enforceable: true,
         }
     }
 }
@@ -1437,6 +1587,10 @@ exec:
         parse(P).expect("policy parses")
     }
 
+    /// A destination port no test policy names, so an assertion about address
+    /// matching stays an assertion about address matching.
+    const ANY_PORT: u16 = 4242;
+
     fn key(s: &str) -> [u8; NAME_LEN] {
         let mut k = [0u8; NAME_LEN];
         k[..s.len()].copy_from_slice(s.as_bytes());
@@ -1601,6 +1755,148 @@ files:
         );
     }
 
+    const PORTED: &str = r#"
+default_action: allow
+network:
+  - { cidr: "10.0.0.0/8", action: allow }        # the whole private LAN
+  - { port: 25, action: block }                  # ...but never SMTP, anywhere
+  - { cidr: "10.0.0.5/32", port: 25, action: allow }  # except this one relay
+  - { cidr: "0.0.0.0/0", action: block }
+"#;
+
+    /// The ordering decision, stated as behaviour: a rule that names a port is
+    /// consulted before one that does not, whatever their address prefixes.
+    #[test]
+    fn a_port_rule_beats_an_address_rule_with_a_longer_prefix() {
+        let p = parse(PORTED).expect("parses");
+        // 10.0.0.0/8 allows the LAN...
+        assert_eq!(
+            p.eval_connect("10.1.2.3".parse().unwrap(), 443).action,
+            Action::Allow
+        );
+        // ...but the /0 port rule still denies SMTP inside it, despite a
+        // 0-bit address prefix losing to /8 on address specificity alone.
+        assert_eq!(
+            p.eval_connect("10.1.2.3".parse().unwrap(), 25).action,
+            Action::Block
+        );
+        // Within the port pass, the more specific address wins as usual.
+        assert_eq!(
+            p.eval_connect("10.0.0.5".parse().unwrap(), 25).action,
+            Action::Allow
+        );
+        // And an address with no port rule falls through to the address pass.
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap(), 443).action,
+            Action::Block
+        );
+    }
+
+    /// `port:` with no address covers BOTH families. A v4-only reading would
+    /// leave the same port open over IPv6 — the exact shape of the hole the
+    /// `::/0` rule had to be added for.
+    #[test]
+    fn a_bare_port_rule_covers_ipv6_too() {
+        let p = parse("default_action: allow\nnetwork:\n  - { port: 25, action: block }\n")
+            .expect("parses");
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap(), 25).action,
+            Action::Block
+        );
+        assert_eq!(
+            p.eval_connect6("2606:4700::1111".parse().unwrap(), 25)
+                .action,
+            Action::Block
+        );
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap(), 26).action,
+            Action::Allow
+        );
+    }
+
+    /// Port rules must not leak into the address-only trie: a port-qualified
+    /// `0.0.0.0/0 block` there would read as a deny-all for every port.
+    #[test]
+    fn port_rules_are_kept_out_of_the_address_trie() {
+        let p = parse("default_action: allow\nnetwork:\n  - { port: 25, action: block }\n")
+            .expect("parses");
+        assert!(p.net_entries().is_empty(), "{:?}", p.net_entries());
+        assert!(p.net_entries6().is_empty());
+        assert_eq!(p.port_entries().len(), 1);
+        assert_eq!(p.port_entries6().len(), 1);
+        // Prefix covers the whole port and no address bits.
+        assert_eq!(p.port_entries()[0].0, PORT_BITS);
+    }
+
+    /// The key's bit layout IS the semantics — port first, so a prefix can pin a
+    /// port without pinning an address. If these ever swap, "port 25 anywhere"
+    /// silently becomes inexpressible.
+    #[test]
+    fn the_port_key_puts_the_port_before_the_address() {
+        let p = parse(
+            "default_action: allow\nnetwork:\n  - { cidr: \"10.0.0.0/8\", port: 5432, action: allow }\n",
+        )
+        .expect("parses");
+        let (plen, key, _) = p.port_entries()[0];
+        assert_eq!(plen, PORT_BITS + 8);
+        assert_eq!(key.port, 5432u16.to_be_bytes());
+        assert_eq!(key.addr, [10, 0, 0, 0]);
+        assert_eq!(key._pad, [0, 0]);
+    }
+
+    /// A rule with no address and no port is still an error — `port:` widened
+    /// what a rule may be, it did not make every field optional.
+    #[test]
+    fn a_network_rule_still_needs_something_to_match_on() {
+        let Err(e) = parse("network:\n  - { action: block }\n") else {
+            panic!("a rule with nothing to match on must be refused");
+        };
+        assert!(
+            format!("{e:?}").contains("`cidr`, `domain`, or `port`"),
+            "{e:?}"
+        );
+    }
+
+    /// A port-qualified deny-all is not a deny-all, and the IPv6 coverage
+    /// warning must not be silenced by one.
+    #[test]
+    fn a_port_qualified_catch_all_does_not_count_as_deny_all() {
+        let p = parse(
+            "default_action: allow\nnetwork:\n  - { cidr: \"0.0.0.0/0\", port: 25, action: block }\n",
+        )
+        .expect("parses");
+        assert!(
+            p.net_coverage_gaps().is_empty(),
+            "a port rule is not a v4 deny-all"
+        );
+
+        let q =
+            parse("default_action: allow\nnetwork:\n  - { cidr: \"0.0.0.0/0\", action: block }\n")
+                .expect("parses");
+        assert_eq!(
+            q.net_coverage_gaps().len(),
+            1,
+            "a real v4 deny-all still warns"
+        );
+    }
+
+    /// An exception for a port-trie denial names the port, because it has to be
+    /// written into the trie that denied — and it is a smaller thing to approve.
+    #[test]
+    fn a_port_denial_key_is_narrower_than_an_address_one() {
+        let ported = DenialKey::Net4Port {
+            ip: "1.1.1.1".parse().unwrap(),
+            port: 25,
+        };
+        assert_eq!(ported.to_string(), "ip=1.1.1.1:25");
+        let text = ported.blast_radius();
+        assert!(text.contains("port 25 only"), "{text}");
+        assert!(!text.contains("ALL egress"), "{text}");
+        // The address form is the broad one, and still says so.
+        let broad = DenialKey::Net4("1.1.1.1".parse().unwrap());
+        assert!(broad.blast_radius().contains("ALL egress"));
+    }
+
     /// An unresolved `path:` rule has its own report, with its own reason. It
     /// must not ALSO appear under "no kernel key — glob segment, or name too
     /// long", which is a different problem and a wrong explanation.
@@ -1662,19 +1958,21 @@ files:
     fn network_cidr_matching() {
         let p = policy();
         assert_eq!(
-            p.eval_connect("127.0.0.1".parse().unwrap()).action,
+            p.eval_connect("127.0.0.1".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect("192.168.1.5".parse().unwrap()).action,
+            p.eval_connect("192.168.1.5".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect("1.1.1.1".parse().unwrap()).action,
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT).action,
             Action::Block
         );
         assert_eq!(
-            p.eval_connect("8.8.8.8".parse().unwrap()).action,
+            p.eval_connect("8.8.8.8".parse().unwrap(), ANY_PORT).action,
             Action::Block
         );
     }
@@ -1683,16 +1981,18 @@ files:
     fn network_v6_matching() {
         let p = policy();
         assert_eq!(
-            p.eval_connect6("::1".parse().unwrap()).action,
+            p.eval_connect6("::1".parse().unwrap(), ANY_PORT).action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect6("2001:db8::5".parse().unwrap()).action,
+            p.eval_connect6("2001:db8::5".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Block
         );
         // unmatched v6 -> default (allow in P); the v4 0.0.0.0/0 rule does not apply
         assert_eq!(
-            p.eval_connect6("2606:4700::1".parse().unwrap()).action,
+            p.eval_connect6("2606:4700::1".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Allow
         );
     }
@@ -1717,7 +2017,7 @@ files:
         let p = policy();
         assert_eq!(p.eval_file("/x/.env").rule, "**/.env");
         assert_eq!(
-            p.eval_connect("1.1.1.1".parse().unwrap()).rule,
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT).rule,
             "cidr:0.0.0.0/0"
         );
         assert_eq!(p.eval_file("/x/main.rs").rule, "**");
@@ -1754,7 +2054,10 @@ files:
         assert_eq!(v.action, Action::Block);
         assert!(!v.enforceable);
         // network blocks are always enforceable
-        assert!(p.eval_connect("1.1.1.1".parse().unwrap()).enforceable);
+        assert!(
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT)
+                .enforceable
+        );
 
         let oo = p.observe_only_blocks();
         assert!(oo.contains(&"**/.env.*".to_string()));
@@ -1766,7 +2069,7 @@ files:
         let p = parse("default_action: warn").unwrap();
         assert_eq!(p.eval_file("/anything").action, Action::Warn);
         assert_eq!(
-            p.eval_connect("8.8.8.8".parse().unwrap()).action,
+            p.eval_connect("8.8.8.8".parse().unwrap(), ANY_PORT).action,
             Action::Warn
         );
     }
@@ -1858,15 +2161,15 @@ network:
         )
         .unwrap();
         assert_eq!(
-            p.eval_connect("1.1.1.1".parse().unwrap()).action,
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT).action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect("1.1.1.1".parse().unwrap()).rule,
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT).rule,
             "cidr:1.1.1.1/32"
         );
         assert_eq!(
-            p.eval_connect("8.8.8.8".parse().unwrap()).action,
+            p.eval_connect("8.8.8.8".parse().unwrap(), ANY_PORT).action,
             Action::Block
         );
     }
@@ -1952,11 +2255,13 @@ network:
         )
         .unwrap();
         assert_eq!(
-            p.eval_connect("203.0.113.7".parse().unwrap()).action,
+            p.eval_connect("203.0.113.7".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect("203.0.113.8".parse().unwrap()).action,
+            p.eval_connect("203.0.113.8".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Block
         );
         assert!(p

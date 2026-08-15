@@ -54,6 +54,14 @@ network:
   - { domain: "github.com", action: allow }
   - { domain: "api.anthropic.com", action: allow }
   - { domain: "registry.npmjs.org", action: allow }
+  # Port rules are consulted BEFORE any rule above, whatever its prefix — so
+  # these hold even inside the private ranges this preset allows in full.
+  # An agent has no business speaking SMTP, and a reverse shell to a LAN host
+  # would otherwise be waved through by the 10.0.0.0/8 allow.
+  - { port: 25, action: block } # SMTP
+  - { port: 465, action: block } # SMTPS
+  - { port: 587, action: block } # submission
+  - { port: 4444, action: block } # the reverse-shell port of folklore
   - { cidr: "0.0.0.0/0", action: block } # deny everything else (IPv4)
   - { cidr: "::/0", action: block } # deny everything else (IPv6 + v4-mapped)
 

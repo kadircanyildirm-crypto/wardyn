@@ -36,7 +36,9 @@ use aya::programs::{CgroupAttachMode, CgroupSockAddr, Lsm, TracePoint};
 use aya::Btf;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
-use wardyn_common::{action, kind, meta, stat, Event, InodeKey, NAME_LEN, PATH_LEN};
+use wardyn_common::{
+    action, kind, meta, stat, Event, InodeKey, PortKey4, PortKey6, NAME_LEN, PATH_LEN, PORT_BITS,
+};
 use wardyn_policy::cli::{self, Mode, Opts, ParseOutcome};
 use wardyn_policy::identity::AnchorBase;
 use wardyn_policy::policy::{self, Action, DenialKey, Exceptions, Loader, Policy, Verdict};
@@ -70,6 +72,46 @@ struct InoKey {
     ino: u64,
 }
 unsafe impl aya::Pod for InoKey {}
+
+/// Userspace mirrors of the port-qualified LPM keys. Same orphan-rule story as
+/// `NameKey` and `InoKey`; the layouts are asserted equal in the tests below.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PortKey4Pod {
+    port: [u8; 2],
+    addr: [u8; 4],
+    _pad: [u8; 2],
+}
+unsafe impl aya::Pod for PortKey4Pod {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PortKey6Pod {
+    port: [u8; 2],
+    addr: [u8; 16],
+    _pad: [u8; 2],
+}
+unsafe impl aya::Pod for PortKey6Pod {}
+
+impl From<PortKey4> for PortKey4Pod {
+    fn from(k: PortKey4) -> Self {
+        PortKey4Pod {
+            port: k.port,
+            addr: k.addr,
+            _pad: [0; 2],
+        }
+    }
+}
+
+impl From<PortKey6> for PortKey6Pod {
+    fn from(k: PortKey6) -> Self {
+        PortKey6Pod {
+            port: k.port,
+            addr: k.addr,
+            _pad: [0; 2],
+        }
+    }
+}
 
 impl From<InodeKey> for InoKey {
     fn from(k: InodeKey) -> Self {
@@ -107,6 +149,7 @@ const CFG_SB_DEV_OFF: u32 = 16;
 const CFG_DENTRY_INODE_OFF: u32 = 17;
 const CFG_EXT_OFFSETS: u32 = 18;
 const CFG_IDENTITY_ON: u32 = 19;
+const CFG_PORT_RULES_ON: u32 = 20;
 
 /// Feed rows that carry an operator/diagnostic message rather than a syscall.
 const KIND_NOTICE: u32 = u32::MAX;
@@ -120,6 +163,10 @@ pub(crate) struct KernelMaps {
     execs: BpfHashMap<MapData, NameKey, u8>,
     net4: LpmTrie<MapData, u32, u32>,
     net6: LpmTrie<MapData, Ip6Key, u32>,
+    /// Port-qualified rules, consulted by the hooks before the address-only
+    /// tries above.
+    port4: LpmTrie<MapData, PortKey4Pod, u32>,
+    port6: LpmTrie<MapData, PortKey6Pod, u32>,
     /// Identity maps (M6). Held for the same reason as the name maps: an
     /// approve-once exception has to be able to drop an inode key mid-run.
     inodes: BpfHashMap<MapData, InoKey, u8>,
@@ -143,6 +190,23 @@ impl KernelMaps {
             net6.insert(&Key::new(plen, Ip6Key(data)), act, 0)
                 .context("populating NET_RULES6")?;
         }
+        let mut port4: LpmTrie<_, PortKey4Pod, u32> =
+            LpmTrie::try_from(ebpf.take_map("NET_PORT_RULES").context("NET_PORT_RULES")?)?;
+        for (plen, key, act) in policy.port_entries() {
+            port4
+                .insert(&Key::new(plen, PortKey4Pod::from(key)), act, 0)
+                .context("populating NET_PORT_RULES")?;
+        }
+        let mut port6: LpmTrie<_, PortKey6Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PORT_RULES6")
+                .context("NET_PORT_RULES6")?,
+        )?;
+        for (plen, key, act) in policy.port_entries6() {
+            port6
+                .insert(&Key::new(plen, PortKey6Pod::from(key)), act, 0)
+                .context("populating NET_PORT_RULES6")?;
+        }
+
         // The map VALUE is the access mask, not a presence flag — see
         // `wardyn_common::fmode`. 0 means "every open"; READ/WRITE narrow it.
         let (name_keys, dir_keys) = policy.file_enforcement();
@@ -201,6 +265,8 @@ impl KernelMaps {
             execs,
             net4,
             net6,
+            port4,
+            port6,
             inodes,
             dir_inodes,
             exec_inodes,
@@ -246,6 +312,31 @@ impl KernelMaps {
                 .net6
                 .insert(&Key::new(128, Ip6Key(ip.octets())), action::ALLOW, 0)
                 .context("inserting /128 allow"),
+            // Into the PORT trie, because that is the one that denied. The hooks
+            // consult it first and take its answer as final, so an allow written
+            // anywhere else would be read after the block that is still there.
+            DenialKey::Net4Port { ip, port } => self
+                .port4
+                .insert(
+                    &Key::new(
+                        PORT_BITS + 32,
+                        PortKey4Pod::from(PortKey4::new(*port, ip.octets())),
+                    ),
+                    action::ALLOW,
+                    0,
+                )
+                .context("inserting port allow"),
+            DenialKey::Net6Port { ip, port } => self
+                .port6
+                .insert(
+                    &Key::new(
+                        PORT_BITS + 128,
+                        PortKey6Pod::from(PortKey6::new(*port, ip.octets())),
+                    ),
+                    action::ALLOW,
+                    0,
+                )
+                .context("inserting port allow"),
         }
     }
 }
@@ -877,6 +968,8 @@ async fn run() -> anyhow::Result<i32> {
         }
     };
     config.set(CFG_FORK_CHILD_OFF, child_off, 0)?;
+    // Skip the port-trie lookup per connect for policies that name no ports.
+    config.set(CFG_PORT_RULES_ON, u32::from(policy.has_port_rules()), 0)?;
 
     // LSM dentry offsets: resolve them from the running kernel's own BTF so the
     // file/exec matcher adapts to the kernel instead of being pinned to 6.8. On
@@ -1436,6 +1529,11 @@ fn prediction_key(k: &DenialKey) -> String {
         DenialKey::FileName(n) | DenialKey::FileDir(n) | DenialKey::Exec(n) => n.clone(),
         DenialKey::Net4(ip) => ip.to_string(),
         DenialKey::Net6(ip) => ip.to_string(),
+        // Matches `confirmation_key`, which keys a network confirmation on the
+        // address alone: userspace predicts from the address it observed and
+        // cannot know which trie the kernel will use.
+        DenialKey::Net4Port { ip, .. } => ip.to_string(),
+        DenialKey::Net6Port { ip, .. } => ip.to_string(),
         // Userspace never *predicts* an identity denial — it only has the path
         // string, and the point of an identity rule is that the string is not
         // what decides. These arrive as kernel reports, which is the branch that
@@ -1537,9 +1635,15 @@ pub(crate) fn describe(
         }
         kind::DENY_NET => {
             let addr = deny_net_addr(ev);
-            let key = match addr {
-                std::net::IpAddr::V4(v4) => DenialKey::Net4(v4),
-                std::net::IpAddr::V6(v6) => DenialKey::Net6(v6),
+            // `meta` says which trie decided. Building an address key for a
+            // port-trie denial would produce an exception the port rule
+            // immediately overrules.
+            let by_port = ev.meta == meta::KEY_PORT;
+            let key = match (addr, by_port) {
+                (std::net::IpAddr::V4(ip), false) => DenialKey::Net4(ip),
+                (std::net::IpAddr::V6(ip), false) => DenialKey::Net6(ip),
+                (std::net::IpAddr::V4(ip), true) => DenialKey::Net4Port { ip, port: ev.dport },
+                (std::net::IpAddr::V6(ip), true) => DenialKey::Net6Port { ip, port: ev.dport },
             };
             return Some(Desc {
                 pid: ev.pid,
@@ -1614,13 +1718,13 @@ pub(crate) fn describe(
                 if let Some(v4) = ip6.to_ipv4_mapped() {
                     (
                         format!("[{ip6}]:{}", ev.dport),
-                        policy.eval_connect(v4),
+                        policy.eval_connect(v4, ev.dport),
                         DenialKey::Net4(v4),
                     )
                 } else {
                     (
                         format!("[{ip6}]:{}", ev.dport),
-                        policy.eval_connect6(ip6),
+                        policy.eval_connect6(ip6, ev.dport),
                         DenialKey::Net6(ip6),
                     )
                 }
@@ -1628,7 +1732,7 @@ pub(crate) fn describe(
                 let ip = Ipv4Addr::from(ev.daddr.to_ne_bytes());
                 (
                     format!("{ip}:{}", ev.dport),
-                    policy.eval_connect(ip),
+                    policy.eval_connect(ip, ev.dport),
                     DenialKey::Net4(ip),
                 )
             };

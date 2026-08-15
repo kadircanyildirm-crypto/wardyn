@@ -147,7 +147,14 @@ saying "first match wins" everywhere would be wrong:
 |---|---|
 | `files` / `exec` | first match wins |
 | `network` | **longest prefix wins** (the kernel uses an LPM trie) |
+| `network`, rules naming a `port:` | **consulted first**, whatever the address prefixes — see below |
 | `files` / `exec` under `--enforce` | **no order** — the kernel holds a *set* of block keys, so an earlier `allow` does not exempt what a later `block` covers |
+
+A network rule may name a **`port:`**, and one that does beats one that does not:
+`{ port: 25, action: block }` denies SMTP even to a `/8` the policy allows in
+full. Within the port rules it is longest-prefix as usual, so a specific relay
+can still be allowed back. A bare `port:` with no `cidr:` covers **both** address
+families — a v4-only reading would leave the same port open over IPv6.
 
 A file or exec rule is written with **either** `match:` (a glob over names) or
 `path:` (one concrete object, pinned by identity) — never both. File rules also
@@ -180,6 +187,7 @@ files:
 network:                                 # cidr, or domain (resolved at load)
   - { cidr: "127.0.0.0/8",   action: allow }
   - { domain: "github.com",  action: allow }
+  - { port: 25,              action: block }   # never SMTP — beats any rule above
   - { cidr: "0.0.0.0/0",     action: block }   # deny all other egress
 
 exec:                                    # glob against the executable path
@@ -317,13 +325,13 @@ Full design, hook map, and the eBPF-verifier war stories are in
   from the TUI ✓, kernel-reported denials ✓)_ Next: persistent overrides kept
   outside the watched tree's reach.
 - [ ] **M6 — Match on identity, not names:** _(`(dev, ino)` keying for files,
-  directories and executables ✓, read/write axis ✓, offsets resolved from the
-  running kernel's BTF ✓, e2e proof that rename/hard-link/copy no longer defeat a
-  rule — including a control run showing they still do without it ✓)_ Next:
-  port/protocol in network rules, and a create/unlink axis. Copying a *blocked
-  binary* to a new name still runs it — a copy is a different object with a
-  different name, and unlike a secret there is no read to deny; see
-  [`SECURITY.md`](./SECURITY.md).
+  directories and executables ✓, read/write axis ✓, `port:` in network rules ✓,
+  offsets resolved from the running kernel's BTF ✓, e2e proof that
+  rename/hard-link/copy no longer defeat a rule — including a control run showing
+  they still do without it ✓)_ Next: a create/unlink axis, and protocol
+  (`tcp`/`udp`) alongside `port:`. Copying a *blocked binary* to a new name still
+  runs it — a copy is a different object with a different name, and unlike a
+  secret there is no read to deny; see [`SECURITY.md`](./SECURITY.md).
 
 ## Contributing
 

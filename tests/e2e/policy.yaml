@@ -25,6 +25,11 @@ files:
 network:
   - { cidr: "127.0.0.0/8", action: allow } # loopback v4
   - { cidr: "::1/128", action: allow } # loopback v6
+  # Port rules. These exercise the ordering that cannot be inferred from the
+  # list: a rule naming a `port:` is consulted BEFORE any rule that does not.
+  - { cidr: "127.0.0.2/32", action: block } # this loopback host is blocked...
+  - { cidr: "127.0.0.2/32", port: 9, action: allow } # ...except on port 9
+  - { port: 7, action: block } # and port 7 is denied everywhere, loopback included
   - { cidr: "0.0.0.0/0", action: block } # deny all other v4 egress
   - { cidr: "::/0", action: block } # deny all other v6 egress (regression guard)
 

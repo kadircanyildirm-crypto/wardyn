@@ -63,6 +63,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity assertion that passed because some name rule happened to cover the
   renamed file would be indistinguishable from a working inode match.
 
+  The suite is now 29 assertions with **0 skips** on a BPF-LSM kernel. It was 10
+  with 1 skip, and that one skip was the entire file/exec axis.
+
+- **`port:` in network rules.** A network rule may name a destination port:
+
+  ```yaml
+  network:
+    - { cidr: "10.0.0.0/8", action: allow }              # the whole LAN
+    - { port: 25,           action: block }              # ...but never SMTP
+    - { cidr: "10.0.0.5/32", port: 25, action: allow }   # except this relay
+  ```
+
+  Port-qualified rules live in their own LPM trie (`NET_PORT_RULES`), keyed
+  `[port, address]` and consulted **before** the address-only one. So a rule that
+  names a port beats one that does not, whatever their address prefixes — which
+  is both what the kernel does and what people mean by "never SMTP". Within the
+  port trie it is longest-prefix as usual, so a specific host can be allowed back.
+  A bare `port:` with no `cidr:` covers **both** address families; a v4-only
+  reading would leave the same port open over IPv6, which is the exact shape of
+  the hole the `::/0` rule had to be added for.
+
+  Port before address in the key is forced, not stylistic: an LPM trie compares
+  from the most significant end, so address-first would put the port bits out of
+  reach of any rule that did not also fix all 32 address bits — making "port 25,
+  anywhere" inexpressible.
+
+  Protocol is deliberately not a third dimension. Behind the port it would make
+  "this protocol to this address, any port" inexpressible, and that restriction
+  is harder to explain than the expressiveness is worth. `port:` alone covers the
+  policies people actually write.
+
+  The kernel now reports **which trie decided** (`meta = KEY_PORT`), because an
+  approve-once exception must be written into the trie that denied — an allow in
+  the address trie would be overruled by the port rule on the very next connect,
+  and the operator would watch their approval do nothing. The confirm prompt is
+  also narrower for a port denial: "egress to 1.1.1.1 on port 25 only" rather
+  than "ALL egress to 1.1.1.1".
+
 - **A read/write axis for file rules.** `access: read | write | any` (default
   `any`). `block` used to mean "cannot be opened at all", which also forbade
   *writing* the file, so a policy could not say "the agent may create a `.env`, it

@@ -182,11 +182,35 @@ launched subtree, and only under `--enforce`. Because `WATCHED` is seeded only i
 (system-wide blocking is out of scope, and would otherwise enforce *nothing* while
 claiming to).
 
-- **Network** — `cgroup/connect4` looks the destination IPv4 up in the `NET_RULES`
-  LPM trie (compiled from `policy.network`) and returns *deny* for a `block` verdict.
-  The trie is **longest-prefix-match**, so the userspace feed evaluates network
+- **Network** — `cgroup/connect4` consults two LPM tries, in this order:
+  1. `NET_PORT_RULES`, keyed `[port, address]`, holding every rule that named a
+     `port:`. If it hits, that answer is final.
+  2. `NET_RULES`, keyed by address alone, then `default_action` on a miss.
+
+  Both are **longest-prefix-match**, so the userspace feed evaluates network
   rules most-specific-first (not first-match) to report the same verdict the kernel
   enforces — a broad `block` CIDR before a narrow `allow` no longer disagree.
+
+  **Why the port comes first in the key.** An LPM trie compares its key as one
+  bit string from the most significant end, so whatever leads is what a prefix
+  can pin *without* pinning the rest. Port-then-address is the only order that
+  can express "port 25, anywhere" — the most useful port rule there is. Address
+  first would put the port bits out of reach of any rule that did not also fix
+  all 32 address bits.
+
+  **Why a second trie rather than a wider key.** The two answer different
+  questions and the hook has to prefer one. A rule that names a port describes
+  the connection more precisely than one that does not, so the port trie wins
+  outright — `{ port: 25, action: block }` denies SMTP even inside a `/8` the
+  policy allows. Protocol is deliberately *not* a third dimension: adding it
+  would make "this protocol to this address, any port" inexpressible (its bits
+  would sit behind the port's), and a restriction that arbitrary is worse than
+  the small amount of expressiveness it buys.
+
+  Which trie decided is reported in the event (`meta = KEY_PORT`), because an
+  approve-once exception has to be written into the trie that denied — an allow
+  in the address trie would be overruled by the port rule on the next connect,
+  and the operator would watch their approval do nothing.
 - **File** — LSM `file_open` checks, in this order:
   1. **Identity.** `file->f_inode` → `(i_ino, i_sb->s_dev)` against `BLOCK_INODES`.
      Checked first because it is the more specific statement: a file matched by

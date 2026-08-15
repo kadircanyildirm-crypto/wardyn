@@ -132,6 +132,13 @@ timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null || true
 timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>/dev/null || true
 # blocked public v6 (only produces an event if the host has IPv6)
 timeout 3 bash -c 'exec 3<>/dev/tcp/2606:4700:4700::1111/443' 2>/dev/null || true
+# ── port rules, all on loopback so nothing depends on external connectivity ──
+# blocked by an address rule (/32 beats the /8 allow)
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.2/8' 2>/dev/null || true
+# ...but allowed on port 9, because a port rule is consulted first
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.2/9' 2>/dev/null || true
+# denied on an address the policy otherwise allows in full — the ordering proof
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7' 2>/dev/null || true
 # blocked secret (enforced only under BPF-LSM)
 if cat "$WS/.env" >/dev/null 2>&1; then echo allowed >"$WS/env_read.txt"; else echo denied >"$WS/env_read.txt"; fi
 # blocked secret NESTED under a blocked directory (ancestor walk)
@@ -260,6 +267,25 @@ if grep -qF "2606:4700:4700::1111" "$AUDIT" 2>/dev/null; then
   fi
 else
   skip "IPv6 egress (host has no IPv6 route; nothing attempted)"
+fi
+
+# 4b) port rules, and the one thing about them that has to be stated: a rule
+#     naming a port is consulted before one that does not, whatever their
+#     address prefixes.
+if audited_block "127.0.0.2:8"; then
+  pass "port: an address rule still blocks a port it says nothing about"
+else
+  fail "127.0.0.2:8 was not blocked — the /32 address rule did not take effect"
+fi
+if grep -qF "127.0.0.2:9" "$AUDIT" 2>/dev/null; then
+  fail "127.0.0.2:9 was flagged — a port allow must override the address block"
+else
+  pass "port: an allow on one port overrides a block on the whole address"
+fi
+if audited_block "127.0.0.1:7"; then
+  pass "port: a bare port block denies it on a network the policy otherwise allows"
+else
+  fail "127.0.0.1:7 was allowed — a port rule did NOT beat the 127.0.0.0/8 allow"
 fi
 
 # 5) privilege drop — the agent must not have run as root when invoked via sudo.

@@ -85,6 +85,13 @@ pub mod meta {
     /// `BLOCK_DIR_INODES` — the directory rule survived the directory being
     /// renamed.
     pub const KEY_DIR_INO: u32 = 3;
+    /// `DENY_NET`: the destination matched a **port-qualified** rule, i.e. the
+    /// decision came from `NET_PORT_RULES`, not the address-only trie.
+    ///
+    /// Which trie decided is not cosmetic: an approve-once exception has to be
+    /// written into the same trie that denied, or the operator grants an
+    /// allow that the port rule keeps overruling.
+    pub const KEY_PORT: u32 = 4;
 }
 
 /// Bits of [`Event::fmode`], mirroring the kernel's `FMODE_*`. Only the two that
@@ -227,3 +234,56 @@ impl Event {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Ip6Key(pub [u8; 16]);
+
+/// Bits of a port-qualified key that precede the address: the 16-bit port.
+///
+/// **The field order is the semantics.** An LPM trie compares its key as one bit
+/// string from the most significant end, so whatever comes first is what a
+/// prefix can constrain *without* constraining the rest. Port before address is
+/// therefore the only order that lets a rule say "port 25, anywhere" — the most
+/// useful port rule there is. Address first would make that inexpressible,
+/// because reaching the port bits would mean covering all 32 address bits.
+pub const PORT_BITS: u32 = 16;
+
+/// LPM key for a port-qualified IPv4 rule: `[port (network order), address]`.
+///
+/// The trailing padding is explicit and never covered by a prefix. It is there
+/// so the key is exactly 8 bytes: `aya::maps::lpm_trie::Key` places a `u32`
+/// prefix length in front of this, and if the total needed alignment padding,
+/// the kernel would compare that padding as part of the key data.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PortKey4 {
+    pub port: [u8; 2],
+    pub addr: [u8; 4],
+    pub _pad: [u8; 2],
+}
+
+impl PortKey4 {
+    pub const fn new(port: u16, addr: [u8; 4]) -> Self {
+        PortKey4 {
+            port: port.to_be_bytes(),
+            addr,
+            _pad: [0; 2],
+        }
+    }
+}
+
+/// Same, for IPv6: `[port (network order), 16-byte address]`, padded to 20.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PortKey6 {
+    pub port: [u8; 2],
+    pub addr: [u8; 16],
+    pub _pad: [u8; 2],
+}
+
+impl PortKey6 {
+    pub const fn new(port: u16, addr: [u8; 16]) -> Self {
+        PortKey6 {
+            port: port.to_be_bytes(),
+            addr,
+            _pad: [0; 2],
+        }
+    }
+}
