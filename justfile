@@ -66,3 +66,20 @@ setup:
 # One-time: enable the BPF LSM (needs a reboot afterwards).
 enable-lsm:
     sudo ./scripts/enable-bpf-lsm.sh
+
+# Is this kernel actually able to enforce the file/exec axis? A `no` here means
+# `just e2e` will SKIP every LSM assertion — which reads as success and is not.
+check-lsm:
+    @echo "kernel:  $(uname -r)"
+    @echo "BTF:     $([ -e /sys/kernel/btf/vmlinux ] && echo present || echo MISSING)"
+    @echo "cgroup2: $(stat -fc %T /sys/fs/cgroup 2>/dev/null || echo unknown)"
+    @if [ ! -e /sys/kernel/security/lsm ]; then \
+        echo "LSMs:    securityfs not mounted — try: sudo mount -t securityfs securityfs /sys/kernel/security"; \
+     else \
+        echo "LSMs:    $(cat /sys/kernel/security/lsm)"; \
+     fi
+    @if grep -qw bpf /sys/kernel/security/lsm 2>/dev/null; then \
+        echo "BPF-LSM: ACTIVE — file/exec enforcement is testable here"; \
+     else \
+        echo "BPF-LSM: NOT ACTIVE — file/exec assertions will skip (see docs/WSL2.md or scripts/enable-bpf-lsm.sh)"; \
+     fi
