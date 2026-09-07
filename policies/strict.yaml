@@ -72,6 +72,11 @@ network:
   - { port: 465, action: block } # SMTPS
   - { port: 587, action: block } # submission
   - { port: 4444, action: block } # the reverse-shell port of folklore
+  # `proto:` is one dimension further out, and consulted before `port:`. DNS is
+  # the case that needs it: the resolver has to work, and port 53 over TCP is
+  # also a serviceable tunnel, so allow exactly the transport a resolver uses.
+  - { port: 53, proto: udp, action: allow }
+  - { port: 53, action: block }
   - { cidr: "0.0.0.0/0", action: block } # deny everything else (IPv4)
   - { cidr: "::/0", action: block } # deny everything else (IPv6 + v4-mapped)
 

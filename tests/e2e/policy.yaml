@@ -42,6 +42,20 @@ network:
   - { cidr: "127.0.0.2/32", action: block } # this loopback host is blocked...
   - { cidr: "127.0.0.2/32", port: 9, action: allow } # ...except on port 9
   - { port: 7, action: block } # and port 7 is denied everywhere, loopback included
+  # Protocol rules. One dimension further out than `port:`, and consulted before
+  # it, so these exercise the ordering that cannot be inferred from the list:
+  # a rule naming a protocol beats a longer address prefix that does not.
+  - { cidr: "127.0.0.3/32", proto: udp, action: block } # UDP here is denied...
+  #                                                      ...but TCP is still allowed by the /8
+  - { port: 11, action: block } # this port is denied...
+  - { port: 11, proto: udp, action: allow } # ...except over UDP, the most specific rule there is
+  # Protocol rules. One dimension further out than `port:`, and consulted before
+  # it, so these exercise the ordering that cannot be inferred from the list:
+  # a rule naming a protocol beats a longer address prefix that does not.
+  - { cidr: "127.0.0.3/32", proto: udp, action: block } # UDP here is denied...
+  #                                                      ...but TCP is still allowed by the /8
+  - { port: 11, action: block } # this port is denied...
+  - { port: 11, proto: udp, action: allow } # ...except over UDP, the most specific rule there is
   - { cidr: "0.0.0.0/0", action: block } # deny all other v4 egress
   - { cidr: "::/0", action: block } # deny all other v6 egress (regression guard)
 

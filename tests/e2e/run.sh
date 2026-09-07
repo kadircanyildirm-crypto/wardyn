@@ -148,6 +148,15 @@ timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.2/8' 2>/dev/null || true
 timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.2/9' 2>/dev/null || true
 # denied on an address the policy otherwise allows in full — the ordering proof
 timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7' 2>/dev/null || true
+# ── protocol rules, one dimension further out than ports ─────────────────────
+# UDP to a host the /8 allows in full: the protocol rule is consulted first.
+timeout 3 bash -c 'exec 3<>/dev/udp/127.0.0.3/9' 2>/dev/null || true
+# ...and the same host over TCP, which that rule says nothing about.
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.3/10' 2>/dev/null || true
+# A bare port block, lifted for one protocol by the most specific tier there is.
+timeout 3 bash -c 'exec 3<>/dev/udp/127.0.0.1/11' 2>/dev/null || true
+# ...while the same port over TCP is still denied by that bare port rule.
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.4/11' 2>/dev/null || true
 # blocked secret (enforced only under BPF-LSM)
 if cat "$WS/.env" >/dev/null 2>&1; then echo allowed >"$WS/env_read.txt"; else echo denied >"$WS/env_read.txt"; fi
 # blocked secret NESTED under a blocked directory (ancestor walk)
@@ -293,6 +302,29 @@ if audited_block "1.1.1.1:443"; then
   pass "IPv4 egress to 1.1.1.1:443 blocked and enforced"
 else
   fail "expected an enforced block for 1.1.1.1:443"
+fi
+
+# 2c) protocol rules: a rule naming a transport beats a longer address prefix
+#     that does not, and naming both beats naming one.
+if audited_block "127.0.0.3:9"; then
+  pass "proto: UDP denied on a host the address rules allow in full"
+else
+  fail "127.0.0.3:9 over UDP was not blocked — the protocol trie did not take effect"
+fi
+if audited_block "127.0.0.3:10"; then
+  fail "TCP to 127.0.0.3 was blocked by a rule that names UDP — the protocol is being ignored"
+else
+  pass "proto: the same host over TCP is untouched by a UDP rule"
+fi
+if audited_block "127.0.0.1:11"; then
+  fail "UDP to port 11 was blocked — a proto+port allow did NOT beat a bare port block"
+else
+  pass "proto: an allow naming protocol AND port beats a block naming only the port"
+fi
+if audited_block "127.0.0.4:11"; then
+  pass "proto: that same port over TCP is still denied by the bare port rule"
+else
+  fail "127.0.0.4:11 over TCP was allowed — the proto+port allow leaked into the port trie"
 fi
 
 # 3) loopback egress allowed (allows are never audited, so it must be absent).
@@ -534,7 +566,8 @@ fi
 # 9) --dry-run explains the policy without root, eBPF, or a target.
 DRY="$("$WARDYN" --dry-run --policy "$POLICY" 2>&1)"
 if [[ "$DRY" == *"name=.env"* && "$DRY" == *"dir=.ssh"* && "$DRY" == *"cidr:0.0.0.0/0"* \
-   && "$DRY" == *"DELETING"* && "$DRY" == *"CREATING"* ]]; then
+   && "$DRY" == *"DELETING"* && "$DRY" == *"CREATING"* \
+   && "$DRY" == *"blocked by protocol"* && "$DRY" == *"MOST SPECIFIC FIRST"* ]]; then
   pass "--dry-run reports every key the kernel will enforce on, and on which axis"
 else
   fail "--dry-run did not describe the policy's kernel keys"

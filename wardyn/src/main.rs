@@ -37,13 +37,13 @@ use aya::Btf;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 use wardyn_common::{
-    action, fmode, kind, meta, stat, Event, InodeKey, PortKey4, PortKey6, NAME_LEN, PATH_LEN,
-    PORT_BITS,
+    action, fmode, kind, meta, stat, Event, InodeKey, PortKey4, PortKey6, ProtoKey4, ProtoKey6,
+    ProtoPortKey4, ProtoPortKey6, NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS,
 };
 use wardyn_policy::cli::{self, Mode, Opts, ParseOutcome};
 use wardyn_policy::identity::AnchorBase;
 use wardyn_policy::policy::{
-    self, Action, DenialKey, Exceptions, LifecycleOp, Loader, Policy, Verdict,
+    self, Action, DenialKey, Exceptions, LifecycleOp, Loader, Policy, Proto, Verdict,
 };
 
 use crate::audit::Audit;
@@ -95,6 +95,87 @@ struct PortKey6Pod {
     _pad: [u8; 2],
 }
 unsafe impl aya::Pod for PortKey6Pod {}
+
+/// Userspace mirrors of the protocol-qualified LPM keys.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProtoPortKey4Pod {
+    proto: u8,
+    port: [u8; 2],
+    addr: [u8; 4],
+    _pad: [u8; 1],
+}
+unsafe impl aya::Pod for ProtoPortKey4Pod {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProtoPortKey6Pod {
+    proto: u8,
+    port: [u8; 2],
+    addr: [u8; 16],
+    _pad: [u8; 1],
+}
+unsafe impl aya::Pod for ProtoPortKey6Pod {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProtoKey4Pod {
+    proto: u8,
+    addr: [u8; 4],
+    _pad: [u8; 3],
+}
+unsafe impl aya::Pod for ProtoKey4Pod {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProtoKey6Pod {
+    proto: u8,
+    addr: [u8; 16],
+    _pad: [u8; 3],
+}
+unsafe impl aya::Pod for ProtoKey6Pod {}
+
+impl From<ProtoPortKey4> for ProtoPortKey4Pod {
+    fn from(k: ProtoPortKey4) -> Self {
+        ProtoPortKey4Pod {
+            proto: k.proto,
+            port: k.port,
+            addr: k.addr,
+            _pad: [0; 1],
+        }
+    }
+}
+
+impl From<ProtoPortKey6> for ProtoPortKey6Pod {
+    fn from(k: ProtoPortKey6) -> Self {
+        ProtoPortKey6Pod {
+            proto: k.proto,
+            port: k.port,
+            addr: k.addr,
+            _pad: [0; 1],
+        }
+    }
+}
+
+impl From<ProtoKey4> for ProtoKey4Pod {
+    fn from(k: ProtoKey4) -> Self {
+        ProtoKey4Pod {
+            proto: k.proto,
+            addr: k.addr,
+            _pad: [0; 3],
+        }
+    }
+}
+
+impl From<ProtoKey6> for ProtoKey6Pod {
+    fn from(k: ProtoKey6) -> Self {
+        ProtoKey6Pod {
+            proto: k.proto,
+            addr: k.addr,
+            _pad: [0; 3],
+        }
+    }
+}
 
 impl From<PortKey4> for PortKey4Pod {
     fn from(k: PortKey4) -> Self {
@@ -154,6 +235,7 @@ const CFG_EXT_OFFSETS: u32 = 18;
 const CFG_IDENTITY_ON: u32 = 19;
 const CFG_PORT_RULES_ON: u32 = 20;
 const CFG_LIFECYCLE_ON: u32 = 21;
+const CFG_PROTO_RULES_ON: u32 = 22;
 
 /// Feed rows that carry an operator/diagnostic message rather than a syscall.
 const KIND_NOTICE: u32 = u32::MAX;
@@ -171,6 +253,12 @@ pub(crate) struct KernelMaps {
     /// tries above.
     port4: LpmTrie<MapData, PortKey4Pod, u32>,
     port6: LpmTrie<MapData, PortKey6Pod, u32>,
+    /// Protocol-qualified rules. Four tries in all now, consulted most-specific
+    /// first — an exception has to be written into the one that denied.
+    proto_port4: LpmTrie<MapData, ProtoPortKey4Pod, u32>,
+    proto_port6: LpmTrie<MapData, ProtoPortKey6Pod, u32>,
+    proto4: LpmTrie<MapData, ProtoKey4Pod, u32>,
+    proto6: LpmTrie<MapData, ProtoKey6Pod, u32>,
     /// Identity maps (M6). Held for the same reason as the name maps: an
     /// approve-once exception has to be able to drop an inode key mid-run.
     inodes: BpfHashMap<MapData, InoKey, u8>,
@@ -209,6 +297,43 @@ impl KernelMaps {
             port6
                 .insert(&Key::new(plen, PortKey6Pod::from(key)), act, 0)
                 .context("populating NET_PORT_RULES6")?;
+        }
+
+        let mut proto_port4: LpmTrie<_, ProtoPortKey4Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PROTO_PORT_RULES")
+                .context("NET_PROTO_PORT_RULES")?,
+        )?;
+        for (plen, key, act) in policy.proto_port_entries() {
+            proto_port4
+                .insert(&Key::new(plen, ProtoPortKey4Pod::from(key)), act, 0)
+                .context("populating NET_PROTO_PORT_RULES")?;
+        }
+        let mut proto_port6: LpmTrie<_, ProtoPortKey6Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PROTO_PORT_RULES6")
+                .context("NET_PROTO_PORT_RULES6")?,
+        )?;
+        for (plen, key, act) in policy.proto_port_entries6() {
+            proto_port6
+                .insert(&Key::new(plen, ProtoPortKey6Pod::from(key)), act, 0)
+                .context("populating NET_PROTO_PORT_RULES6")?;
+        }
+        let mut proto4: LpmTrie<_, ProtoKey4Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PROTO_RULES")
+                .context("NET_PROTO_RULES")?,
+        )?;
+        for (plen, key, act) in policy.proto_entries() {
+            proto4
+                .insert(&Key::new(plen, ProtoKey4Pod::from(key)), act, 0)
+                .context("populating NET_PROTO_RULES")?;
+        }
+        let mut proto6: LpmTrie<_, ProtoKey6Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PROTO_RULES6")
+                .context("NET_PROTO_RULES6")?,
+        )?;
+        for (plen, key, act) in policy.proto_entries6() {
+            proto6
+                .insert(&Key::new(plen, ProtoKey6Pod::from(key)), act, 0)
+                .context("populating NET_PROTO_RULES6")?;
         }
 
         // The map VALUE is the access mask, not a presence flag — see
@@ -271,6 +396,10 @@ impl KernelMaps {
             net6,
             port4,
             port6,
+            proto_port4,
+            proto_port6,
+            proto4,
+            proto6,
             inodes,
             dir_inodes,
             exec_inodes,
@@ -335,6 +464,59 @@ impl KernelMaps {
             DenialKey::FileInode { dev, ino } => drop_ino(&mut self.inodes, *dev, *ino),
             DenialKey::DirInode { dev, ino } => drop_ino(&mut self.dir_inodes, *dev, *ino),
             DenialKey::ExecInode { dev, ino } => drop_ino(&mut self.exec_inodes, *dev, *ino),
+            // Into the protocol trie that denied, for the same reason a port
+            // denial goes into the port trie: the rule that is still there
+            // outranks an allow written anywhere less specific.
+            DenialKey::NetProto { proto, key } => {
+                let n = proto.number();
+                match key.as_ref() {
+                    DenialKey::Net4(ip) => self
+                        .proto4
+                        .insert(
+                            &Key::new(
+                                PROTO_BITS + 32,
+                                ProtoKey4Pod::from(ProtoKey4::new(n, ip.octets())),
+                            ),
+                            action::ALLOW,
+                            0,
+                        )
+                        .context("inserting protocol allow"),
+                    DenialKey::Net6(ip) => self
+                        .proto6
+                        .insert(
+                            &Key::new(
+                                PROTO_BITS + 128,
+                                ProtoKey6Pod::from(ProtoKey6::new(n, ip.octets())),
+                            ),
+                            action::ALLOW,
+                            0,
+                        )
+                        .context("inserting protocol allow"),
+                    DenialKey::Net4Port { ip, port } => self
+                        .proto_port4
+                        .insert(
+                            &Key::new(
+                                PROTO_BITS + PORT_BITS + 32,
+                                ProtoPortKey4Pod::from(ProtoPortKey4::new(n, *port, ip.octets())),
+                            ),
+                            action::ALLOW,
+                            0,
+                        )
+                        .context("inserting protocol+port allow"),
+                    DenialKey::Net6Port { ip, port } => self
+                        .proto_port6
+                        .insert(
+                            &Key::new(
+                                PROTO_BITS + PORT_BITS + 128,
+                                ProtoPortKey6Pod::from(ProtoPortKey6::new(n, *port, ip.octets())),
+                            ),
+                            action::ALLOW,
+                            0,
+                        )
+                        .context("inserting protocol+port allow"),
+                    other => anyhow::bail!("`{other}` cannot carry a protocol exception"),
+                }
+            }
             DenialKey::Lifecycle { op, key } => {
                 let bit = op.bit();
                 match key.as_ref() {
@@ -1082,6 +1264,7 @@ async fn run() -> anyhow::Result<i32> {
     // not only a hot-path saving: it is what guarantees a policy written before
     // the axis existed cannot start refusing an `rm` because wardyn was updated.
     config.set(CFG_LIFECYCLE_ON, u32::from(policy.has_lifecycle_rules()), 0)?;
+    config.set(CFG_PROTO_RULES_ON, u32::from(policy.has_proto_rules()), 0)?;
 
     // LSM dentry offsets: resolve them from the running kernel's own BTF so the
     // file/exec matcher adapts to the kernel instead of being pinned to 6.8. On
@@ -1667,6 +1850,10 @@ fn prediction_key(k: &DenialKey) -> String {
         // lifecycle denial has nothing to confirm — the kernel event IS the
         // first time userspace hears about the operation.
         DenialKey::Lifecycle { op, key } => format!("{}:{}", op.as_str(), prediction_key(key)),
+        // Keyed on the address alone, exactly as the port form is: userspace
+        // predicts from what the tracepoint saw, and the tracepoint sees a
+        // sockaddr, not a socket — it has no protocol to key on.
+        DenialKey::NetProto { key, .. } => prediction_key(key),
     }
 }
 
@@ -1786,22 +1973,44 @@ pub(crate) fn describe(
         }
         kind::DENY_NET => {
             let addr = deny_net_addr(ev);
-            // `meta` says which trie decided. Building an address key for a
-            // port-trie denial would produce an exception the port rule
-            // immediately overrules.
-            let by_port = ev.meta == meta::KEY_PORT;
+            // `meta` says which of the four tries decided. Building an address
+            // key for a port-trie denial would produce an exception the port
+            // rule immediately overrules — and the same is now true one
+            // dimension further out.
+            let by_port = matches!(ev.meta, meta::KEY_PORT | meta::KEY_PROTO_PORT);
             let key = match (addr, by_port) {
                 (std::net::IpAddr::V4(ip), false) => DenialKey::Net4(ip),
                 (std::net::IpAddr::V6(ip), false) => DenialKey::Net6(ip),
                 (std::net::IpAddr::V4(ip), true) => DenialKey::Net4Port { ip, port: ev.dport },
                 (std::net::IpAddr::V6(ip), true) => DenialKey::Net6Port { ip, port: ev.dport },
             };
+            let key = match ev.meta {
+                meta::KEY_PROTO | meta::KEY_PROTO_PORT => {
+                    match Proto::from_number(ev.proto as u8) {
+                        Some(proto) => DenialKey::NetProto {
+                            proto,
+                            key: Box::new(key),
+                        },
+                        // The kernel says a protocol trie decided but reports a
+                        // protocol no rule can name. That should be impossible;
+                        // leaving the key unwrapped would silently write the
+                        // exception into the wrong trie, so keep the unwrapped key
+                        // and let the operator see the denial repeat rather than
+                        // watch an approval do nothing.
+                        None => key,
+                    }
+                }
+                _ => key,
+            };
             return Some(Desc {
                 pid: ev.pid,
                 comm: field_str(&ev.comm),
                 kind: ev.kind,
                 label: "connect",
-                detail: format!("{addr}:{}", ev.dport),
+                detail: match Proto::from_number(ev.proto as u8) {
+                    Some(p) => format!("{addr}:{} ({})", ev.dport, p.as_str()),
+                    None => format!("{addr}:{}", ev.dport),
+                },
                 action: Action::Block,
                 rule: format!("kernel:{key}"),
                 enforceable: true,
@@ -2214,6 +2423,46 @@ mod tests {
             )
         };
         assert_eq!(a, b, "InoKey and InodeKey do not agree byte-for-byte");
+    }
+
+    /// Same contract for the four protocol keys. A drifted mirror here is a key
+    /// the kernel never finds: the trie matches nothing, wardyn fails open, and
+    /// the only symptom is a rule that quietly stopped applying.
+    #[test]
+    fn the_protocol_key_mirrors_have_the_shared_layout() {
+        use core::mem::size_of;
+
+        fn same_bytes<A, B>(a: &A, b: &B) -> bool {
+            assert_eq!(size_of::<A>(), size_of::<B>(), "size differs");
+            let x = unsafe {
+                core::slice::from_raw_parts((a as *const A) as *const u8, size_of::<A>())
+            };
+            let y = unsafe {
+                core::slice::from_raw_parts((b as *const B) as *const u8, size_of::<B>())
+            };
+            x == y
+        }
+
+        let pp4 = ProtoPortKey4::new(6, 443, [1, 2, 3, 4]);
+        assert!(same_bytes(&pp4, &ProtoPortKey4Pod::from(pp4)));
+        let pp6 = ProtoPortKey6::new(17, 53, [9u8; 16]);
+        assert!(same_bytes(&pp6, &ProtoPortKey6Pod::from(pp6)));
+        let p4 = ProtoKey4::new(17, [10, 0, 0, 1]);
+        assert!(same_bytes(&p4, &ProtoKey4Pod::from(p4)));
+        let p6 = ProtoKey6::new(6, [7u8; 16]);
+        assert!(same_bytes(&p6, &ProtoKey6Pod::from(p6)));
+
+        // The protocol must lead the key, for the same reason the port leads a
+        // `PortKey4`: an LPM trie compares from the most significant end, and
+        // only what comes first can be pinned without pinning the rest.
+        let raw = unsafe {
+            core::slice::from_raw_parts(
+                (&pp4 as *const ProtoPortKey4) as *const u8,
+                size_of::<ProtoPortKey4>(),
+            )
+        };
+        assert_eq!(raw[0], 6, "protocol is not the leading byte");
+        assert_eq!(&raw[1..3], &443u16.to_be_bytes(), "port does not follow it");
     }
 
     /// An identity denial must be rendered as the object's *current* name plus

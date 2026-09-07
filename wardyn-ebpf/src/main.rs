@@ -29,7 +29,8 @@ use aya_ebpf::{
 };
 use wardyn_common::{
     action, fmode, kind, meta, stat, Event, InodeKey, Ip6Key, NameKey, PortKey4, PortKey6,
-    COMM_LEN, MAX_DIR_WALK, NAME_LEN, PATH_LEN, PORT_BITS,
+    ProtoKey4, ProtoKey6, ProtoPortKey4, ProtoPortKey6, COMM_LEN, MAX_DIR_WALK, NAME_LEN, PATH_LEN,
+    PORT_BITS, PROTO_BITS,
 };
 
 /// The kernel refuses GPL-only helpers (`bpf_probe_read_kernel`, which every
@@ -102,6 +103,29 @@ static NET_PORT_RULES: LpmTrie<PortKey4, u32> = LpmTrie::with_max_entries(1024, 
 /// Same, for IPv6.
 #[map]
 static NET_PORT_RULES6: LpmTrie<PortKey6, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Rules naming BOTH a protocol and a port, keyed `[proto, port, address]`.
+///
+/// Four tries now answer the same question at four specificities, and the hooks
+/// consult them in that order — proto+port, port, proto, address — because that
+/// is the order in which a rule says *more* about the connection in front of it.
+/// Letting prefix length decide across dimensions instead would make
+/// `{ proto: udp, action: block }` a `/0` rule that any `/8` allow outranks, so
+/// "no UDP at all" would quietly not mean that.
+#[map]
+static NET_PROTO_PORT_RULES: LpmTrie<ProtoPortKey4, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Same, for IPv6.
+#[map]
+static NET_PROTO_PORT_RULES6: LpmTrie<ProtoPortKey6, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Rules naming a protocol but no port, keyed `[proto, address]`.
+#[map]
+static NET_PROTO_RULES: LpmTrie<ProtoKey4, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Same, for IPv6.
+#[map]
+static NET_PROTO_RULES6: LpmTrie<ProtoKey6, u32> = LpmTrie::with_max_entries(1024, 0);
 
 // The three name maps and the three identity maps below all store an **access
 // mask** as their value (see `wardyn_common::fmode`), not a presence flag: 0
@@ -182,6 +206,9 @@ const CFG_PORT_RULES_ON: u32 = 20;
 /// nothing about removing or creating files pays nothing for them - and, more
 /// importantly, cannot start refusing an `rm` it never mentioned.
 const CFG_LIFECYCLE_ON: u32 = 21;
+/// Set when the policy has at least one rule naming a `proto:`. Skips two trie
+/// lookups per connect for the policies that do not use them.
+const CFG_PROTO_RULES_ON: u32 = 22;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
 // personality(persona) — persona is the 1st arg, same slot as execve's filename.
@@ -449,6 +476,11 @@ fn emit_connect(ctx: &TracePointContext, uaddr_off: usize) -> Result<(), i64> {
         (*e).dev = 0;
         (*e).ino = 0;
         (*e).fmode = 0;
+        // A `sys_enter` tracepoint sees the sockaddr, not the socket, so the
+        // protocol is genuinely unknown here. Reported as 0 rather than guessed
+        // from which syscall it was: `connect(2)` is used on UDP sockets too,
+        // and a guess would put those rows under the wrong rule.
+        (*e).proto = 0;
     }
     entry.submit(0);
     Ok(())
@@ -541,7 +573,7 @@ fn emit_deny_ident(
 /// decided ([`meta::KEY_PORT`] for a port-qualified rule, 0 for address-only) —
 /// userspace needs it to apply an exception to the right one.
 #[inline(always)]
-fn emit_deny_net(daddr: u32, daddr6: [u8; 16], dport: u16, family: u16, meta_val: u32) {
+fn emit_deny_net(daddr: u32, daddr6: [u8; 16], dport: u16, family: u16, meta_val: u32, proto: u8) {
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
         bump(stat::RING_DROPS);
         return;
@@ -560,6 +592,7 @@ fn emit_deny_net(daddr: u32, daddr6: [u8; 16], dport: u16, family: u16, meta_val
         (*e).daddr6 = daddr6;
         (*e).dport = dport;
         (*e).family = family;
+        (*e).proto = proto as u32;
     }
     entry.submit(0);
 }
@@ -606,13 +639,27 @@ pub fn connect4(ctx: SockAddrContext) -> i32 {
 /// `(is it blocked, which trie decided)`. The second half is reported in the
 /// event so an exception can be applied to the trie that actually denied.
 #[inline(always)]
-fn net4_blocked(ip: u32, dport: u16) -> (bool, u32) {
-    // Port rules first, and their answer is final — that is the whole ordering
-    // decision, and userspace's `net_verdict` makes the same one.
+fn net4_blocked(ip: u32, dport: u16, proto: u8) -> (bool, u32) {
+    let addr = ip.to_ne_bytes();
+    let protos_on = cfg(CFG_PROTO_RULES_ON) != 0;
+    // Most specific first, and the first answer is final — that is the whole
+    // ordering decision, and userspace's `net_verdict` makes the same one.
+    if protos_on {
+        let key = ProtoPortKey4::new(proto, dport, addr);
+        if let Some(&a) = NET_PROTO_PORT_RULES.get(&Key::new(PROTO_BITS + PORT_BITS + 32, key)) {
+            return (a == action::BLOCK, meta::KEY_PROTO_PORT);
+        }
+    }
     if cfg(CFG_PORT_RULES_ON) != 0 {
-        let key = PortKey4::new(dport, ip.to_ne_bytes());
+        let key = PortKey4::new(dport, addr);
         if let Some(&a) = NET_PORT_RULES.get(&Key::new(PORT_BITS + 32, key)) {
             return (a == action::BLOCK, meta::KEY_PORT);
+        }
+    }
+    if protos_on {
+        let key = ProtoKey4::new(proto, addr);
+        if let Some(&a) = NET_PROTO_RULES.get(&Key::new(PROTO_BITS + 32, key)) {
+            return (a == action::BLOCK, meta::KEY_PROTO);
         }
     }
     let action = NET_RULES
@@ -630,6 +677,18 @@ fn dest_port(ctx: &SockAddrContext) -> u16 {
     u16::from_be(raw as u16)
 }
 
+/// The socket's IP protocol (`IPPROTO_TCP` / `IPPROTO_UDP`), read from the
+/// context rather than inferred from which hook is running.
+///
+/// Inferring would be wrong in the ordinary case: `connect(2)` on a UDP socket
+/// runs `connect4`, so "connect means TCP" would file every connected datagram
+/// under the wrong protocol — and a `{ proto: udp }` rule would miss exactly the
+/// sockets a program is most likely to use for DNS.
+#[inline(always)]
+fn sock_proto(ctx: &SockAddrContext) -> u8 {
+    unsafe { (*ctx.sock_addr).protocol as u8 }
+}
+
 fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     if cfg(CFG_ENFORCE) == 0 {
         return Ok(ALLOW);
@@ -640,10 +699,11 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     }
     let ip = unsafe { (*ctx.sock_addr).user_ip4 }; // network byte order
     let dport = dest_port(ctx);
-    let (blocked, by) = net4_blocked(ip, dport);
+    let proto = sock_proto(ctx);
+    let (blocked, by) = net4_blocked(ip, dport, proto);
     if blocked {
         bump(stat::DENIED_NET);
-        emit_deny_net(ip, [0u8; 16], dport, AF_INET, by);
+        emit_deny_net(ip, [0u8; 16], dport, AF_INET, by, proto);
         return Ok(DENY);
     }
     Ok(ALLOW)
@@ -694,26 +754,50 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         && ip6[10] == 0xff
         && ip6[11] == 0xff;
     let dport = dest_port(ctx);
+    let proto = sock_proto(ctx);
     if v4_mapped {
         // ip6[12..16] are the embedded v4 octets in network order — the same
         // representation `net4_blocked` and `user_ip4` use.
         let ip = u32::from_ne_bytes([ip6[12], ip6[13], ip6[14], ip6[15]]);
-        let (blocked, by) = net4_blocked(ip, dport);
+        let (blocked, by) = net4_blocked(ip, dport, proto);
         if blocked {
             bump(stat::DENIED_NET);
             // Report the address the operator will recognise from the feed.
-            emit_deny_net(0, ip6, dport, AF_INET6, by);
+            emit_deny_net(0, ip6, dport, AF_INET6, by, proto);
             return Ok(DENY);
         }
         return Ok(ALLOW);
     }
-    // Port rules first, exactly as in the v4 path.
+    // The same four tiers as the v4 path, in the same order.
+    let protos_on = cfg(CFG_PROTO_RULES_ON) != 0;
+    if protos_on {
+        let key = ProtoPortKey6::new(proto, dport, ip6);
+        if let Some(&a) = NET_PROTO_PORT_RULES6.get(&Key::new(PROTO_BITS + PORT_BITS + 128, key)) {
+            if a == action::BLOCK {
+                bump(stat::DENIED_NET);
+                emit_deny_net(0, ip6, dport, AF_INET6, meta::KEY_PROTO_PORT, proto);
+                return Ok(DENY);
+            }
+            return Ok(ALLOW);
+        }
+    }
     if cfg(CFG_PORT_RULES_ON) != 0 {
         let key = PortKey6::new(dport, ip6);
         if let Some(&a) = NET_PORT_RULES6.get(&Key::new(PORT_BITS + 128, key)) {
             if a == action::BLOCK {
                 bump(stat::DENIED_NET);
-                emit_deny_net(0, ip6, dport, AF_INET6, meta::KEY_PORT);
+                emit_deny_net(0, ip6, dport, AF_INET6, meta::KEY_PORT, proto);
+                return Ok(DENY);
+            }
+            return Ok(ALLOW);
+        }
+    }
+    if protos_on {
+        let key = ProtoKey6::new(proto, ip6);
+        if let Some(&a) = NET_PROTO_RULES6.get(&Key::new(PROTO_BITS + 128, key)) {
+            if a == action::BLOCK {
+                bump(stat::DENIED_NET);
+                emit_deny_net(0, ip6, dport, AF_INET6, meta::KEY_PROTO, proto);
                 return Ok(DENY);
             }
             return Ok(ALLOW);
@@ -725,7 +809,7 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         .unwrap_or_else(|| cfg(CFG_NET_DEFAULT));
     if action == action::BLOCK {
         bump(stat::DENIED_NET);
-        emit_deny_net(0, ip6, dport, AF_INET6, 0);
+        emit_deny_net(0, ip6, dport, AF_INET6, 0, proto);
         return Ok(DENY);
     }
     Ok(ALLOW)

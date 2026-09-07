@@ -151,11 +151,32 @@ saying "first match wins" everywhere would be wrong:
 | `network`, rules naming a `port:` | **consulted first**, whatever the address prefixes — see below |
 | `files` / `exec` under `--enforce` | **no order** — the kernel holds a *set* of block keys, so an earlier `allow` does not exempt what a later `block` covers |
 
-A network rule may name a **`port:`**, and one that does beats one that does not:
-`{ port: 25, action: block }` denies SMTP even to a `/8` the policy allows in
-full. Within the port rules it is longest-prefix as usual, so a specific relay
-can still be allowed back. A bare `port:` with no `cidr:` covers **both** address
-families — a v4-only reading would leave the same port open over IPv6.
+A network rule may name a **`port:`** and a **`proto:`** (`tcp`/`udp`), and a
+rule that names more of them beats one that names fewer — whatever their address
+prefixes. Rules are consulted in four tiers, most specific first:
+
+| tier | example | beats |
+| --- | --- | --- |
+| protocol **and** port | `{ port: 53, proto: udp, action: allow }` | everything below |
+| port | `{ port: 25, action: block }` | address rules, at any prefix |
+| protocol | `{ proto: udp, action: block }` | address rules, at any prefix |
+| address | `{ cidr: "10.0.0.0/8", action: allow }` | the default |
+
+So `{ port: 25, action: block }` denies SMTP even to a `/8` the policy allows in
+full, and `{ proto: udp, action: block }` denies UDP there too. Within a tier it
+is longest-prefix as usual, so a specific relay can still be allowed back. A bare
+`port:`/`proto:` with no `cidr:` covers **both** address families — a v4-only
+reading would leave the same port open over IPv6.
+
+Letting prefix length decide *across* dimensions instead would make
+`{ proto: udp, action: block }` a `/0` rule that any `/8` allow outranks, so the
+most useful protocol rule there is would quietly not mean what it says.
+
+> A `proto:` rule is enforced by the kernel but **not predicted in the feed**:
+> the connect tracepoint sees a `sockaddr`, not a socket, so it has no protocol
+> to match on. Where a policy makes the outcome depend on the transport, the
+> observed row says so and does not claim a verdict; if the kernel denies, its
+> own row reports it. `--dry-run` prints the same warning.
 
 A file or exec rule is written with **either** `match:` (a glob over names) or
 `path:` (one concrete object, pinned by identity) — never both. File rules also
@@ -205,6 +226,7 @@ network:                                 # cidr, or domain (resolved at load)
   - { cidr: "127.0.0.0/8",   action: allow }
   - { domain: "github.com",  action: allow }
   - { port: 25,              action: block }   # never SMTP — beats any rule above
+  - { port: 53, proto: udp,  action: allow }   # ...but DNS over UDP is fine
   - { cidr: "0.0.0.0/0",     action: block }   # deny all other egress
 
 exec:                                    # glob against the executable path
@@ -341,15 +363,15 @@ Full design, hook map, and the eBPF-verifier war stories are in
   of flailing at a bare `EPERM`. _(denial receipts ✓, approve-once exceptions
   from the TUI ✓, kernel-reported denials ✓)_ Next: persistent overrides kept
   outside the watched tree's reach.
-- [ ] **M6 — Match on identity, not names:** _(`(dev, ino)` keying for files,
+- [x] **M6 — Match on identity, not names:** _(`(dev, ino)` keying for files,
   directories and executables ✓, read/write axis ✓, create/delete axis ✓,
-  `port:` in network rules ✓, offsets resolved from the running kernel's BTF ✓,
-  e2e proof that rename/hard-link/copy no longer defeat a rule — including a
-  control run showing they still do without it ✓, and that a plain `block` rule
-  still permits `rm`, so no existing policy changed meaning ✓)_ Next: protocol
-  (`tcp`/`udp`) alongside `port:`. Copying a *blocked binary* to a new name still
-  runs it — a copy is a different object with a different name, and unlike a
-  secret there is no read to deny; see [`SECURITY.md`](./SECURITY.md).
+  `port:` in network rules ✓, `proto:` (`tcp`/`udp`) alongside it ✓, offsets
+  resolved from the running kernel's BTF ✓, e2e proof that rename/hard-link/copy no longer defeat a rule —
+  including a control run showing they still do without it ✓, and that a plain
+  `block` rule still permits `rm`, so no existing policy changed meaning ✓)_
+  Copying a *blocked binary* to a new name still runs it — a copy is a different
+  object with a different name, and unlike a secret there is no read to deny;
+  see [`SECURITY.md`](./SECURITY.md).
 
 ## Contributing
 

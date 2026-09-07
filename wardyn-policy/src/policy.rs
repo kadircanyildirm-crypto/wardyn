@@ -23,7 +23,10 @@ use anyhow::{Context as _, Result};
 use globset::{Glob, GlobMatcher};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use wardyn_common::{fmode, InodeKey, PortKey4, PortKey6, NAME_LEN, PORT_BITS};
+use wardyn_common::{
+    fmode, proto as ipproto, InodeKey, PortKey4, PortKey6, ProtoKey4, ProtoKey6, ProtoPortKey4,
+    ProtoPortKey6, NAME_LEN, PORT_BITS, PROTO_BITS,
+};
 
 use crate::identity::{self, Anchor, AnchorBase, AnchorKind, ResolveOutcome, UnresolvedAnchor};
 
@@ -141,6 +144,45 @@ impl Action {
     }
 }
 
+/// The transport a network rule can name.
+///
+/// Two values, not 256: these are the protocols an egress policy can say
+/// anything useful about, and a rule able to name any IP protocol number would
+/// mostly be able to name ones no socket the hooks see ever carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Proto {
+    Tcp,
+    Udp,
+}
+
+impl Proto {
+    /// The IP protocol number the kernel key is built from.
+    pub fn number(self) -> u8 {
+        match self {
+            Proto::Tcp => ipproto::TCP,
+            Proto::Udp => ipproto::UDP,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+        }
+    }
+
+    /// The rule vocabulary for a protocol number seen on the wire, or `None` for
+    /// anything a rule cannot name.
+    pub fn from_number(n: u8) -> Option<Proto> {
+        match n {
+            ipproto::TCP => Some(Proto::Tcp),
+            ipproto::UDP => Some(Proto::Udp),
+            _ => None,
+        }
+    }
+}
+
 /// A policy decision plus the rule that produced it (for audit / display).
 #[derive(Debug, Clone)]
 pub struct Verdict {
@@ -232,6 +274,18 @@ pub enum DenialKey {
         dev: u32,
         ino: u64,
     },
+    /// The same cgroup hooks, but the decision came from one of the two
+    /// **protocol** tries.
+    ///
+    /// `key` is the address-or-port key inside that trie, and `proto` says which
+    /// trie holds it. Wrapping rather than adding four flat variants keeps the
+    /// overrides file readable, and keeps the invariant that matters: an
+    /// exception is written into the trie that denied, or the rule that is still
+    /// there overrules it on the very next connect.
+    NetProto {
+        proto: Proto,
+        key: Box<DenialKey>,
+    },
     /// One of the lifecycle hooks (`inode_unlink`, `inode_rmdir`,
     /// `inode_create`, `inode_mkdir`, `inode_rename`) refused.
     ///
@@ -290,6 +344,15 @@ impl DenialKey {
             DenialKey::Lifecycle { op, key } => {
                 format!("{}-ing, and only that, for: {}", op.as_str(), key.scope())
             }
+            // Narrower than the key it wraps, in the same way and for the same
+            // reason as a port key: this grants one transport, not the host.
+            DenialKey::NetProto { proto, key } => {
+                format!(
+                    "{} only — {}",
+                    proto.as_str().to_uppercase(),
+                    key.blast_radius()
+                )
+            }
         }
     }
 
@@ -319,7 +382,7 @@ impl DenialKey {
             DenialKey::FileInode { dev, ino }
             | DenialKey::DirInode { dev, ino }
             | DenialKey::ExecInode { dev, ino } => Some(InodeKey::new(*dev, *ino)),
-            DenialKey::Lifecycle { key, .. } => key.inode(),
+            DenialKey::Lifecycle { key, .. } | DenialKey::NetProto { key, .. } => key.inode(),
             _ => None,
         }
     }
@@ -407,6 +470,7 @@ impl fmt::Display for DenialKey {
             DenialKey::DirInode { dev, ino } => write!(f, "dir-ino={}", dev_ino(*dev, *ino)),
             DenialKey::ExecInode { dev, ino } => write!(f, "exec-ino={}", dev_ino(*dev, *ino)),
             DenialKey::Lifecycle { op, key } => write!(f, "{}:{key}", op.as_str()),
+            DenialKey::NetProto { proto, key } => write!(f, "{}/{key}", proto.as_str()),
         }
     }
 }
@@ -477,6 +541,10 @@ struct NetRuleRaw {
     /// any rule that does not, whatever their address prefixes — see
     /// [`Policy::eval_connect`].
     port: Option<u16>,
+    /// Transport. Same idea one dimension further: a rule naming a protocol is
+    /// more specific than one that does not, and the two combine — `proto` +
+    /// `port` is the most specific rule there is.
+    proto: Option<Proto>,
     action: Action,
 }
 
@@ -542,9 +610,12 @@ enum NetMatch {
 struct NetRule {
     label: String,
     which: NetMatch,
-    /// `Some(p)` puts this rule in the port trie, which the kernel consults
-    /// before the address-only one.
+    /// `Some(p)` puts this rule in a port trie, which the kernel consults
+    /// before the address-only ones.
     port: Option<u16>,
+    /// `Some(p)` puts this rule in a protocol trie. With `port`, that is four
+    /// tries in all, consulted most-specific first.
+    proto: Option<Proto>,
     action: Action,
 }
 
@@ -569,6 +640,12 @@ impl NetRule {
     /// Does this rule's port constraint (if any) admit `dport`?
     fn port_matches(&self, dport: u16) -> bool {
         self.port.is_none_or(|p| p == dport)
+    }
+
+    /// Which of the four tiers this rule lives in: `(names a proto, names a
+    /// port)`. The tuple is the trie, and the order tiers are consulted in.
+    fn tier(&self) -> (bool, bool) {
+        (self.proto.is_some(), self.port.is_some())
     }
 }
 
@@ -692,9 +769,11 @@ impl Policy {
         let mut network = Vec::new();
         let mut unresolved_domains = Vec::new();
         for r in raw.network {
-            let suffix = match r.port {
-                Some(p) => format!(" port {p}"),
-                None => String::new(),
+            let suffix = match (r.proto, r.port) {
+                (Some(t), Some(p)) => format!(" {} port {p}", t.as_str()),
+                (Some(t), None) => format!(" {}", t.as_str()),
+                (None, Some(p)) => format!(" port {p}"),
+                (None, None) => String::new(),
             };
             match (&r.cidr, &r.domain) {
                 (Some(cidr), Some(domain)) => {
@@ -712,6 +791,7 @@ impl Policy {
                         label: format!("cidr:{cidr}{suffix}"),
                         which,
                         port: r.port,
+                        proto: r.proto,
                         action: r.action,
                     });
                 }
@@ -729,6 +809,7 @@ impl Policy {
                             label: format!("domain:{domain}{suffix}"),
                             which,
                             port: r.port,
+                            proto: r.proto,
                             action: r.action,
                         });
                     }
@@ -739,17 +820,24 @@ impl Policy {
                 // over IPv6, which is the exact shape of the hole the `::/0`
                 // rule had to be added for.
                 (None, None) => {
-                    let Some(port) = r.port else {
-                        anyhow::bail!("network rule needs `cidr`, `domain`, or `port`");
+                    if r.port.is_none() && r.proto.is_none() {
+                        anyhow::bail!("network rule needs `cidr`, `domain`, `port`, or `proto`");
+                    }
+                    let label = match (r.proto, r.port) {
+                        (Some(t), Some(p)) => format!("{}:{p}", t.as_str()),
+                        (Some(t), None) => format!("proto:{}", t.as_str()),
+                        (None, Some(p)) => format!("port:{p}"),
+                        (None, None) => unreachable!("guarded above"),
                     };
                     for which in [
                         NetMatch::V4Cidr("0.0.0.0/0".parse().expect("valid")),
                         NetMatch::V6Cidr("::/0".parse().expect("valid")),
                     ] {
                         network.push(NetRule {
-                            label: format!("port:{port}"),
+                            label: label.clone(),
                             which,
-                            port: Some(port),
+                            port: r.port,
+                            proto: r.proto,
                             action: r.action,
                         });
                     }
@@ -826,10 +914,12 @@ impl Policy {
         self.network
             .iter()
             .rev()
-            // Port-qualified rules live in their own trie; leaving them here as
-            // well would make `{ cidr: "0.0.0.0/0", port: 25, action: block }`
-            // read as a deny-all for every port.
-            .filter(|r| r.port.is_none())
+            // A rule that names a port or a protocol lives in one of the three
+            // more specific tries; leaving it here as well would make
+            // `{ cidr: "0.0.0.0/0", port: 25, action: block }` read as a
+            // deny-all for every port, and `{ proto: udp, action: block }` as a
+            // deny-all for every transport.
+            .filter(|r| r.tier() == (false, false))
             .filter_map(|r| {
                 let (plen, data) = match &r.which {
                     NetMatch::V4Cidr(net) => (
@@ -855,7 +945,7 @@ impl Policy {
             .iter()
             .rev()
             .filter_map(|r| {
-                let port = r.port?;
+                let port = r.port.filter(|_| r.proto.is_none())?;
                 let (addr_bits, octets) = match &r.which {
                     NetMatch::V4Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
                     NetMatch::V4Ip(a) => (32u32, a.octets()),
@@ -876,7 +966,7 @@ impl Policy {
             .iter()
             .rev()
             .filter_map(|r| {
-                let port = r.port?;
+                let port = r.port.filter(|_| r.proto.is_none())?;
                 let (addr_bits, octets) = match &r.which {
                     NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
                     NetMatch::V6Ip(a) => (128u32, a.octets()),
@@ -894,7 +984,103 @@ impl Policy {
     /// Whether any rule names a port — i.e. whether the kernel needs to consult
     /// the port tries at all.
     pub fn has_port_rules(&self) -> bool {
-        self.network.iter().any(|r| r.port.is_some())
+        self.network.iter().any(|r| r.tier() == (false, true))
+    }
+
+    /// Whether any rule names a protocol, for the same reason.
+    pub fn has_proto_rules(&self) -> bool {
+        self.network.iter().any(|r| r.proto.is_some())
+    }
+
+    /// Rules naming a protocol AND a port, for `NET_PROTO_PORT_RULES`.
+    ///
+    /// The prefix covers the protocol and port bits in full and only the address
+    /// is prefixed — a rule reaches this trie by naming both, so neither leading
+    /// field is ever a don't-care, and the address keeps exactly the meaning it
+    /// has in the tries with no protocol at all.
+    pub fn proto_port_entries(&self) -> Vec<(u32, ProtoPortKey4, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter_map(|r| {
+                let (proto, port) = (r.proto?, r.port?);
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V4Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V4Ip(a) => (32u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PROTO_BITS + PORT_BITS + addr_bits,
+                    ProtoPortKey4::new(proto.number(), port, octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Same, for IPv6.
+    pub fn proto_port_entries6(&self) -> Vec<(u32, ProtoPortKey6, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter_map(|r| {
+                let (proto, port) = (r.proto?, r.port?);
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V6Ip(a) => (128u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PROTO_BITS + PORT_BITS + addr_bits,
+                    ProtoPortKey6::new(proto.number(), port, octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Rules naming a protocol but no port, for `NET_PROTO_RULES`.
+    pub fn proto_entries(&self) -> Vec<(u32, ProtoKey4, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter(|r| r.port.is_none())
+            .filter_map(|r| {
+                let proto = r.proto?;
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V4Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V4Ip(a) => (32u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PROTO_BITS + addr_bits,
+                    ProtoKey4::new(proto.number(), octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Same, for IPv6.
+    pub fn proto_entries6(&self) -> Vec<(u32, ProtoKey6, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter(|r| r.port.is_none())
+            .filter_map(|r| {
+                let proto = r.proto?;
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V6Ip(a) => (128u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PROTO_BITS + addr_bits,
+                    ProtoKey6::new(proto.number(), octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
     }
 
     /// IPv6 network rules as `(prefix_len, address bytes (network order), action
@@ -1221,38 +1407,60 @@ impl Policy {
             let axis = if a.exec { "exec" } else { "file" };
             let _ = writeln!(s, "  {axis}  {:<29} {}", a.to_string(), a.blast_radius());
         }
-        // Deduplicated: a bare `port:` rule is compiled into one entry per
-        // address family, and a rule listed twice reads as two rules.
-        let blocked = |ported: bool| -> Vec<&str> {
+        // Deduplicated: a bare `port:`/`proto:` rule is compiled into one entry
+        // per address family, and a rule listed twice reads as two rules.
+        let blocked = |tier: (bool, bool)| -> Vec<&str> {
             let mut out: Vec<&str> = Vec::new();
             for r in &self.network {
-                if r.action == Action::Block
-                    && r.port.is_some() == ported
-                    && !out.contains(&r.label.as_str())
+                if r.action == Action::Block && r.tier() == tier && !out.contains(&r.label.as_str())
                 {
                     out.push(&r.label);
                 }
             }
             out
         };
-        let (addr_blocks, port_blocks) = (blocked(false), blocked(true));
-        if addr_blocks.is_empty() && port_blocks.is_empty() {
-            let _ = writeln!(s, "  net   (no block rules — no egress is denied)");
-        } else {
-            if !addr_blocks.is_empty() {
-                let _ = writeln!(s, "  net   blocked: {}", addr_blocks.join(", "));
-            }
-            if !port_blocks.is_empty() {
-                let _ = writeln!(s, "  net   blocked by port: {}", port_blocks.join(", "));
+        // Listed in the order the kernel consults them, because that order IS
+        // the semantics: reading them in policy order would suggest a
+        // first-match rule that does not exist.
+        let tiers = [
+            ((true, true), "blocked by protocol+port"),
+            ((false, true), "blocked by port"),
+            ((true, false), "blocked by protocol"),
+            ((false, false), "blocked"),
+        ];
+        let mut any = false;
+        for (tier, label) in tiers {
+            let rules = blocked(tier);
+            if !rules.is_empty() {
+                any = true;
+                let _ = writeln!(s, "  net   {label}: {}", rules.join(", "));
             }
         }
-        // The one thing about port rules that cannot be inferred from the list.
-        if self.has_port_rules() {
+        if !any {
+            let _ = writeln!(s, "  net   (no block rules — no egress is denied)");
+        }
+        // The one thing about these rules that cannot be inferred from the list.
+        if self.has_port_rules() || self.has_proto_rules() {
             let _ = writeln!(
                 s,
-                "\nnote: a rule naming a `port:` is consulted BEFORE any rule that does not, \
-                 whatever\n      their address prefixes. `{{ port: 25, action: block }}` denies \
-                 SMTP even to a\n      network another rule allows in full."
+                "\nnote: rules are consulted MOST SPECIFIC FIRST — protocol+port, then port, then\
+                 \n      protocol, then address — whatever their address prefixes. \
+                 `{{ port: 25,\n      action: block }}` denies SMTP even to a network another rule \
+                 allows in full, and\n      `{{ proto: udp, action: block }}` denies UDP there too."
+            );
+        }
+        // A protocol rule enforces nothing on a connect whose protocol the feed
+        // could not read, and the feed reads none of them — so the row an
+        // operator sees may say `ok` for a connection the kernel then refuses.
+        // The kernel's own DENY_NET event still reports it; saying so here is
+        // what keeps that from looking like a contradiction.
+        if self.has_proto_rules() {
+            let _ = writeln!(
+                s,
+                "      A `proto:` rule is enforced by the kernel but NOT predicted in the feed: \
+                 the\n      connect tracepoint sees a sockaddr, not a socket, so it has no \
+                 protocol to\n      match on. Such a denial arrives as a kernel-reported row \
+                 instead."
             );
         }
         if self.kern_names.is_empty()
@@ -1362,35 +1570,122 @@ impl Policy {
         eval_path(&self.exec, path, self.default_action)
     }
 
+    /// The verdict for a connect whose transport is not known.
+    ///
+    /// That is every *observed* connect: the `sys_enter` tracepoint sees a
+    /// `sockaddr`, not a socket, so it cannot report the protocol and does not
+    /// guess one. See [`Self::eval_connect_proto`] for what the mirror does with
+    /// that.
     pub fn eval_connect(&self, ip: Ipv4Addr, dport: u16) -> Verdict {
-        self.net_verdict(|r| r.v4_prefix(ip), dport)
+        self.eval_connect_proto(ip, dport, None)
     }
 
     pub fn eval_connect6(&self, ip: Ipv6Addr, dport: u16) -> Verdict {
-        self.net_verdict(|r| r.v6_prefix(ip), dport)
+        self.eval_connect6_proto(ip, dport, None)
+    }
+
+    /// The verdict for a connect on a known transport.
+    ///
+    /// `None` means "not known", and the mirror then evaluates **both**
+    /// transports. Where they agree, the answer is certain and nothing about the
+    /// prediction changes. Where they disagree, the policy has made the outcome
+    /// depend on something the feed cannot see, and the verdict comes back as
+    /// the least severe of the two with `enforceable: false`.
+    ///
+    /// Neither half of that is arbitrary. Simply skipping the protocol tiers
+    /// looks safe and is not: a proto-qualified *allow* outranks a lower-tier
+    /// block, so ignoring it makes the mirror claim a denial the kernel never
+    /// made — which is the failure this mirror exists to prevent, and which the
+    /// e2e suite caught doing exactly that. Leaning to the permissive side
+    /// instead costs nothing, because a denial the mirror misses still reaches
+    /// the feed: the cgroup hook reports its own decision, exactly as it does
+    /// for an identity match no path string could have predicted.
+    pub fn eval_connect_proto(&self, ip: Ipv4Addr, dport: u16, proto: Option<Proto>) -> Verdict {
+        self.net_verdict(|r| r.v4_prefix(ip), dport, proto)
+    }
+
+    pub fn eval_connect6_proto(&self, ip: Ipv6Addr, dport: u16, proto: Option<Proto>) -> Verdict {
+        self.net_verdict(|r| r.v6_prefix(ip), dport, proto)
     }
 
     /// Pick the verdict for a connect, mirroring what the kernel will do.
     ///
-    /// Two passes, and the order between them is the one thing about port rules
-    /// that has to be stated rather than guessed:
+    /// Four passes, and the order between them is the one thing about these
+    /// rules that has to be stated rather than guessed:
     ///
-    /// 1. **Rules that name this port**, most-specific address first.
-    /// 2. **Rules that name no port**, most-specific address first.
-    /// 3. `default_action`.
+    /// 1. **Rules naming this protocol AND this port**, most-specific address first.
+    /// 2. **Rules naming this port** (any protocol), most-specific address first.
+    /// 3. **Rules naming this protocol** (any port), most-specific address first.
+    /// 4. **Rules naming neither**, most-specific address first.
+    /// 5. `default_action`.
     ///
-    /// So a rule that names a port beats one that does not, whatever their
+    /// So a rule that names a dimension beats one that does not, whatever their
     /// address prefixes — `{ port: 25, action: block }` denies SMTP even to a
-    /// `/8` the policy otherwise allows. That is what the kernel does, because
-    /// port rules live in their own trie which the hook consults first, and it
-    /// is also what people mean when they write "never SMTP". Within each pass
-    /// it is longest-prefix-match, not first-match, because the kernel decides
-    /// with an LPM trie; ties keep the earliest rule.
-    fn net_verdict(&self, prefix_of: impl Fn(&NetRule) -> Option<u8>, dport: u16) -> Verdict {
-        for ported in [true, false] {
+    /// `/8` the policy otherwise allows, and `{ proto: udp, action: block }`
+    /// denies UDP there too. That is what the kernel does, because each tier is
+    /// its own LPM trie and the hook consults them in this order; it is also
+    /// what people mean when they write "never SMTP" or "no UDP at all".
+    ///
+    /// Letting prefix length decide *across* dimensions instead would make
+    /// `{ proto: udp, action: block }` a `/0` rule that any `/8` allow outranks,
+    /// so the most useful protocol rule there is would quietly not mean what it
+    /// says. Within each pass it is longest-prefix-match, not first-match,
+    /// because the kernel decides with an LPM trie; ties keep the earliest rule.
+    fn net_verdict(
+        &self,
+        prefix_of: impl Fn(&NetRule) -> Option<u8>,
+        dport: u16,
+        proto: Option<Proto>,
+    ) -> Verdict {
+        // A known transport, or a policy with nothing protocol-dependent in it:
+        // one pass, and the answer is exact.
+        if proto.is_some() || !self.has_proto_rules() {
+            return self.net_verdict_for(&prefix_of, dport, proto);
+        }
+        // Otherwise ask both transports. Agreement means the protocol never
+        // mattered here, so the prediction is as good as it ever was.
+        let tcp = self.net_verdict_for(&prefix_of, dport, Some(Proto::Tcp));
+        let udp = self.net_verdict_for(&prefix_of, dport, Some(Proto::Udp));
+        if tcp.action == udp.action {
+            return tcp;
+        }
+        // Disagreement means the feed genuinely cannot say. Report the least
+        // severe of the two and mark it unenforceable, so the row never asserts
+        // a denial the kernel may not make; if the kernel does deny, its own
+        // `DENY_NET` event says so, and that row is the authority.
+        let (lenient, other) = if tcp.action.code() <= udp.action.code() {
+            (tcp, udp)
+        } else {
+            (udp, tcp)
+        };
+        Verdict {
+            action: lenient.action,
+            rule: format!(
+                "{} (transport-dependent: `{}` if the other protocol)",
+                lenient.rule, other.rule
+            ),
+            enforceable: false,
+        }
+    }
+
+    /// One pass of the four-tier match, for a single (possibly unknown) transport.
+    fn net_verdict_for(
+        &self,
+        prefix_of: &impl Fn(&NetRule) -> Option<u8>,
+        dport: u16,
+        proto: Option<Proto>,
+    ) -> Verdict {
+        for tier in [(true, true), (false, true), (true, false), (false, false)] {
+            // An unknown protocol matches no protocol rule.
+            if tier.0 && proto.is_none() {
+                continue;
+            }
             let mut best: Option<(&NetRule, u8)> = None;
             for r in &self.network {
-                if r.port.is_some() != ported || !r.port_matches(dport) {
+                if r.tier() != tier || !r.port_matches(dport) {
+                    continue;
+                }
+                if r.proto.is_some() && r.proto != proto {
                     continue;
                 }
                 let Some(plen) = prefix_of(r) else {
@@ -2005,7 +2300,7 @@ network:
             panic!("a rule with nothing to match on must be refused");
         };
         assert!(
-            format!("{e:?}").contains("`cidr`, `domain`, or `port`"),
+            format!("{e:?}").contains("`cidr`, `domain`, `port`, or `proto`"),
             "{e:?}"
         );
     }
@@ -2785,5 +3080,240 @@ files:
 
         let text = p.explain();
         assert!(text.contains("DELETING"), "{text}");
+    }
+
+    // ── the protocol axis (M6) ──────────────────────────────────────────────
+
+    /// The claim the whole tiering exists to make: a rule that names a protocol
+    /// beats one that does not, whatever their address prefixes. Prefix-length
+    /// ordering alone would make this a `/0` losing to a `/8`.
+    #[test]
+    fn a_proto_rule_beats_an_address_rule_with_a_longer_prefix() {
+        let p = parse(
+            r#"
+network:
+  - { cidr: "10.0.0.0/8", action: allow }
+  - { proto: udp,         action: block }
+"#,
+        )
+        .expect("parses");
+
+        let host: Ipv4Addr = "10.1.2.3".parse().unwrap();
+        assert_eq!(
+            p.eval_connect_proto(host, 443, Some(Proto::Udp)).action,
+            Action::Block,
+            "a /8 allow outranked `no UDP at all`"
+        );
+        // ...and says nothing about the other transport.
+        assert_eq!(
+            p.eval_connect_proto(host, 443, Some(Proto::Tcp)).action,
+            Action::Allow
+        );
+    }
+
+    /// Naming both dimensions is more specific than naming either, and the two
+    /// combine in the order the kernel consults its tries.
+    #[test]
+    fn protocol_and_port_together_are_the_most_specific_tier() {
+        let p = parse(
+            r#"
+network:
+  - { port: 53, proto: udp, action: allow }
+  - { port: 53,             action: block }
+  - { cidr: "0.0.0.0/0",    action: allow }
+"#,
+        )
+        .expect("parses");
+
+        let dns: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        // The proto+port rule is consulted first, so DNS over UDP is allowed...
+        assert_eq!(
+            p.eval_connect_proto(dns, 53, Some(Proto::Udp)).action,
+            Action::Allow
+        );
+        // ...while the bare port rule still denies the same port over TCP.
+        assert_eq!(
+            p.eval_connect_proto(dns, 53, Some(Proto::Tcp)).action,
+            Action::Block
+        );
+        // And a port nobody mentioned falls through to the address tier.
+        assert_eq!(
+            p.eval_connect_proto(dns, 443, Some(Proto::Tcp)).action,
+            Action::Allow
+        );
+    }
+
+    /// The feed cannot read a socket's protocol, so where the policy makes the
+    /// outcome depend on one it must not pretend to know.
+    ///
+    /// This is the regression the e2e suite caught: skipping the protocol tiers
+    /// looks like the safe direction and is not. A proto-qualified *allow*
+    /// outranks a lower-tier block, so ignoring it made the mirror record
+    /// `block, enforced: true` for a connection the kernel had just permitted —
+    /// the exact claim this mirror exists to never make.
+    #[test]
+    fn a_transport_dependent_outcome_is_reported_as_unknown_not_as_a_denial() {
+        let p = parse(
+            r#"
+network:
+  - { port: 11, proto: udp, action: allow }
+  - { port: 11,             action: block }
+  - { cidr: "0.0.0.0/0",    action: allow }
+"#,
+        )
+        .expect("parses");
+
+        let host: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        // Known transports: exact, and they disagree.
+        assert_eq!(
+            p.eval_connect_proto(host, 11, Some(Proto::Udp)).action,
+            Action::Allow
+        );
+        assert_eq!(
+            p.eval_connect_proto(host, 11, Some(Proto::Tcp)).action,
+            Action::Block
+        );
+        // Unknown: the lenient side, and explicitly not enforceable, so the row
+        // never asserts a denial. The kernel reports its own if it makes one.
+        let v = p.eval_connect(host, 11);
+        assert_eq!(
+            v.action,
+            Action::Allow,
+            "the feed claimed a denial it cannot know about"
+        );
+        assert!(
+            !v.enforceable,
+            "an uncertain verdict was recorded as enforced"
+        );
+        assert!(v.rule.contains("transport-dependent"), "{}", v.rule);
+    }
+
+    /// Where both transports agree, nothing about the prediction changes — a
+    /// policy whose protocol rules do not reach this connection keeps the exact
+    /// verdict it had before the axis existed.
+    #[test]
+    fn agreement_between_transports_keeps_the_verdict_certain() {
+        let p = parse(
+            r#"
+network:
+  - { cidr: "10.0.0.0/8", proto: udp, action: block }
+  - { cidr: "0.0.0.0/0",  action: block }
+"#,
+        )
+        .expect("parses");
+
+        // 1.1.1.1 is outside the /8, so both transports land on the deny-all.
+        let v = p.eval_connect("1.1.1.1".parse().unwrap(), 443);
+        assert_eq!(v.action, Action::Block);
+        assert!(
+            v.enforceable,
+            "a verdict both transports agree on must stay enforceable"
+        );
+    }
+
+    /// Each tier owns its own trie, and a rule must appear in exactly one —
+    /// leaving a `proto:` rule in the address trie as well would turn
+    /// `{ proto: udp, action: block }` into a deny-all for every transport.
+    #[test]
+    fn proto_rules_are_kept_out_of_the_less_specific_tries() {
+        let p = parse(
+            r#"
+network:
+  - { cidr: "0.0.0.0/0", proto: udp, action: block }
+  - { cidr: "1.1.1.1/32", port: 53, proto: udp, action: block }
+"#,
+        )
+        .expect("parses");
+
+        assert!(p.has_proto_rules());
+        assert!(!p.has_port_rules(), "a proto+port rule is not a port rule");
+        assert!(
+            p.net_entries().is_empty(),
+            "a protocol rule leaked into the address trie"
+        );
+        assert!(
+            p.port_entries().is_empty(),
+            "a protocol+port rule leaked into the port trie"
+        );
+        assert_eq!(p.proto_entries().len(), 1);
+        assert_eq!(p.proto_port_entries().len(), 1);
+    }
+
+    /// The prefix has to cover the protocol and port bits in full: a rule
+    /// reaches these tries by naming them, so neither is ever a don't-care.
+    #[test]
+    fn the_protocol_key_puts_the_protocol_before_everything_else() {
+        let p = parse(
+            r#"
+network:
+  - { cidr: "10.0.0.0/8", port: 25, proto: tcp, action: block }
+"#,
+        )
+        .expect("parses");
+
+        let (plen, key, _) = p.proto_port_entries()[0];
+        assert_eq!(
+            plen,
+            PROTO_BITS + PORT_BITS + 8,
+            "prefix must cover proto+port in full"
+        );
+        assert_eq!(key.proto, 6, "IPPROTO_TCP");
+        assert_eq!(key.port, 25u16.to_be_bytes(), "port in network order");
+        assert_eq!(key.addr, [10, 0, 0, 0]);
+
+        let (plen, key, _) = parse("network:\n  - { proto: udp, action: block }\n")
+            .expect("parses")
+            .proto_entries()[0];
+        assert_eq!(plen, PROTO_BITS, "a bare proto rule pins the protocol only");
+        assert_eq!(key.proto, 17, "IPPROTO_UDP");
+    }
+
+    /// A bare `proto:` with no address covers BOTH families — a v4-only reading
+    /// would leave the same transport open over IPv6, which is the exact shape
+    /// of the hole the `::/0` rule had to be added for.
+    #[test]
+    fn a_bare_protocol_rule_covers_both_address_families() {
+        let p = parse("network:\n  - { proto: udp, action: block }\n").expect("parses");
+        assert_eq!(p.proto_entries().len(), 1);
+        assert_eq!(p.proto_entries6().len(), 1);
+        assert_eq!(
+            p.eval_connect6_proto("2606:4700::1".parse().unwrap(), 443, Some(Proto::Udp))
+                .action,
+            Action::Block
+        );
+    }
+
+    /// An exception must name the trie that denied, or the rule still sitting in
+    /// it overrules the approval on the very next connect.
+    #[test]
+    fn a_protocol_exception_is_narrower_than_the_address_it_wraps() {
+        let inner = DenialKey::Net4("1.1.1.1".parse().unwrap());
+        let wrapped = DenialKey::NetProto {
+            proto: Proto::Udp,
+            key: Box::new(inner.clone()),
+        };
+        assert_ne!(wrapped, inner);
+        let radius = wrapped.blast_radius();
+        assert!(radius.contains("UDP"), "{radius}");
+        assert!(radius.contains("1.1.1.1"), "{radius}");
+    }
+
+    /// `--dry-run` has to state the order, because it is the one thing about
+    /// these rules that cannot be read off the list.
+    #[test]
+    fn dry_run_lists_the_protocol_tiers_and_names_the_prediction_gap() {
+        let p = parse(
+            r#"
+network:
+  - { port: 53, proto: udp, action: block }
+  - { proto: udp,           action: block }
+"#,
+        )
+        .expect("parses");
+        let text = p.explain();
+        assert!(text.contains("blocked by protocol+port"), "{text}");
+        assert!(text.contains("blocked by protocol"), "{text}");
+        assert!(text.contains("MOST SPECIFIC FIRST"), "{text}");
+        assert!(text.contains("NOT predicted in the feed"), "{text}");
     }
 }

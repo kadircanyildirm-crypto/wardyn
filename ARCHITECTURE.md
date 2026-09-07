@@ -183,7 +183,25 @@ launched subtree, and only under `--enforce`. Because `WATCHED` is seeded only i
 (system-wide blocking is out of scope, and would otherwise enforce *nothing* while
 claiming to).
 
-- **Network** — `cgroup/connect4` consults two LPM tries, in this order:
+- **Network** — `cgroup/connect4` consults four LPM tries, most specific first —
+  protocol+port, port, protocol, address — because that is the order in which a
+  rule *says more* about the connection in front of it. The leading fields of
+  each key (`proto`, then `port`) are always fully covered by the prefix: a rule
+  reaches one of those tries by naming them, so neither is ever a don't-care, and
+  the address behind them keeps exactly the meaning it has in the plain trie.
+
+  Two consequences worth stating. The protocol comes from
+  `bpf_sock_addr->protocol`, not from which hook fired — `connect(2)` runs on UDP
+  sockets too, so "connect means TCP" would file every connected datagram under
+  the wrong rule. And userspace **cannot** mirror the protocol tiers for an
+  *observed* connect: the `sys_enter` tracepoint sees a `sockaddr`, not a socket.
+  Where the two transports would get different verdicts, the mirror reports the
+  lenient one and marks it unenforceable rather than asserting a denial the
+  kernel may not make — the e2e suite caught an earlier version doing exactly
+  that, recording `block, enforced: true` for a connection the kernel had just
+  permitted.
+
+  Within the address tier, `connect4` consults two LPM tries, in this order:
   1. `NET_PORT_RULES`, keyed `[port, address]`, holding every rule that named a
      `port:`. If it hits, that answer is final.
   2. `NET_RULES`, keyed by address alone, then `default_action` on a miss.

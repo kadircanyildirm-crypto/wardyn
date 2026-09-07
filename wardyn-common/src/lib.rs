@@ -105,6 +105,12 @@ pub mod meta {
     /// written into the same trie that denied, or the operator grants an
     /// allow that the port rule keeps overruling.
     pub const KEY_PORT: u32 = 4;
+    /// `DENY_NET`: the decision came from `NET_PROTO_RULES`, i.e. a rule that
+    /// named a `proto:` but no `port:`.
+    pub const KEY_PROTO: u32 = 5;
+    /// `DENY_NET`: the decision came from `NET_PROTO_PORT_RULES` — a rule that
+    /// named both. The most specific of the four tries, and the first consulted.
+    pub const KEY_PROTO_PORT: u32 = 6;
 }
 
 /// The access mask stored beside every file/exec block key, and the `f_mode`
@@ -308,6 +314,15 @@ pub struct Event {
     /// For `OPEN` observations and `DENY_FILE`: the access the open asked for,
     /// as [`fmode`] bits. 0 when the hook could not read it.
     pub fmode: u32,
+
+    /// For `CONNECT` / `DENY_NET`: the socket's IP protocol number (`IPPROTO_TCP`
+    /// = 6, `IPPROTO_UDP` = 17), 0 when unknown.
+    ///
+    /// Its own field rather than a reuse of [`Self::fmode`], which happens to be
+    /// free on network events: an operator reading a raw audit line should not
+    /// have to know which kind of event they are looking at before they can say
+    /// what a number means.
+    pub proto: u32,
 }
 
 impl Event {
@@ -330,6 +345,7 @@ impl Event {
             ino: 0,
             dev: 0,
             fmode: 0,
+            proto: 0,
         }
     }
 }
@@ -389,6 +405,113 @@ impl PortKey6 {
             port: port.to_be_bytes(),
             addr,
             _pad: [0; 2],
+        }
+    }
+}
+
+/// IP protocol numbers a rule can name. Only these two: they are the transports
+/// an egress policy can meaningfully talk about, and a policy that could name
+/// any of 256 numbers would mostly be able to name ones no socket ever carries.
+pub mod proto {
+    pub const TCP: u8 = 6;
+    pub const UDP: u8 = 17;
+}
+
+/// Bits of a protocol-qualified key that precede everything else: the 8-bit
+/// protocol number.
+///
+/// Leading, for the same reason the port leads a [`PortKey4`]: an LPM trie
+/// compares its key as one bit string from the most significant end, so only
+/// what comes first can be pinned without pinning the rest. A rule in either of
+/// the protocol tries *always* names a protocol — that is what put it there — so
+/// these bits are never a don't-care, and the fields behind them keep the exact
+/// meaning they have in the tries that have no protocol at all.
+pub const PROTO_BITS: u32 = 8;
+
+/// LPM key for a rule naming a protocol and a port: `[proto, port, address]`.
+///
+/// Four tries now answer the same question at different specificities, and the
+/// hooks consult them most-specific first — protocol+port, port, protocol,
+/// address — because that is the order in which a rule *says more* about the
+/// connection in front of it. The alternative is to let prefix length decide
+/// across dimensions, which would make `{ proto: udp, action: block }` lose to
+/// any `/8` allow and turn "no UDP at all" into a rule that does not mean what
+/// it says.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProtoPortKey4 {
+    pub proto: u8,
+    pub port: [u8; 2],
+    pub addr: [u8; 4],
+    pub _pad: [u8; 1],
+}
+
+impl ProtoPortKey4 {
+    pub const fn new(proto: u8, port: u16, addr: [u8; 4]) -> Self {
+        ProtoPortKey4 {
+            proto,
+            port: port.to_be_bytes(),
+            addr,
+            _pad: [0; 1],
+        }
+    }
+}
+
+/// Same, for IPv6.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProtoPortKey6 {
+    pub proto: u8,
+    pub port: [u8; 2],
+    pub addr: [u8; 16],
+    pub _pad: [u8; 1],
+}
+
+impl ProtoPortKey6 {
+    pub const fn new(proto: u8, port: u16, addr: [u8; 16]) -> Self {
+        ProtoPortKey6 {
+            proto,
+            port: port.to_be_bytes(),
+            addr,
+            _pad: [0; 1],
+        }
+    }
+}
+
+/// LPM key for a rule naming a protocol but no port: `[proto, address]`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProtoKey4 {
+    pub proto: u8,
+    pub addr: [u8; 4],
+    pub _pad: [u8; 3],
+}
+
+impl ProtoKey4 {
+    pub const fn new(proto: u8, addr: [u8; 4]) -> Self {
+        ProtoKey4 {
+            proto,
+            addr,
+            _pad: [0; 3],
+        }
+    }
+}
+
+/// Same, for IPv6.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProtoKey6 {
+    pub proto: u8,
+    pub addr: [u8; 16],
+    pub _pad: [u8; 3],
+}
+
+impl ProtoKey6 {
+    pub const fn new(proto: u8, addr: [u8; 16]) -> Self {
+        ProtoKey6 {
+            proto,
+            addr,
+            _pad: [0; 3],
         }
     }
 }

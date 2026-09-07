@@ -45,6 +45,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`proto: tcp | udp` on network rules (M6).** A rule can now name the transport,
+  and rules are consulted in four tiers, most specific first — protocol+port,
+  port, protocol, address:
+
+  ```yaml
+  network:
+    - { port: 53, proto: udp, action: allow }   # the resolver works...
+    - { port: 53,             action: block }   # ...but 53/tcp is a tunnel
+    - { proto: udp,           action: block }   # no other UDP, anywhere
+  ```
+
+  Each tier is its own LPM trie, keyed with the protocol leading and the port
+  behind it, so a rule that names a dimension beats one that does not whatever
+  their address prefixes — the same guarantee `port:` already made, extended one
+  dimension. Letting prefix length decide *across* dimensions instead would make
+  `{ proto: udp, action: block }` a `/0` rule that any `/8` allow outranks, and
+  "no UDP at all" would quietly not mean that.
+
+  The protocol comes from `bpf_sock_addr->protocol`, not from which hook fired:
+  `connect(2)` runs on UDP sockets too, so "connect means TCP" would file every
+  connected datagram under the wrong rule — including the DNS a program is most
+  likely to send.
+
+  ## The feed cannot see a protocol, and now says so
+
+  The `sys_enter_connect` tracepoint sees a `sockaddr`, not a socket. Where a
+  policy makes the outcome depend on the transport, the userspace mirror reports
+  the *lenient* of the two verdicts and marks it unenforceable, rather than
+  asserting a denial the kernel may not make. `--dry-run` says the same thing in
+  words.
+
+  The first attempt simply skipped the protocol tiers when the protocol was
+  unknown, which looks like the safe direction and is not: a proto-qualified
+  *allow* outranks a lower-tier block, so ignoring it made the audit record
+  `block, enforced: true` for a connection the kernel had just permitted. The
+  e2e suite caught it, and a unit test now pins the behaviour that replaced it.
+
 - **A create/delete axis — `access: create` / `delete` / `all` (M6).** `rm` is not
   an open. Every file rule wardyn had was matched at `file_open`, and that hook
   does not fire for `unlink(2)` at all — so a policy could guard a secret's

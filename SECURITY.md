@@ -108,6 +108,21 @@ Out of scope (known limitations, documented, not vulnerabilities):
     can make an anchor fail to match. It fails *open*, degrading to the name rule,
     and never denies the wrong object: the key simply matches nothing.
 
+- **A `proto:` rule is enforced but not predicted.** The kernel reads the
+  socket's protocol; the connect tracepoint cannot, because it sees a `sockaddr`
+  and not a socket. Where a policy makes a destination's verdict depend on the
+  transport, the observed feed row reports the lenient verdict and does **not**
+  claim enforcement — the kernel's own `DENY_NET` row is what reports a denial.
+  A row that says `ok` followed by a kernel `⛔BLOCK` for the same destination is
+  this, working as intended.
+
+- **`proto:` names a transport, not a payload.** `{ proto: udp, action: block }`
+  refuses UDP sockets; it says nothing about what is tunnelled over the transports
+  that remain, and DNS-over-HTTPS or a shell over 443/tcp are not protocol-level
+  events. Rules are matched at `connect`/`sendmsg`, so a raw socket
+  (`SOCK_RAW`, `AF_PACKET`) or an already-established connection is outside what
+  these hooks see at all.
+
 - **Rules are matched, not the intent behind them.** `access: read` narrows a rule
   to opens requesting `FMODE_READ`. An `O_PATH` open requests neither read nor
   write and is covered only by a rule with no `access:` (the default), or by
