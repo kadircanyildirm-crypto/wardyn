@@ -20,12 +20,14 @@
 //! operation failed instead of flailing against a bare EPERM.
 mod audit;
 mod btf;
+mod overrides_file;
 mod receipt;
 mod tui;
 
 use std::collections::VecDeque;
 use std::io::IsTerminal as _;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context as _};
 use aya::maps::lpm_trie::{Key, LpmTrie};
@@ -34,9 +36,15 @@ use aya::programs::{CgroupAttachMode, CgroupSockAddr, Lsm, TracePoint};
 use aya::Btf;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
-use wardyn_common::{action, kind, meta, stat, Event, NAME_LEN, PATH_LEN};
+use wardyn_common::{
+    action, fmode, kind, meta, stat, Event, InodeKey, PortKey4, PortKey6, ProtoKey4, ProtoKey6,
+    ProtoPortKey4, ProtoPortKey6, NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS,
+};
 use wardyn_policy::cli::{self, Mode, Opts, ParseOutcome};
-use wardyn_policy::policy::{self, Action, DenialKey, Exceptions, Policy, Verdict};
+use wardyn_policy::identity::AnchorBase;
+use wardyn_policy::policy::{
+    self, Action, DenialKey, Exceptions, LifecycleOp, Loader, Policy, Proto, Verdict,
+};
 
 use crate::audit::Audit;
 use crate::receipt::Receipt;
@@ -56,6 +64,149 @@ unsafe impl aya::Pod for NameKey {}
 struct Ip6Key([u8; 16]);
 unsafe impl aya::Pod for Ip6Key {}
 
+/// Userspace mirror of `wardyn_common::InodeKey`, `Pod` for the identity maps.
+/// Same story as `NameKey`: the orphan rule keeps the `Pod` impl off the shared
+/// type, so the layout is duplicated and asserted equal in the tests below.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InoKey {
+    dev: u32,
+    _pad: u32,
+    ino: u64,
+}
+unsafe impl aya::Pod for InoKey {}
+
+/// Userspace mirrors of the port-qualified LPM keys. Same orphan-rule story as
+/// `NameKey` and `InoKey`; the layouts are asserted equal in the tests below.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PortKey4Pod {
+    port: [u8; 2],
+    addr: [u8; 4],
+    _pad: [u8; 2],
+}
+unsafe impl aya::Pod for PortKey4Pod {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PortKey6Pod {
+    port: [u8; 2],
+    addr: [u8; 16],
+    _pad: [u8; 2],
+}
+unsafe impl aya::Pod for PortKey6Pod {}
+
+/// Userspace mirrors of the protocol-qualified LPM keys.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProtoPortKey4Pod {
+    proto: u8,
+    port: [u8; 2],
+    addr: [u8; 4],
+    _pad: [u8; 1],
+}
+unsafe impl aya::Pod for ProtoPortKey4Pod {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProtoPortKey6Pod {
+    proto: u8,
+    port: [u8; 2],
+    addr: [u8; 16],
+    _pad: [u8; 1],
+}
+unsafe impl aya::Pod for ProtoPortKey6Pod {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProtoKey4Pod {
+    proto: u8,
+    addr: [u8; 4],
+    _pad: [u8; 3],
+}
+unsafe impl aya::Pod for ProtoKey4Pod {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProtoKey6Pod {
+    proto: u8,
+    addr: [u8; 16],
+    _pad: [u8; 3],
+}
+unsafe impl aya::Pod for ProtoKey6Pod {}
+
+impl From<ProtoPortKey4> for ProtoPortKey4Pod {
+    fn from(k: ProtoPortKey4) -> Self {
+        ProtoPortKey4Pod {
+            proto: k.proto,
+            port: k.port,
+            addr: k.addr,
+            _pad: [0; 1],
+        }
+    }
+}
+
+impl From<ProtoPortKey6> for ProtoPortKey6Pod {
+    fn from(k: ProtoPortKey6) -> Self {
+        ProtoPortKey6Pod {
+            proto: k.proto,
+            port: k.port,
+            addr: k.addr,
+            _pad: [0; 1],
+        }
+    }
+}
+
+impl From<ProtoKey4> for ProtoKey4Pod {
+    fn from(k: ProtoKey4) -> Self {
+        ProtoKey4Pod {
+            proto: k.proto,
+            addr: k.addr,
+            _pad: [0; 3],
+        }
+    }
+}
+
+impl From<ProtoKey6> for ProtoKey6Pod {
+    fn from(k: ProtoKey6) -> Self {
+        ProtoKey6Pod {
+            proto: k.proto,
+            addr: k.addr,
+            _pad: [0; 3],
+        }
+    }
+}
+
+impl From<PortKey4> for PortKey4Pod {
+    fn from(k: PortKey4) -> Self {
+        PortKey4Pod {
+            port: k.port,
+            addr: k.addr,
+            _pad: [0; 2],
+        }
+    }
+}
+
+impl From<PortKey6> for PortKey6Pod {
+    fn from(k: PortKey6) -> Self {
+        PortKey6Pod {
+            port: k.port,
+            addr: k.addr,
+            _pad: [0; 2],
+        }
+    }
+}
+
+impl From<InodeKey> for InoKey {
+    fn from(k: InodeKey) -> Self {
+        InoKey {
+            dev: k.dev,
+            _pad: 0,
+            ino: k.ino,
+        }
+    }
+}
+
 /// AF_INET6, matching the eBPF side.
 const AF_INET6: u16 = 10;
 
@@ -71,6 +222,20 @@ const CFG_FILE_DENTRY_OFF: u32 = 8;
 const CFG_DENTRY_NAME_OFF: u32 = 9;
 const CFG_DENTRY_PARENT_OFF: u32 = 10;
 const CFG_BPRM_FILE_OFF: u32 = 11;
+// Identity matching (M6). All zero unless BTF yielded the inode fields AND the
+// policy produced at least one anchor; the hooks check `CFG_IDENTITY_ON` first,
+// so a kernel that hides these simply keeps name matching.
+const CFG_FILE_INODE_OFF: u32 = 12;
+const CFG_FILE_MODE_OFF: u32 = 13;
+const CFG_INODE_INO_OFF: u32 = 14;
+const CFG_INODE_SB_OFF: u32 = 15;
+const CFG_SB_DEV_OFF: u32 = 16;
+const CFG_DENTRY_INODE_OFF: u32 = 17;
+const CFG_EXT_OFFSETS: u32 = 18;
+const CFG_IDENTITY_ON: u32 = 19;
+const CFG_PORT_RULES_ON: u32 = 20;
+const CFG_LIFECYCLE_ON: u32 = 21;
+const CFG_PROTO_RULES_ON: u32 = 22;
 
 /// Feed rows that carry an operator/diagnostic message rather than a syscall.
 const KIND_NOTICE: u32 = u32::MAX;
@@ -84,6 +249,21 @@ pub(crate) struct KernelMaps {
     execs: BpfHashMap<MapData, NameKey, u8>,
     net4: LpmTrie<MapData, u32, u32>,
     net6: LpmTrie<MapData, Ip6Key, u32>,
+    /// Port-qualified rules, consulted by the hooks before the address-only
+    /// tries above.
+    port4: LpmTrie<MapData, PortKey4Pod, u32>,
+    port6: LpmTrie<MapData, PortKey6Pod, u32>,
+    /// Protocol-qualified rules. Four tries in all now, consulted most-specific
+    /// first — an exception has to be written into the one that denied.
+    proto_port4: LpmTrie<MapData, ProtoPortKey4Pod, u32>,
+    proto_port6: LpmTrie<MapData, ProtoPortKey6Pod, u32>,
+    proto4: LpmTrie<MapData, ProtoKey4Pod, u32>,
+    proto6: LpmTrie<MapData, ProtoKey6Pod, u32>,
+    /// Identity maps (M6). Held for the same reason as the name maps: an
+    /// approve-once exception has to be able to drop an inode key mid-run.
+    inodes: BpfHashMap<MapData, InoKey, u8>,
+    dir_inodes: BpfHashMap<MapData, InoKey, u8>,
+    exec_inodes: BpfHashMap<MapData, InoKey, u8>,
 }
 
 impl KernelMaps {
@@ -102,33 +282,127 @@ impl KernelMaps {
             net6.insert(&Key::new(plen, Ip6Key(data)), act, 0)
                 .context("populating NET_RULES6")?;
         }
+        let mut port4: LpmTrie<_, PortKey4Pod, u32> =
+            LpmTrie::try_from(ebpf.take_map("NET_PORT_RULES").context("NET_PORT_RULES")?)?;
+        for (plen, key, act) in policy.port_entries() {
+            port4
+                .insert(&Key::new(plen, PortKey4Pod::from(key)), act, 0)
+                .context("populating NET_PORT_RULES")?;
+        }
+        let mut port6: LpmTrie<_, PortKey6Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PORT_RULES6")
+                .context("NET_PORT_RULES6")?,
+        )?;
+        for (plen, key, act) in policy.port_entries6() {
+            port6
+                .insert(&Key::new(plen, PortKey6Pod::from(key)), act, 0)
+                .context("populating NET_PORT_RULES6")?;
+        }
+
+        let mut proto_port4: LpmTrie<_, ProtoPortKey4Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PROTO_PORT_RULES")
+                .context("NET_PROTO_PORT_RULES")?,
+        )?;
+        for (plen, key, act) in policy.proto_port_entries() {
+            proto_port4
+                .insert(&Key::new(plen, ProtoPortKey4Pod::from(key)), act, 0)
+                .context("populating NET_PROTO_PORT_RULES")?;
+        }
+        let mut proto_port6: LpmTrie<_, ProtoPortKey6Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PROTO_PORT_RULES6")
+                .context("NET_PROTO_PORT_RULES6")?,
+        )?;
+        for (plen, key, act) in policy.proto_port_entries6() {
+            proto_port6
+                .insert(&Key::new(plen, ProtoPortKey6Pod::from(key)), act, 0)
+                .context("populating NET_PROTO_PORT_RULES6")?;
+        }
+        let mut proto4: LpmTrie<_, ProtoKey4Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PROTO_RULES")
+                .context("NET_PROTO_RULES")?,
+        )?;
+        for (plen, key, act) in policy.proto_entries() {
+            proto4
+                .insert(&Key::new(plen, ProtoKey4Pod::from(key)), act, 0)
+                .context("populating NET_PROTO_RULES")?;
+        }
+        let mut proto6: LpmTrie<_, ProtoKey6Pod, u32> = LpmTrie::try_from(
+            ebpf.take_map("NET_PROTO_RULES6")
+                .context("NET_PROTO_RULES6")?,
+        )?;
+        for (plen, key, act) in policy.proto_entries6() {
+            proto6
+                .insert(&Key::new(plen, ProtoKey6Pod::from(key)), act, 0)
+                .context("populating NET_PROTO_RULES6")?;
+        }
+
+        // The map VALUE is the access mask, not a presence flag — see
+        // `wardyn_common::fmode`. 0 means "every open"; READ/WRITE narrow it.
         let (name_keys, dir_keys) = policy.file_enforcement();
         let mut names: BpfHashMap<_, NameKey, u8> =
             BpfHashMap::try_from(ebpf.take_map("BLOCK_NAMES").context("BLOCK_NAMES")?)?;
-        for k in name_keys {
+        for (k, mask) in name_keys {
             names
-                .insert(NameKey(k), 1u8, 0)
+                .insert(NameKey(k), mask, 0)
                 .context("populating BLOCK_NAMES")?;
         }
         let mut dirs: BpfHashMap<_, NameKey, u8> =
             BpfHashMap::try_from(ebpf.take_map("BLOCK_DIRS").context("BLOCK_DIRS")?)?;
-        for k in dir_keys {
-            dirs.insert(NameKey(k), 1u8, 0)
+        for (k, mask) in dir_keys {
+            dirs.insert(NameKey(k), mask, 0)
                 .context("populating BLOCK_DIRS")?;
         }
         let mut execs: BpfHashMap<_, NameKey, u8> =
             BpfHashMap::try_from(ebpf.take_map("BLOCK_EXEC").context("BLOCK_EXEC")?)?;
-        for k in policy.exec_enforcement() {
+        for (k, mask) in policy.exec_enforcement() {
             execs
-                .insert(NameKey(k), 1u8, 0)
+                .insert(NameKey(k), mask, 0)
                 .context("populating BLOCK_EXEC")?;
         }
+
+        // Identity keys. Populated even when the kernel's identity offsets did
+        // not resolve: the hooks gate on CFG_IDENTITY_ON, so a populated map is
+        // simply never consulted, and startup has already said so out loud.
+        let inode_keys = policy.inode_enforcement();
+        let mut take_ino = |name: &str| -> anyhow::Result<BpfHashMap<MapData, InoKey, u8>> {
+            Ok(BpfHashMap::try_from(
+                ebpf.take_map(name).with_context(|| name.to_string())?,
+            )?)
+        };
+        let mut inodes = take_ino("BLOCK_INODES")?;
+        for (k, mask) in inode_keys.files {
+            inodes
+                .insert(InoKey::from(k), mask, 0)
+                .context("populating BLOCK_INODES")?;
+        }
+        let mut dir_inodes = take_ino("BLOCK_DIR_INODES")?;
+        for (k, mask) in inode_keys.dirs {
+            dir_inodes
+                .insert(InoKey::from(k), mask, 0)
+                .context("populating BLOCK_DIR_INODES")?;
+        }
+        let mut exec_inodes = take_ino("BLOCK_EXEC_INODES")?;
+        for (k, mask) in inode_keys.execs {
+            exec_inodes
+                .insert(InoKey::from(k), mask, 0)
+                .context("populating BLOCK_EXEC_INODES")?;
+        }
+
         Ok(KernelMaps {
             names,
             dirs,
             execs,
             net4,
             net6,
+            port4,
+            port6,
+            proto_port4,
+            proto_port6,
+            proto4,
+            proto6,
+            inodes,
+            dir_inodes,
+            exec_inodes,
         })
     }
 
@@ -141,10 +415,126 @@ impl KernelMaps {
             let bytes = policy::name_key(name).context("name not kernel-mappable")?;
             map.remove(&NameKey(bytes)).context("removing block key")
         }
+        fn drop_ino(
+            map: &mut BpfHashMap<MapData, InoKey, u8>,
+            dev: u32,
+            ino: u64,
+        ) -> anyhow::Result<()> {
+            map.remove(&InoKey::from(InodeKey::new(dev, ino)))
+                .context("removing identity block key")
+        }
+        // A lifecycle exception narrows the stored mask instead of removing the
+        // key: the operator approved one `rm`, not every read of the file. The
+        // key only goes away when clearing the bit leaves nothing to enforce —
+        // writing a zero back would mean `MASK_ANY`, i.e. "block every open",
+        // which is the opposite of what was granted.
+        fn lift_name(
+            map: &mut BpfHashMap<MapData, NameKey, u8>,
+            name: &str,
+            op: u8,
+        ) -> anyhow::Result<()> {
+            let bytes = policy::name_key(name).context("name not kernel-mappable")?;
+            let cur = map.get(&NameKey(bytes), 0).context("reading block key")?;
+            match fmode::without(cur, op) {
+                Some(next) => map
+                    .insert(NameKey(bytes), next, 0)
+                    .context("narrowing block key"),
+                None => map.remove(&NameKey(bytes)).context("removing block key"),
+            }
+        }
+        fn lift_ino(
+            map: &mut BpfHashMap<MapData, InoKey, u8>,
+            dev: u32,
+            ino: u64,
+            op: u8,
+        ) -> anyhow::Result<()> {
+            let k = InoKey::from(InodeKey::new(dev, ino));
+            let cur = map.get(&k, 0).context("reading identity block key")?;
+            match fmode::without(cur, op) {
+                Some(next) => map
+                    .insert(k, next, 0)
+                    .context("narrowing identity block key"),
+                None => map.remove(&k).context("removing identity block key"),
+            }
+        }
         match key {
             DenialKey::FileName(n) => drop_name(&mut self.names, n),
             DenialKey::FileDir(d) => drop_name(&mut self.dirs, d),
             DenialKey::Exec(n) => drop_name(&mut self.execs, n),
+            DenialKey::FileInode { dev, ino } => drop_ino(&mut self.inodes, *dev, *ino),
+            DenialKey::DirInode { dev, ino } => drop_ino(&mut self.dir_inodes, *dev, *ino),
+            DenialKey::ExecInode { dev, ino } => drop_ino(&mut self.exec_inodes, *dev, *ino),
+            // Into the protocol trie that denied, for the same reason a port
+            // denial goes into the port trie: the rule that is still there
+            // outranks an allow written anywhere less specific.
+            DenialKey::NetProto { proto, key } => {
+                let n = proto.number();
+                match key.as_ref() {
+                    DenialKey::Net4(ip) => self
+                        .proto4
+                        .insert(
+                            &Key::new(
+                                PROTO_BITS + 32,
+                                ProtoKey4Pod::from(ProtoKey4::new(n, ip.octets())),
+                            ),
+                            action::ALLOW,
+                            0,
+                        )
+                        .context("inserting protocol allow"),
+                    DenialKey::Net6(ip) => self
+                        .proto6
+                        .insert(
+                            &Key::new(
+                                PROTO_BITS + 128,
+                                ProtoKey6Pod::from(ProtoKey6::new(n, ip.octets())),
+                            ),
+                            action::ALLOW,
+                            0,
+                        )
+                        .context("inserting protocol allow"),
+                    DenialKey::Net4Port { ip, port } => self
+                        .proto_port4
+                        .insert(
+                            &Key::new(
+                                PROTO_BITS + PORT_BITS + 32,
+                                ProtoPortKey4Pod::from(ProtoPortKey4::new(n, *port, ip.octets())),
+                            ),
+                            action::ALLOW,
+                            0,
+                        )
+                        .context("inserting protocol+port allow"),
+                    DenialKey::Net6Port { ip, port } => self
+                        .proto_port6
+                        .insert(
+                            &Key::new(
+                                PROTO_BITS + PORT_BITS + 128,
+                                ProtoPortKey6Pod::from(ProtoPortKey6::new(n, *port, ip.octets())),
+                            ),
+                            action::ALLOW,
+                            0,
+                        )
+                        .context("inserting protocol+port allow"),
+                    other => anyhow::bail!("`{other}` cannot carry a protocol exception"),
+                }
+            }
+            DenialKey::Lifecycle { op, key } => {
+                let bit = op.bit();
+                match key.as_ref() {
+                    DenialKey::FileName(n) => lift_name(&mut self.names, n, bit),
+                    DenialKey::FileDir(d) => lift_name(&mut self.dirs, d, bit),
+                    DenialKey::FileInode { dev, ino } => {
+                        lift_ino(&mut self.inodes, *dev, *ino, bit)
+                    }
+                    DenialKey::DirInode { dev, ino } => {
+                        lift_ino(&mut self.dir_inodes, *dev, *ino, bit)
+                    }
+                    // The lifecycle hooks consult only the four file maps, so
+                    // nothing else can be wrapped. Refuse rather than silently
+                    // do nothing: an exception that quietly failed is worse than
+                    // one that never appeared.
+                    other => anyhow::bail!("`{other}` cannot carry a lifecycle exception"),
+                }
+            }
             // `from_ne_bytes`, not `from_le_bytes`: the LPM trie compares key
             // bytes from the most significant end, so the octets must sit in
             // network order in memory on either endianness.
@@ -160,6 +550,31 @@ impl KernelMaps {
                 .net6
                 .insert(&Key::new(128, Ip6Key(ip.octets())), action::ALLOW, 0)
                 .context("inserting /128 allow"),
+            // Into the PORT trie, because that is the one that denied. The hooks
+            // consult it first and take its answer as final, so an allow written
+            // anywhere else would be read after the block that is still there.
+            DenialKey::Net4Port { ip, port } => self
+                .port4
+                .insert(
+                    &Key::new(
+                        PORT_BITS + 32,
+                        PortKey4Pod::from(PortKey4::new(*port, ip.octets())),
+                    ),
+                    action::ALLOW,
+                    0,
+                )
+                .context("inserting port allow"),
+            DenialKey::Net6Port { ip, port } => self
+                .port6
+                .insert(
+                    &Key::new(
+                        PORT_BITS + 128,
+                        PortKey6Pod::from(PortKey6::new(*port, ip.octets())),
+                    ),
+                    action::ALLOW,
+                    0,
+                )
+                .context("inserting port allow"),
         }
     }
 }
@@ -179,11 +594,23 @@ pub(crate) struct StatSnapshot {
     pub denied_file: u64,
     pub denied_exec: u64,
     pub denied_net: u64,
+    /// How many of the above matched on `(dev, ino)` rather than a name. A
+    /// SUBSET of the denial counters above, never an addition — see
+    /// [`stat::DENIED_IDENTITY`].
+    pub denied_identity: u64,
+    /// Removals refused by the lifecycle hooks.
+    pub denied_delete: u64,
+    /// New names refused by the lifecycle hooks.
+    pub denied_create: u64,
 }
 
 impl StatSnapshot {
     pub fn denials(&self) -> u64 {
-        self.denied_file + self.denied_exec + self.denied_net
+        self.denied_file
+            + self.denied_exec
+            + self.denied_net
+            + self.denied_delete
+            + self.denied_create
     }
 }
 
@@ -206,6 +633,9 @@ impl KernelStats {
             denied_file: self.slot(stat::DENIED_FILE),
             denied_exec: self.slot(stat::DENIED_EXEC),
             denied_net: self.slot(stat::DENIED_NET),
+            denied_identity: self.slot(stat::DENIED_IDENTITY),
+            denied_delete: self.slot(stat::DENIED_DELETE),
+            denied_create: self.slot(stat::DENIED_CREATE),
         }
     }
 }
@@ -399,14 +829,73 @@ fn resolve_target_identity(opts: &Opts) -> Option<(u32, u32)> {
     Some((uid, gid))
 }
 
+/// Where a `path:` rule's relative path and `~` resolve from.
+///
+/// Both halves are things only this process knows and neither is guessable:
+/// - **cwd** is wardyn's working directory, which the agent inherits, so
+///   `path: .env` means the `.env` of the project the agent was launched in.
+/// - **home** is the *agent's* home, not root's. Wardyn runs under `sudo`, so
+///   `$HOME` here is normally `/root`, and a rule saying `~/.ssh` that quietly
+///   anchored root's keys instead of the user's would protect the wrong thing
+///   while looking correct.
+fn anchor_base(opts: &Opts) -> AnchorBase {
+    let home = resolve_target_identity(opts)
+        .and_then(|(uid, _)| home_for_uid(uid))
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    AnchorBase {
+        cwd: std::env::current_dir().ok(),
+        home,
+    }
+}
+
+/// The home directory recorded for `uid` in `/etc/passwd`.
+///
+/// Read directly rather than through NSS: wardyn has no libc user-database
+/// dependency, and a policy that resolves differently depending on whether LDAP
+/// answered would be worse than one that only knows local accounts. A miss is
+/// reported by the caller as an unresolved rule, never guessed.
+fn home_for_uid(uid: u32) -> Option<PathBuf> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        // name:passwd:uid:gid:gecos:home:shell
+        let mut f = line.split(':');
+        let (_name, _pw, u) = (f.next()?, f.next()?, f.next()?);
+        if u.parse::<u32>().ok()? != uid {
+            continue;
+        }
+        let home = f.nth(2)?; // skip gid, gecos
+        if !home.is_empty() {
+            return Some(PathBuf::from(home));
+        }
+    }
+    None
+}
+
+/// The LSM hooks that carry the `create`/`delete` axis. Attached only when a
+/// policy asks for it, and separately from the two core hooks, because they are
+/// not equally load-bearing: `file_open` failing to attach means wardyn cannot
+/// do its main job, while `inode_mkdir` failing means one axis of one rule is
+/// unenforced. Aborting the whole LSM for the second would trade the tool for a
+/// feature.
+const LIFECYCLE_HOOKS: &[&str] = &[
+    "inode_unlink",
+    "inode_rmdir",
+    "inode_create",
+    "inode_mkdir",
+    "inode_rename",
+    "inode_link",
+    "inode_symlink",
+];
+
 /// Load + attach the BPF-LSM file/exec deniers. Kept separate so a kernel without
 /// BPF LSM degrades gracefully to network-only enforcement instead of aborting.
-fn attach_lsm(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+///
+/// `lifecycle` adds the create/delete hooks. Returns the hooks that could NOT be
+/// attached, so the caller can name them instead of leaving a policy claiming an
+/// axis the kernel is not enforcing.
+fn attach_lsm(ebpf: &mut aya::Ebpf, lifecycle: bool) -> anyhow::Result<Vec<String>> {
     let btf = Btf::from_sys_fs().context("loading kernel BTF")?;
-    for (name, hook) in [
-        ("file_open", "file_open"),
-        ("bprm_check", "bprm_check_security"),
-    ] {
+    let mut attach = |name: &str, hook: &str| -> anyhow::Result<()> {
         let prog: &mut Lsm = ebpf
             .program_mut(name)
             .with_context(|| format!("{name} program not found"))?
@@ -415,8 +904,21 @@ fn attach_lsm(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
             .with_context(|| format!("loading lsm/{hook}"))?;
         prog.attach()
             .with_context(|| format!("attaching lsm/{hook}"))?;
+        Ok(())
+    };
+    // The two that wardyn is not wardyn without.
+    attach("file_open", "file_open")?;
+    attach("bprm_check", "bprm_check_security")?;
+
+    let mut missing = Vec::new();
+    if lifecycle {
+        for hook in LIFECYCLE_HOOKS {
+            if let Err(e) = attach(hook, hook) {
+                missing.push(format!("{hook} ({e:#})"));
+            }
+        }
     }
-    Ok(())
+    Ok(missing)
 }
 
 /// Await the child's exit if there is one; otherwise never resolve.
@@ -512,7 +1014,13 @@ async fn run() -> anyhow::Result<i32> {
     // eBPF, or a target — the check that used to be impossible before deploying
     // a policy.
     if opts.dry_run {
-        let policy = Policy::load(opts.policy_path.as_deref())?;
+        // Same anchor base as a real run, so `--dry-run` reports the objects the
+        // run would actually pin. Resolving them differently here would make the
+        // one command users are told to validate a policy with the one command
+        // that cannot see an identity rule pointing at the wrong file.
+        let policy = Loader::new()
+            .base(anchor_base(&opts))
+            .load(opts.policy_path.as_deref())?;
         print!("{}", policy.explain());
         return Ok(0);
     }
@@ -545,9 +1053,28 @@ async fn run() -> anyhow::Result<i32> {
     // plainly when there is no TUI.
     let mut notices: Vec<String> = Vec::new();
 
-    let policy = Policy::load(opts.policy_path.as_deref())?;
+    let policy = Loader::new()
+        .base(anchor_base(&opts))
+        .load(opts.policy_path.as_deref())?;
     notices.push(format!("policy loaded: {}", policy.summary()));
     if opts.enforce {
+        // Identity rules: say which objects they landed on, and which resolved
+        // to nothing. A `path:` rule that silently evaporated (wrong working
+        // directory, a `~` with no home) looks exactly like coverage in the rule
+        // list and is nothing at all in the kernel. Only under `--enforce`,
+        // because in observe mode no rule enforces anything anyway.
+        for a in policy.anchors() {
+            notices.push(format!("{} pins {}", a.rule, a.blast_radius()));
+        }
+        for u in policy.unresolved_anchors() {
+            notices.push(format!(
+                "{} resolved to nothing ({} — {}); it pins no object. Any `match:` rule for the \
+                 same name still applies.",
+                u.rule,
+                u.path.display(),
+                u.reason
+            ));
+        }
         // Be honest up front: block rules that can't reduce to a kernel-checkable
         // basename/dir are flagged in the feed but never actually denied.
         for pat in policy.observe_only_blocks() {
@@ -683,13 +1210,25 @@ async fn run() -> anyhow::Result<i32> {
 
         // Files/exec: BPF-LSM deniers. Non-fatal — if the kernel lacks BPF LSM,
         // keep the (already-attached) network enforcement rather than aborting.
-        match attach_lsm(&mut ebpf) {
-            Ok(()) => {
+        match attach_lsm(&mut ebpf, policy.has_lifecycle_rules()) {
+            Ok(missing) => {
                 lsm_active = true;
-                notices.push(
+                let axes = if policy.has_lifecycle_rules() {
+                    "enforcement ON — egress (cgroup) + secret-file reads + blocked execs + \
+                     create/delete (LSM)"
+                } else {
                     "enforcement ON — egress (cgroup) + secret-file reads + blocked execs (LSM)"
-                        .into(),
-                );
+                };
+                notices.push(axes.into());
+                // A create/delete rule that silently did not attach is a rule
+                // the policy claims and the kernel does not hold. Name it.
+                if !missing.is_empty() {
+                    notices.push(format!(
+                        "create/delete rules are only PARTLY enforced — this kernel would not \
+                         take: {}. Operations reaching the missing hook are ALLOWED.",
+                        missing.join(", ")
+                    ));
+                }
             }
             Err(e) => notices.push(format!(
                 "BPF LSM enforcement unavailable ({e:#}) — file/exec blocking is OFF (network \
@@ -719,6 +1258,13 @@ async fn run() -> anyhow::Result<i32> {
         }
     };
     config.set(CFG_FORK_CHILD_OFF, child_off, 0)?;
+    // Skip the port-trie lookup per connect for policies that name no ports.
+    config.set(CFG_PORT_RULES_ON, u32::from(policy.has_port_rules()), 0)?;
+    // The five lifecycle hooks stay inert unless a rule asked for them. This is
+    // not only a hot-path saving: it is what guarantees a policy written before
+    // the axis existed cannot start refusing an `rm` because wardyn was updated.
+    config.set(CFG_LIFECYCLE_ON, u32::from(policy.has_lifecycle_rules()), 0)?;
+    config.set(CFG_PROTO_RULES_ON, u32::from(policy.has_proto_rules()), 0)?;
 
     // LSM dentry offsets: resolve them from the running kernel's own BTF so the
     // file/exec matcher adapts to the kernel instead of being pinned to 6.8. On
@@ -727,33 +1273,73 @@ async fn run() -> anyhow::Result<i32> {
     // drives the honest feed below (file/exec BLOCK is only predicted when we
     // trust the offsets are right; the kernel's own events are unaffected).
     let mut offsets_trusted = false;
+    let mut identity_available = false;
     if opts.enforce {
-        match btf::resolve_lsm_offsets() {
-            Some(o) => {
-                config.set(CFG_FILE_DENTRY_OFF, o.file_dentry, 0)?;
-                config.set(CFG_DENTRY_NAME_OFF, o.dentry_name, 0)?;
-                config.set(CFG_DENTRY_PARENT_OFF, o.dentry_parent, 0)?;
-                config.set(CFG_BPRM_FILE_OFF, o.bprm_file, 0)?;
+        match btf::resolve_offsets() {
+            Ok(o) => {
+                config.set(CFG_FILE_DENTRY_OFF, o.lsm.file_dentry, 0)?;
+                config.set(CFG_DENTRY_NAME_OFF, o.lsm.dentry_name, 0)?;
+                config.set(CFG_DENTRY_PARENT_OFF, o.lsm.dentry_parent, 0)?;
+                config.set(CFG_BPRM_FILE_OFF, o.lsm.bprm_file, 0)?;
                 offsets_trusted = true;
+                match o.identity {
+                    Some(i) => {
+                        config.set(CFG_FILE_INODE_OFF, i.file_inode, 0)?;
+                        config.set(CFG_FILE_MODE_OFF, i.file_mode, 0)?;
+                        config.set(CFG_INODE_INO_OFF, i.inode_ino, 0)?;
+                        config.set(CFG_INODE_SB_OFF, i.inode_sb, 0)?;
+                        config.set(CFG_SB_DEV_OFF, i.sb_dev, 0)?;
+                        config.set(CFG_DENTRY_INODE_OFF, i.dentry_inode, 0)?;
+                        // The offsets are usable: `access:` narrowing (which only
+                        // needs f_mode) is now in force.
+                        config.set(CFG_EXT_OFFSETS, 1, 0)?;
+                        identity_available = true;
+                        // The identity *reads* are switched on separately, only
+                        // when the policy has keys for them to match: three extra
+                        // kernel reads and a map lookup per open, plus four more
+                        // per ancestor level, is not free on the hot path of
+                        // every file the watched tree touches.
+                        let want = !policy.inode_enforcement().is_empty();
+                        config.set(CFG_IDENTITY_ON, u32::from(want), 0)?;
+                    }
+                    None => notices.push(
+                        "this kernel's BTF does not expose the inode fields; identity (dev,ino) \
+                         rules cannot be enforced — name rules still are."
+                            .to_string(),
+                    ),
+                }
             }
-            None => {
+            Err(why) => {
                 // Couldn't read/parse BTF; the built-in 6.8 offsets apply. Only
                 // trust them for the honest feed if we're actually on 6.8.
                 offsets_trusted = kernel_matches_builtin_offsets();
                 if offsets_trusted {
                     notices.push(format!(
-                        "BTF unavailable — using built-in kernel-{OFFSETS_KERNEL} LSM offsets \
-                         (running kernel matches)."
+                        "BTF offset resolution failed ({why}) — using built-in kernel-\
+                         {OFFSETS_KERNEL} LSM offsets (running kernel matches)."
                     ));
                 } else {
                     notices.push(format!(
-                        "could not resolve LSM struct offsets from BTF and the running kernel is \
-                         not {OFFSETS_KERNEL}; file/exec blocking may silently fail. Such rows are \
-                         shown as block~ until the kernel reports a denial itself."
+                        "could not resolve LSM struct offsets from BTF ({why}) and the running \
+                         kernel is not {OFFSETS_KERNEL}; file/exec blocking may silently fail. \
+                         Such rows are shown as block~ until the kernel reports a denial itself."
                     ));
                 }
             }
         }
+    }
+
+    // `access: read`/`write` needs the kernel to read `f_mode`, which needs an
+    // offset we may not have. The rule still fires — it just covers every open,
+    // which is broader than written. Broader is the safe direction; saying
+    // nothing about it is not.
+    if opts.enforce && !identity_available && policy.uses_access_narrowing() {
+        notices.push(
+            "this policy narrows rules with `access:`, but the kernel offsets needed to read an \
+             open's access mode did not resolve — those rules cover EVERY open (broader than \
+             written), not just the access named."
+                .to_string(),
+        );
     }
 
     // `run` scoping: WATCHED is keyed by tgid as the KERNEL sees it (init pid
@@ -941,6 +1527,26 @@ fn report_kernel_stats(s: &StatSnapshot, enforce: bool, claimed: u64) {
             "wardyn: kernel denials — {} file, {} exec, {} network",
             s.denied_file, s.denied_exec, s.denied_net
         );
+        // Listed on their own line rather than folded into "file": these came
+        // from a different set of hooks, and an operator checking whether the
+        // `delete` axis actually fired should not have to subtract.
+        if s.denied_delete > 0 || s.denied_create > 0 {
+            eprintln!(
+                "wardyn: kernel denials — {} delete, {} create (lifecycle hooks)",
+                s.denied_delete, s.denied_create
+            );
+        }
+        // Identity denials are the ones a name rule alone would have missed —
+        // the renamed secret, the hard link, the moved directory. Reported
+        // separately because "the rename didn't help" is a claim, and a counter
+        // is the difference between a claim and a measurement.
+        if s.denied_identity > 0 {
+            eprintln!(
+                "wardyn: {} of those matched by identity (dev,ino) — a rename or hard link would \
+                 have defeated a name rule.",
+                s.denied_identity
+            );
+        }
         // The one cross-check that cannot be fooled by a wrong struct offset or
         // an LSM that failed to attach: if the receipt told the agent it was
         // denied N times and the kernel counted none, the receipt was fiction.
@@ -1227,6 +1833,27 @@ fn prediction_key(k: &DenialKey) -> String {
         DenialKey::FileName(n) | DenialKey::FileDir(n) | DenialKey::Exec(n) => n.clone(),
         DenialKey::Net4(ip) => ip.to_string(),
         DenialKey::Net6(ip) => ip.to_string(),
+        // Matches `confirmation_key`, which keys a network confirmation on the
+        // address alone: userspace predicts from the address it observed and
+        // cannot know which trie the kernel will use.
+        DenialKey::Net4Port { ip, .. } => ip.to_string(),
+        DenialKey::Net6Port { ip, .. } => ip.to_string(),
+        // Userspace never *predicts* an identity denial — it only has the path
+        // string, and the point of an identity rule is that the string is not
+        // what decides. These arrive as kernel reports, which is the branch that
+        // renders them; a prediction key for one would never be looked up.
+        DenialKey::FileInode { dev, ino }
+        | DenialKey::DirInode { dev, ino }
+        | DenialKey::ExecInode { dev, ino } => format!("{dev}:{ino}"),
+        // Also never predicted, and for a sharper reason: there is no
+        // observation tracepoint for `unlink`/`rename`/`mkdir` at all, so a
+        // lifecycle denial has nothing to confirm — the kernel event IS the
+        // first time userspace hears about the operation.
+        DenialKey::Lifecycle { op, key } => format!("{}:{}", op.as_str(), prediction_key(key)),
+        // Keyed on the address alone, exactly as the port form is: userspace
+        // predicts from what the tracepoint saw, and the tracepoint sees a
+        // sockaddr, not a socket — it has no protocol to key on.
+        DenialKey::NetProto { key, .. } => prediction_key(key),
     }
 }
 
@@ -1261,26 +1888,82 @@ pub(crate) fn describe(
     // Kernel-reported denials first: these are decisions, not observations, and
     // they are reported exactly as made.
     match ev.kind {
-        kind::DENY_FILE | kind::DENY_EXEC => {
+        kind::DENY_FILE | kind::DENY_EXEC | kind::DENY_DELETE | kind::DENY_CREATE => {
             let name = event_key_name(ev);
-            let key = match ev.kind {
-                kind::DENY_EXEC => DenialKey::Exec(name.clone()),
-                _ if ev.meta == meta::KEY_DIR => DenialKey::FileDir(name.clone()),
+            let identity = matches!(ev.meta, meta::KEY_INO | meta::KEY_DIR_INO);
+            let key = match (ev.kind, ev.meta) {
+                (kind::DENY_EXEC, meta::KEY_INO) => DenialKey::ExecInode {
+                    dev: ev.dev,
+                    ino: ev.ino,
+                },
+                (kind::DENY_EXEC, _) => DenialKey::Exec(name.clone()),
+                (_, meta::KEY_INO) => DenialKey::FileInode {
+                    dev: ev.dev,
+                    ino: ev.ino,
+                },
+                (_, meta::KEY_DIR_INO) => DenialKey::DirInode {
+                    dev: ev.dev,
+                    ino: ev.ino,
+                },
+                (_, meta::KEY_DIR) => DenialKey::FileDir(name.clone()),
                 _ => DenialKey::FileName(name.clone()),
             };
-            let label = if ev.kind == kind::DENY_EXEC {
-                "exec"
+            // A lifecycle denial matched one of the same four file keys, but on
+            // a different bit of its mask. Wrapping it keeps the exception
+            // honest: approving one `rm` must not also unblock every read.
+            let key = match ev.kind {
+                kind::DENY_DELETE => DenialKey::Lifecycle {
+                    op: LifecycleOp::Delete,
+                    key: Box::new(key),
+                },
+                kind::DENY_CREATE => DenialKey::Lifecycle {
+                    op: LifecycleOp::Create,
+                    key: Box::new(key),
+                },
+                _ => key,
+            };
+            let label = match ev.kind {
+                kind::DENY_EXEC => "exec",
+                kind::DENY_DELETE => "delete",
+                kind::DENY_CREATE => "create",
+                _ => "open",
+            };
+            // An identity denial is the one case where the object's *current*
+            // name is the interesting part: the kernel matched the inode, so
+            // showing `hidden.txt [was .env]` is what tells the operator the
+            // rename did not work. Fall back to the bare key if the policy has
+            // no anchor for it (an exception was granted, or the map outlived
+            // a reload).
+            // There is no `sys_enter` tracepoint for unlink/rename/mkdir, so a
+            // lifecycle row is not a *confirmation* of anything the feed already
+            // showed — it is the first and only time the operation is reported.
+            // Say which, so a reader does not go looking for the missing
+            // observation row.
+            let why = if matches!(ev.kind, kind::DENY_DELETE | kind::DENY_CREATE) {
+                "refused in-kernel; the attempt itself is not observed, only its refusal"
             } else {
-                "open"
+                "denied in-kernel; path not observed"
+            };
+            let detail = if identity {
+                match policy.anchor_for(&InodeKey::new(ev.dev, ev.ino)) {
+                    Some(a) => format!("{name}  (same object as {})", a.path.display()),
+                    None => format!("{key} ({why})"),
+                }
+            } else {
+                format!("{key} ({why})")
+            };
+            let rule = match (identity, policy.anchor_for(&InodeKey::new(ev.dev, ev.ino))) {
+                (true, Some(a)) => a.rule.clone(),
+                _ => format!("kernel:{key}"),
             };
             return Some(Desc {
                 pid: ev.pid,
                 comm: field_str(&ev.comm),
                 kind: ev.kind,
                 label,
-                detail: format!("{key} (denied in-kernel; path not observed)"),
+                detail,
                 action: Action::Block,
-                rule: format!("kernel:{key}"),
+                rule,
                 enforceable: true,
                 denial_key: Some(key),
                 excepted: false,
@@ -1290,16 +1973,44 @@ pub(crate) fn describe(
         }
         kind::DENY_NET => {
             let addr = deny_net_addr(ev);
-            let key = match addr {
-                std::net::IpAddr::V4(v4) => DenialKey::Net4(v4),
-                std::net::IpAddr::V6(v6) => DenialKey::Net6(v6),
+            // `meta` says which of the four tries decided. Building an address
+            // key for a port-trie denial would produce an exception the port
+            // rule immediately overrules — and the same is now true one
+            // dimension further out.
+            let by_port = matches!(ev.meta, meta::KEY_PORT | meta::KEY_PROTO_PORT);
+            let key = match (addr, by_port) {
+                (std::net::IpAddr::V4(ip), false) => DenialKey::Net4(ip),
+                (std::net::IpAddr::V6(ip), false) => DenialKey::Net6(ip),
+                (std::net::IpAddr::V4(ip), true) => DenialKey::Net4Port { ip, port: ev.dport },
+                (std::net::IpAddr::V6(ip), true) => DenialKey::Net6Port { ip, port: ev.dport },
+            };
+            let key = match ev.meta {
+                meta::KEY_PROTO | meta::KEY_PROTO_PORT => {
+                    match Proto::from_number(ev.proto as u8) {
+                        Some(proto) => DenialKey::NetProto {
+                            proto,
+                            key: Box::new(key),
+                        },
+                        // The kernel says a protocol trie decided but reports a
+                        // protocol no rule can name. That should be impossible;
+                        // leaving the key unwrapped would silently write the
+                        // exception into the wrong trie, so keep the unwrapped key
+                        // and let the operator see the denial repeat rather than
+                        // watch an approval do nothing.
+                        None => key,
+                    }
+                }
+                _ => key,
             };
             return Some(Desc {
                 pid: ev.pid,
                 comm: field_str(&ev.comm),
                 kind: ev.kind,
                 label: "connect",
-                detail: format!("{addr}:{}", ev.dport),
+                detail: match Proto::from_number(ev.proto as u8) {
+                    Some(p) => format!("{addr}:{} ({})", ev.dport, p.as_str()),
+                    None => format!("{addr}:{}", ev.dport),
+                },
                 action: Action::Block,
                 rule: format!("kernel:{key}"),
                 enforceable: true,
@@ -1342,7 +2053,10 @@ pub(crate) fn describe(
                 if is_exec {
                     policy.kernel_exec_denial(&d)
                 } else {
-                    policy.kernel_file_denial(&d)
+                    // `ev.fmode` is what the syscall's flags asked for, so a rule
+                    // that only covers reads does not predict a denial for a
+                    // write-only open the kernel will let through.
+                    policy.kernel_file_denial(&d, ev.fmode)
                 }
             } else {
                 None
@@ -1364,13 +2078,13 @@ pub(crate) fn describe(
                 if let Some(v4) = ip6.to_ipv4_mapped() {
                     (
                         format!("[{ip6}]:{}", ev.dport),
-                        policy.eval_connect(v4),
+                        policy.eval_connect(v4, ev.dport),
                         DenialKey::Net4(v4),
                     )
                 } else {
                     (
                         format!("[{ip6}]:{}", ev.dport),
-                        policy.eval_connect6(ip6),
+                        policy.eval_connect6(ip6, ev.dport),
                         DenialKey::Net6(ip6),
                     )
                 }
@@ -1378,7 +2092,7 @@ pub(crate) fn describe(
                 let ip = Ipv4Addr::from(ev.daddr.to_ne_bytes());
                 (
                     format!("{ip}:{}", ev.dport),
-                    policy.eval_connect(ip),
+                    policy.eval_connect(ip, ev.dport),
                     DenialKey::Net4(ip),
                 )
             };
@@ -1681,6 +2395,132 @@ mod tests {
         let d = describe(&e, &p, true, true, &Exceptions::default()).unwrap();
         assert_eq!(d.label, "exec");
         assert_eq!(d.denial_key, Some(DenialKey::Exec("nc".into())));
+    }
+
+    /// The `Pod` mirror of `InodeKey` must be byte-identical to the shared type.
+    /// The orphan rule forces the duplicate, and a duplicate that drifts is a
+    /// key the kernel and userspace disagree about — which does not fail, it
+    /// just silently matches nothing. Exactly the failure mode the `dev`
+    /// encoding already had to be pinned against.
+    #[test]
+    fn the_inode_key_mirror_has_the_shared_layout() {
+        use core::mem::{align_of, size_of};
+        assert_eq!(size_of::<InoKey>(), size_of::<InodeKey>());
+        assert_eq!(align_of::<InoKey>(), align_of::<InodeKey>());
+
+        let shared = InodeKey::new(0x0080_0001, 0x0102_0304_0506_0708);
+        let mirror = InoKey::from(shared);
+        let a = unsafe {
+            core::slice::from_raw_parts(
+                (&shared as *const InodeKey) as *const u8,
+                size_of::<InodeKey>(),
+            )
+        };
+        let b = unsafe {
+            core::slice::from_raw_parts(
+                (&mirror as *const InoKey) as *const u8,
+                size_of::<InoKey>(),
+            )
+        };
+        assert_eq!(a, b, "InoKey and InodeKey do not agree byte-for-byte");
+    }
+
+    /// Same contract for the four protocol keys. A drifted mirror here is a key
+    /// the kernel never finds: the trie matches nothing, wardyn fails open, and
+    /// the only symptom is a rule that quietly stopped applying.
+    #[test]
+    fn the_protocol_key_mirrors_have_the_shared_layout() {
+        use core::mem::size_of;
+
+        fn same_bytes<A, B>(a: &A, b: &B) -> bool {
+            assert_eq!(size_of::<A>(), size_of::<B>(), "size differs");
+            let x = unsafe {
+                core::slice::from_raw_parts((a as *const A) as *const u8, size_of::<A>())
+            };
+            let y = unsafe {
+                core::slice::from_raw_parts((b as *const B) as *const u8, size_of::<B>())
+            };
+            x == y
+        }
+
+        let pp4 = ProtoPortKey4::new(6, 443, [1, 2, 3, 4]);
+        assert!(same_bytes(&pp4, &ProtoPortKey4Pod::from(pp4)));
+        let pp6 = ProtoPortKey6::new(17, 53, [9u8; 16]);
+        assert!(same_bytes(&pp6, &ProtoPortKey6Pod::from(pp6)));
+        let p4 = ProtoKey4::new(17, [10, 0, 0, 1]);
+        assert!(same_bytes(&p4, &ProtoKey4Pod::from(p4)));
+        let p6 = ProtoKey6::new(6, [7u8; 16]);
+        assert!(same_bytes(&p6, &ProtoKey6Pod::from(p6)));
+
+        // The protocol must lead the key, for the same reason the port leads a
+        // `PortKey4`: an LPM trie compares from the most significant end, and
+        // only what comes first can be pinned without pinning the rest.
+        let raw = unsafe {
+            core::slice::from_raw_parts(
+                (&pp4 as *const ProtoPortKey4) as *const u8,
+                size_of::<ProtoPortKey4>(),
+            )
+        };
+        assert_eq!(raw[0], 6, "protocol is not the leading byte");
+        assert_eq!(&raw[1..3], &443u16.to_be_bytes(), "port does not follow it");
+    }
+
+    /// An identity denial must be rendered as the object's *current* name plus
+    /// the path the policy named — that pairing is the whole report: it is how
+    /// an operator sees that the rename did not work.
+    #[test]
+    fn an_identity_denial_names_the_object_the_policy_pinned() {
+        use std::path::PathBuf;
+        let fake = |p: &std::path::Path| -> Option<(u64, u64, bool)> {
+            (p == std::path::Path::new("/proj/.env")).then_some((0x801, 4242, false))
+        };
+        let p = wardyn_policy::policy::Loader::offline()
+            .stat(&fake)
+            .base(wardyn_policy::identity::AnchorBase {
+                cwd: Some(PathBuf::from("/proj")),
+                home: None,
+            })
+            .from_str("files:\n  - { path: \".env\", action: block }\n")
+            .unwrap();
+
+        // The kernel reports the name the file has NOW, plus the key it matched.
+        let mut e = ev_with_path(kind::DENY_FILE, "hidden.txt", 10);
+        e.meta = meta::KEY_INO;
+        e.dev = 0x0080_0001;
+        e.ino = 4242;
+        let d = describe(&e, &p, true, true, &Exceptions::default()).unwrap();
+
+        assert!(d.kernel);
+        assert_eq!(
+            d.denial_key,
+            Some(DenialKey::FileInode {
+                dev: 0x0080_0001,
+                ino: 4242
+            })
+        );
+        assert!(d.detail.contains("hidden.txt"), "{}", d.detail);
+        assert!(d.detail.contains("/proj/.env"), "{}", d.detail);
+        assert_eq!(d.rule, "path:.env");
+    }
+
+    /// An identity key the policy no longer knows about (an exception was
+    /// granted, or the map outlived a reload) must still render as a denial —
+    /// degraded to the bare key, never dropped.
+    #[test]
+    fn an_identity_denial_with_no_matching_anchor_still_reports() {
+        let p = Policy::from_yaml_str_with(
+            "default_action: allow",
+            &wardyn_policy::policy::null_resolver,
+        )
+        .unwrap();
+        let mut e = ev_with_path(kind::DENY_FILE, "whatever", 8);
+        e.meta = meta::KEY_INO;
+        e.dev = 0x0080_0001;
+        e.ino = 99;
+        let d = describe(&e, &p, true, true, &Exceptions::default()).unwrap();
+        assert_eq!(d.action, Action::Block);
+        assert!(d.detail.contains("ino"), "{}", d.detail);
+        assert!(d.detail.contains("99"), "{}", d.detail);
     }
 
     #[test]

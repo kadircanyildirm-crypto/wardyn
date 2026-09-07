@@ -22,6 +22,9 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WARDYN="${1:-$REPO_ROOT/target/release/wardyn}"
+# Absolute, because wardyn is launched from the workspace directory below and a
+# relative `./target/release/wardyn` would not resolve from there.
+[[ "$WARDYN" = /* ]] || WARDYN="$(cd "$(dirname "$WARDYN")" && pwd)/$(basename "$WARDYN")"
 POLICY="$SCRIPT_DIR/policy.yaml"
 
 PASS=0
@@ -31,6 +34,11 @@ pass() { printf '  \033[32m✓\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
 fail() { printf '  \033[31m✗ %s\033[0m\n' "$1"; FAIL=$((FAIL + 1)); }
 skip() { printf '  \033[33m∼ SKIP\033[0m %s\n' "$1"; SKIP=$((SKIP + 1)); }
 info() { printf '\033[36m›\033[0m %s\n' "$1"; }
+# A gap wardyn does NOT close, asserted so it stays a documented limitation
+# rather than an assumption. If one of these starts failing, something got
+# better and SECURITY.md is now overcautious — which is a fix, not a break, but
+# it must be a deliberate one.
+limit() { printf '  \033[35m◆ known limit\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
 
 # ── preconditions ───────────────────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -52,25 +60,69 @@ if grep -qw bpf /sys/kernel/security/lsm 2>/dev/null; then LSM_ACTIVE=1; fi
 
 # ── workspace ───────────────────────────────────────────────────────────────
 WS="$(mktemp -d)"
+# A second, identical workspace for the control run at the end (name rules only).
+WS_CTL="$(mktemp -d)"
 # Invoked by the EXIT trap below, never by name. ShellCheck renamed this check
 # between releases (SC2317 in 0.9, SC2329 in 0.11), so silence both or the lint
 # passes locally and fails on whichever version CI happens to ship.
 # shellcheck disable=SC2317,SC2329
-cleanup() { rm -rf "$WS"; }
+cleanup() { rm -rf "$WS" "$WS_CTL"; }
 trap cleanup EXIT
-chmod 777 "$WS" # the agent runs dropped-privilege; let it read/write here
 
-printf 'SECRET_API_KEY=sk-e2e-not-real\n' >"$WS/.env"
-printf 'this file is fine to read\n' >"$WS/ok.txt"
-chmod 644 "$WS/.env" "$WS/ok.txt"
+# Build the fixture tree the agent script operates on, in $1.
+make_fixtures() {
+  local d="$1"
+  chmod 777 "$d" # the agent runs dropped-privilege; let it read/write here
 
-# A secret buried several levels under a blocked DIRECTORY. The LSM hook used to
-# compare only the immediate parent, so this file was readable while the feed
-# showed `**/.ssh/**` as covering it.
-mkdir -p "$WS/.ssh/sub/deeper"
-printf 'PRIVATE KEY\n' >"$WS/.ssh/sub/deeper/id_ed25519"
-chmod -R 755 "$WS/.ssh"
-chmod 644 "$WS/.ssh/sub/deeper/id_ed25519"
+  printf 'SECRET_API_KEY=sk-e2e-not-real\n' >"$d/.env"
+  printf 'this file is fine to read\n' >"$d/ok.txt"
+  # For the access axis: writable, but not readable back.
+  printf 'existing line\n' >"$d/writable.log"
+  chmod 644 "$d/.env" "$d/ok.txt" "$d/writable.log"
+
+  # A secret buried several levels under a blocked DIRECTORY. The LSM hook used
+  # to compare only the immediate parent, so this file was readable while the
+  # feed showed `**/.ssh/**` as covering it.
+  mkdir -p "$d/.ssh/sub/deeper"
+  printf 'PRIVATE KEY\n' >"$d/.ssh/sub/deeper/id_ed25519"
+  chmod -R 755 "$d/.ssh"
+  chmod 644 "$d/.ssh/sub/deeper/id_ed25519"
+
+  # Lifecycle fixtures. `precious.txt` is protected from removal but not from
+  # reading; `vault/` is pinned by identity and protects what is under it.
+  printf 'do not delete me\n' >"$d/precious.txt"
+  chmod 644 "$d/precious.txt"
+  mkdir -p "$d/vault/empty"
+  printf 'vaulted\n' >"$d/vault/note.txt"
+  chmod 755 "$d/vault" "$d/vault/empty"
+  chmod 644 "$d/vault/note.txt"
+
+  # A stand-in for a blocked binary. A shell script is enough:
+  # `bprm_check_security` fires for the script itself, so the `**/nc` exec rule
+  # denies it exactly as it would deny the real netcat, and the fixture needs
+  # nothing installed.
+  printf '#!/bin/sh\necho nc-ran\n' >"$d/nc"
+  chmod 755 "$d/nc"
+
+  # The agent must OWN the fixtures it is going to rename and hard-link.
+  # `fs.protected_hardlinks` (on by default) refuses a link to a file the caller
+  # neither owns nor can write, so root-owned fixtures would make the hard-link
+  # bypass test pass without wardyn doing anything at all — a green light for a
+  # hole that is still open. This also mirrors reality: an agent's secrets are
+  # normally its own files.
+  if [[ -n "${SUDO_UID:-}" && "${SUDO_UID}" != "0" ]]; then
+    chown -R "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$d"
+  fi
+}
+make_fixtures "$WS"
+make_fixtures "$WS_CTL"
+
+# The control policy: the shipped one with every `path:` (identity) rule stripped.
+# Running the *same* agent against it is what turns "the identity tests passed"
+# into "identity is what made them pass" — without it, a name rule that happened
+# to cover a renamed fixture would look exactly like a working inode match.
+CTL_POLICY="$WS_CTL/name-only.yaml"
+grep -v '{ *path:' "$POLICY" >"$CTL_POLICY"
 
 AUDIT="$WS/audit.jsonl"
 DENIALS="$WS/denials.jsonl"
@@ -89,6 +141,22 @@ timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null || true
 timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>/dev/null || true
 # blocked public v6 (only produces an event if the host has IPv6)
 timeout 3 bash -c 'exec 3<>/dev/tcp/2606:4700:4700::1111/443' 2>/dev/null || true
+# ── port rules, all on loopback so nothing depends on external connectivity ──
+# blocked by an address rule (/32 beats the /8 allow)
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.2/8' 2>/dev/null || true
+# ...but allowed on port 9, because a port rule is consulted first
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.2/9' 2>/dev/null || true
+# denied on an address the policy otherwise allows in full — the ordering proof
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7' 2>/dev/null || true
+# ── protocol rules, one dimension further out than ports ─────────────────────
+# UDP to a host the /8 allows in full: the protocol rule is consulted first.
+timeout 3 bash -c 'exec 3<>/dev/udp/127.0.0.3/9' 2>/dev/null || true
+# ...and the same host over TCP, which that rule says nothing about.
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.3/10' 2>/dev/null || true
+# A bare port block, lifted for one protocol by the most specific tier there is.
+timeout 3 bash -c 'exec 3<>/dev/udp/127.0.0.1/11' 2>/dev/null || true
+# ...while the same port over TCP is still denied by that bare port rule.
+timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.4/11' 2>/dev/null || true
 # blocked secret (enforced only under BPF-LSM)
 if cat "$WS/.env" >/dev/null 2>&1; then echo allowed >"$WS/env_read.txt"; else echo denied >"$WS/env_read.txt"; fi
 # blocked secret NESTED under a blocked directory (ancestor walk)
@@ -99,10 +167,103 @@ else
 fi
 # allowed file
 cat "$WS/ok.txt" >/dev/null 2>&1 || true
+
+# ── access axis: `block ... access: read` must still permit writing ──────────
+# An O_WRONLY|O_APPEND open asks for FMODE_WRITE and must be allowed; the
+# O_RDONLY read that follows asks for FMODE_READ and must not be.
+if echo 'appended by the agent' >>"$WS/writable.log" 2>/dev/null; then
+  echo allowed >"$WS/log_write.txt"
+else
+  echo denied >"$WS/log_write.txt"
+fi
+if cat "$WS/writable.log" >/dev/null 2>&1; then
+  echo allowed >"$WS/log_read.txt"
+else
+  echo denied >"$WS/log_read.txt"
+fi
+
+# ── identity bypasses: the same object reached under a different name ────────
+# Everything below is one question: does the rule follow the OBJECT, or only the
+# label? Name matching answers "only the label", and each of these walks through.
+cd "$WS" || exit 9
+say() { if cat "$1" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
+
+# 1. rename the secret, then read it under its new name
+if mv .env renamed.txt 2>/dev/null; then say renamed.txt >"$WS/rename_read.txt"
+else echo mv-failed >"$WS/rename_read.txt"; fi
+mv renamed.txt .env 2>/dev/null || true
+
+# 2. hard-link it: one inode, two names, and the rule only knows one of them
+if ln .env hardlink.txt 2>/dev/null; then say hardlink.txt >"$WS/link_read.txt"
+else echo ln-failed >"$WS/link_read.txt"; fi
+
+# 3. copy it. This one must ALREADY fail, name matching or not: `cp` has to read
+#    the source, and that read is the thing being denied. It is the reason
+#    identity matching closes the loop instead of just moving the goalposts.
+if cp .env copy.txt 2>/dev/null; then echo allowed >"$WS/copy_read.txt"
+else echo denied >"$WS/copy_read.txt"; fi
+
+# 4. rename the blocked DIRECTORY and read through the new name
+if mv .ssh dotssh 2>/dev/null; then
+  say dotssh/sub/deeper/id_ed25519 >"$WS/dirrename_read.txt"
+else echo mv-failed >"$WS/dirrename_read.txt"; fi
+mv dotssh .ssh 2>/dev/null || true
+
+# 5. rename a blocked BINARY and run it
+if mv nc renamed_nc 2>/dev/null; then
+  if ./renamed_nc >/dev/null 2>&1; then echo allowed >"$WS/rename_exec.txt"
+  else echo denied >"$WS/rename_exec.txt"; fi
+else echo mv-failed >"$WS/rename_exec.txt"; fi
+
+# 6. COPY a blocked binary and run it. A copy is a genuinely different object, so
+#    no inode rule can catch it — pinned here as a known limitation rather than
+#    left for someone to discover.
+if cp renamed_nc copied_nc 2>/dev/null; then
+  chmod 755 copied_nc
+  if ./copied_nc >/dev/null 2>&1; then echo allowed >"$WS/copy_exec.txt"
+  else echo denied >"$WS/copy_exec.txt"; fi
+else echo cp-failed >"$WS/copy_exec.txt"; fi
+
+# ── lifecycle axis: an `rm` is not an open ───────────────────────────────────
+# Every rule exercised above is matched at `file_open`, which does not fire for
+# unlink(2) at all — so before the lifecycle hooks existed, a policy could guard
+# a secret's contents and still watch the agent delete it.
+did() { if "$@" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
+
+# `access: delete` must refuse the removal...
+did rm -f "$WS/precious.txt" >"$WS/rm_precious.txt"
+# ...and must NOT refuse reading the very same file. A delete rule that also
+# blocks reads is indistinguishable from the old `block`, which is the thing
+# the axis exists to stop being.
+say "$WS/precious.txt" >"$WS/read_precious.txt"
+
+# An ancestor pinned by identity covers what is under it, for removals exactly
+# as it does for opens.
+did rm -f "$WS/vault/note.txt" >"$WS/rm_vaulted.txt"
+did rmdir "$WS/vault/empty" >"$WS/rmdir_vaulted.txt"
+
+# The create side: a name the policy refuses to let appear at all.
+did touch "$WS/forbidden.new" >"$WS/touch_forbidden.txt"
+did mkdir "$WS/forbidden.dir" >"$WS/mkdir_forbidden.txt"
+# ...including when it appears as the DESTINATION of a rename, which is the
+# hole a create rule would have if only `inode_create` were hooked.
+did mv "$WS/ok.txt" "$WS/forbidden.new" >"$WS/mv_forbidden.txt"
+# ...and as a hard link or a symlink, which are the other two one-word ways to
+# make a name exist.
+did ln "$WS/ok.txt" "$WS/forbidden.new" >"$WS/ln_forbidden.txt"
+did ln -s "$WS/ok.txt" "$WS/forbidden.new" >"$WS/symlink_forbidden.txt"
+
+# COMPATIBILITY. `.env` is blocked with no `access:` at all. That rule said
+# nothing about deleting before this axis existed, and must still say nothing —
+# otherwise every policy already written changed meaning when wardyn updated.
+# Last, because it destroys a fixture the assertions above rely on.
+did rm -f "$WS/.env" >"$WS/rm_env.txt"
+
 # a deliberate non-zero exit, so the test can assert wardyn propagates it
 exit 7
 AGENT
 chmod 755 "$WS/agent.sh"
+cp "$WS/agent.sh" "$WS_CTL/agent.sh" # same agent, for the control run below
 
 # ── run under enforcement ───────────────────────────────────────────────────
 info "wardyn: $WARDYN"
@@ -112,8 +273,14 @@ info "running the agent under --enforce ..."
 
 export WS
 # --plain so there is no TUI; wardyn exits when the agent script exits.
-"$WARDYN" --enforce --plain --policy "$POLICY" --audit "$AUDIT" --denials "$DENIALS" \
-  run -- bash "$WS/agent.sh" >"$WLOG" 2>&1
+#
+# Run from inside the workspace: a `path:` rule written relatively (`path: .env`)
+# means "the one in the project being watched", so it resolves against wardyn's
+# working directory — the same directory the agent is launched in. Running from
+# the repo root instead would anchor the rules to the repo, which is not where
+# the fixtures are.
+( cd "$WS" && "$WARDYN" --enforce --plain --policy "$POLICY" \
+  --audit "$AUDIT" --denials "$DENIALS" run -- bash "$WS/agent.sh" ) >"$WLOG" 2>&1
 WARDYN_RC=$?
 
 echo
@@ -137,6 +304,29 @@ else
   fail "expected an enforced block for 1.1.1.1:443"
 fi
 
+# 2c) protocol rules: a rule naming a transport beats a longer address prefix
+#     that does not, and naming both beats naming one.
+if audited_block "127.0.0.3:9"; then
+  pass "proto: UDP denied on a host the address rules allow in full"
+else
+  fail "127.0.0.3:9 over UDP was not blocked — the protocol trie did not take effect"
+fi
+if audited_block "127.0.0.3:10"; then
+  fail "TCP to 127.0.0.3 was blocked by a rule that names UDP — the protocol is being ignored"
+else
+  pass "proto: the same host over TCP is untouched by a UDP rule"
+fi
+if audited_block "127.0.0.1:11"; then
+  fail "UDP to port 11 was blocked — a proto+port allow did NOT beat a bare port block"
+else
+  pass "proto: an allow naming protocol AND port beats a block naming only the port"
+fi
+if audited_block "127.0.0.4:11"; then
+  pass "proto: that same port over TCP is still denied by the bare port rule"
+else
+  fail "127.0.0.4:11 over TCP was allowed — the proto+port allow leaked into the port trie"
+fi
+
 # 3) loopback egress allowed (allows are never audited, so it must be absent).
 if grep -qF "127.0.0.1:9" "$AUDIT" 2>/dev/null; then
   fail "loopback egress was flagged — expected allow (no audit line)"
@@ -153,6 +343,25 @@ if grep -qF "2606:4700:4700::1111" "$AUDIT" 2>/dev/null; then
   fi
 else
   skip "IPv6 egress (host has no IPv6 route; nothing attempted)"
+fi
+
+# 4b) port rules, and the one thing about them that has to be stated: a rule
+#     naming a port is consulted before one that does not, whatever their
+#     address prefixes.
+if audited_block "127.0.0.2:8"; then
+  pass "port: an address rule still blocks a port it says nothing about"
+else
+  fail "127.0.0.2:8 was not blocked — the /32 address rule did not take effect"
+fi
+if grep -qF "127.0.0.2:9" "$AUDIT" 2>/dev/null; then
+  fail "127.0.0.2:9 was flagged — a port allow must override the address block"
+else
+  pass "port: an allow on one port overrides a block on the whole address"
+fi
+if audited_block "127.0.0.1:7"; then
+  pass "port: a bare port block denies it on a network the policy otherwise allows"
+else
+  fail "127.0.0.1:7 was allowed — a port rule did NOT beat the 127.0.0.0/8 allow"
 fi
 
 # 5) privilege drop — the agent must not have run as root when invoked via sudo.
@@ -190,6 +399,124 @@ if [[ $LSM_ACTIVE -eq 1 ]]; then
   else
     fail "the .env denial was not written to the WARDYN_DENIALS receipt"
   fi
+
+  verdict() { cat "$WS/$1" 2>/dev/null || echo "missing"; }
+
+  # ── the access axis: `block` no longer has to mean "cannot be opened" ─────
+  case "$(verdict log_write.txt)" in
+    allowed) pass "access: a read-only block still permits appending to the file" ;;
+    denied)  fail "a rule with access: read also blocked a WRITE — the axis is not narrowing" ;;
+    *)       fail "access-write check produced no verdict" ;;
+  esac
+  case "$(verdict log_read.txt)" in
+    denied)  pass "access: reading that same file is denied" ;;
+    allowed) fail "a rule with access: read did not block the read" ;;
+    *)       fail "access-read check produced no verdict" ;;
+  esac
+
+  # ── identity: does the rule follow the object, or only the label? ─────────
+
+  case "$(verdict rename_read.txt)" in
+    denied)    pass "identity: renaming the secret did not make it readable" ;;
+    allowed)   fail "BYPASS — \`mv .env x\` then reading x succeeded (name matching only)" ;;
+    mv-failed) skip "rename bypass (the agent could not rename the fixture)" ;;
+    *)         fail "rename bypass check produced no verdict" ;;
+  esac
+
+  case "$(verdict link_read.txt)" in
+    denied)    pass "identity: a hard link to the secret is denied too" ;;
+    allowed)   fail "BYPASS — \`ln .env x\` then reading x succeeded (one inode, two names)" ;;
+    ln-failed) skip "hard-link bypass (the kernel refused the link; check file ownership)" ;;
+    *)         fail "hard-link bypass check produced no verdict" ;;
+  esac
+
+  # This one is expected to hold with or without identity matching, and is the
+  # reason identity matching is worth having: you cannot copy what you cannot read.
+  case "$(verdict copy_read.txt)" in
+    denied)  pass "copying the secret fails, because the copy has to read it first" ;;
+    allowed) fail "the agent COPIED a blocked secret — the read side is not enforced" ;;
+    *)       fail "copy check produced no verdict" ;;
+  esac
+
+  case "$(verdict dirrename_read.txt)" in
+    denied)    pass "identity: renaming the blocked directory did not expose its contents" ;;
+    allowed)   fail "BYPASS — \`mv .ssh dotssh\` then reading through it succeeded" ;;
+    mv-failed) skip "directory rename bypass (the agent could not rename the fixture)" ;;
+    *)         fail "directory rename bypass check produced no verdict" ;;
+  esac
+
+  case "$(verdict rename_exec.txt)" in
+    denied)    pass "identity: renaming a blocked binary did not make it runnable" ;;
+    allowed)   fail "BYPASS — \`mv nc x\` then running x succeeded" ;;
+    mv-failed) skip "binary rename bypass (the agent could not rename the fixture)" ;;
+    *)         fail "binary rename bypass check produced no verdict" ;;
+  esac
+
+  # A copy of a binary is a new inode with a new name: nothing in the policy
+  # describes it. Unlike a secret, a binary is world-readable, so there is no
+  # read to deny either. Closing this needs content or provenance matching, not
+  # identity — see SECURITY.md.
+  case "$(verdict copy_exec.txt)" in
+    allowed) limit "copying a blocked binary to a new name still runs it (SECURITY.md)" ;;
+    denied)  fail "copy-then-exec was blocked — better than documented; update SECURITY.md" ;;
+    *)       skip "copy-then-exec limitation (the agent could not copy the fixture)" ;;
+  esac
+  # ── lifecycle: the axis that had to be hooked somewhere else entirely ─────
+
+  case "$(verdict rm_precious.txt)" in
+    denied)  pass "delete: a rule with access: delete refused the removal" ;;
+    allowed) fail "the agent DELETED a file a delete rule was supposed to protect" ;;
+    *)       fail "delete check produced no verdict" ;;
+  esac
+  case "$(verdict read_precious.txt)" in
+    allowed) pass "delete: that same rule still permits READING the file" ;;
+    denied)  fail "a rule with access: delete also blocked a read — the axis is not narrowing" ;;
+    *)       fail "delete-read check produced no verdict" ;;
+  esac
+  case "$(verdict rm_vaulted.txt)" in
+    denied)  pass "delete: a path: rule on a directory covers removing what is UNDER it" ;;
+    allowed) fail "a file under a delete-protected directory was removed" ;;
+    *)       fail "vault delete check produced no verdict" ;;
+  esac
+  case "$(verdict rmdir_vaulted.txt)" in
+    denied)  pass "delete: rmdir under that directory is refused too (inode_rmdir)" ;;
+    allowed) fail "rmdir under a delete-protected directory succeeded" ;;
+    *)       fail "rmdir check produced no verdict" ;;
+  esac
+  case "$(verdict touch_forbidden.txt)" in
+    denied)  pass "create: a create-blocked name could not be brought into existence" ;;
+    allowed) fail "a file with a create-blocked name was created" ;;
+    *)       fail "create check produced no verdict" ;;
+  esac
+  case "$(verdict mkdir_forbidden.txt)" in
+    denied)  pass "create: mkdir of a create-blocked directory name is refused" ;;
+    allowed) fail "a directory with a create-blocked name was created" ;;
+    *)       fail "mkdir check produced no verdict" ;;
+  esac
+  case "$(verdict mv_forbidden.txt)" in
+    denied)  pass "create: a rename INTO that name is refused at the destination" ;;
+    allowed) fail "mv produced a name the create rule forbids — the rename destination is unhooked" ;;
+    *)       fail "rename-destination check produced no verdict" ;;
+  esac
+  case "$(verdict ln_forbidden.txt)" in
+    denied)  pass "create: a hard link cannot bring a blocked name into existence either" ;;
+    allowed) fail "ln produced a name the create rule forbids — inode_link is unhooked" ;;
+    *)       fail "hard-link create check produced no verdict" ;;
+  esac
+  case "$(verdict symlink_forbidden.txt)" in
+    denied)  pass "create: nor can a symlink (the name is the point, not the target)" ;;
+    allowed) fail "ln -s produced a name the create rule forbids — inode_symlink is unhooked" ;;
+    *)       fail "symlink create check produced no verdict" ;;
+  esac
+  # The compatibility guarantee, proved in the kernel instead of asserted in a
+  # comment. This is the assertion that fails if `MASK_ANY` ever starts covering
+  # the lifecycle axis, and with it every policy anyone has already written.
+  case "$(verdict rm_env.txt)" in
+    allowed) pass "compat: a plain block rule still says NOTHING about deleting" ;;
+    denied)  fail "a plain block rule began refusing rm — existing policies changed meaning" ;;
+    *)       fail "compat delete check produced no verdict" ;;
+  esac
+
   # The receipt must be readable by the agent (it is chowned to the drop
   # target) and by nobody else.
   DPERM="$(stat -c '%a' "$DENIALS" 2>/dev/null || echo '?')"
@@ -207,6 +534,16 @@ if grep -q 'kernel denials —' "$WLOG"; then
   pass "kernel denial counters reported at exit"
 else
   fail "no 'kernel denials' line — the STATS map was not read"
+fi
+# The lifecycle hooks keep their own counters, so a refusal the agent saw with a
+# zero counter here would mean the `rm` failed for some unrelated reason —
+# ownership, a read-only mount — and the test would be green for nothing.
+if [[ $LSM_ACTIVE -eq 1 ]]; then
+  if grep -qE 'kernel denials — [1-9][0-9]* delete, [1-9][0-9]* create' "$WLOG"; then
+    pass "kernel counted the delete AND create denials it made"
+  else
+    fail "no lifecycle denial counters — the create/delete hooks did not fire"
+  fi
 fi
 if grep -q 'enforcement did NOT fire' "$WLOG"; then
   fail "wardyn reported denials to the agent that the kernel never made"
@@ -228,10 +565,52 @@ fi
 
 # 9) --dry-run explains the policy without root, eBPF, or a target.
 DRY="$("$WARDYN" --dry-run --policy "$POLICY" 2>&1)"
-if [[ "$DRY" == *"name=.env"* && "$DRY" == *"dir=.ssh"* && "$DRY" == *"cidr:0.0.0.0/0"* ]]; then
-  pass "--dry-run reports every key the kernel will enforce on"
+if [[ "$DRY" == *"name=.env"* && "$DRY" == *"dir=.ssh"* && "$DRY" == *"cidr:0.0.0.0/0"* \
+   && "$DRY" == *"DELETING"* && "$DRY" == *"CREATING"* \
+   && "$DRY" == *"blocked by protocol"* && "$DRY" == *"MOST SPECIFIC FIRST"* ]]; then
+  pass "--dry-run reports every key the kernel will enforce on, and on which axis"
 else
   fail "--dry-run did not describe the policy's kernel keys"
+fi
+
+# 10) CONTROL: the same agent, the same fixtures, the same wardyn — but a policy
+#     with the `path:` rules stripped out. Every bypass the identity rules closed
+#     must reopen. Without this, an identity assertion that passed because some
+#     *name* rule happened to cover the renamed file would be indistinguishable
+#     from a working inode match, and the feature could rot silently.
+if [[ $LSM_ACTIVE -eq 1 ]]; then
+  info "control run: name rules only (the bypasses must reopen)"
+  CTL_LOG="$WS_CTL/wardyn.stderr"
+  ( cd "$WS_CTL" && WS="$WS_CTL" "$WARDYN" --enforce --plain --policy "$CTL_POLICY" \
+    --audit "$WS_CTL/audit.jsonl" --denials "$WS_CTL/denials.jsonl" \
+    run -- bash "$WS_CTL/agent.sh" ) >"$CTL_LOG" 2>&1
+
+  ctl() { cat "$WS_CTL/$1" 2>/dev/null || echo missing; }
+  reopened=0
+  for probe in rename_read.txt link_read.txt dirrename_read.txt rename_exec.txt; do
+    [[ "$(ctl "$probe")" == "allowed" ]] && reopened=$((reopened + 1))
+  done
+  if [[ $reopened -eq 4 ]]; then
+    pass "control: all 4 bypasses reopen without identity rules (so identity is what closed them)"
+  else
+    fail "control: only $reopened/4 bypasses reopened — the identity assertions above may be passing for another reason"
+  fi
+  # The name rules must still work in the control run: this proves the control
+  # policy is a real policy and not one that failed to load.
+  if [[ "$(ctl env_read.txt)" == "denied" ]]; then
+    pass "control: the name rule still blocks the un-renamed secret"
+  else
+    fail "control: even the plain .env read was allowed — the control policy did not take effect"
+  fi
+
+  # And the kernel's own counter must say the main run used identity matching.
+  if grep -q 'matched by identity' "$WLOG"; then
+    pass "kernel counted identity (dev,ino) denials in the enforcing run"
+  else
+    fail "no identity denials counted — the inode maps were never consulted"
+  fi
+else
+  skip "control run + identity counters (BPF-LSM not active)"
 fi
 
 # ── summary ─────────────────────────────────────────────────────────────────

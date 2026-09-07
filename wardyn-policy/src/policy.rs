@@ -14,7 +14,7 @@
 //!   block keys: an `allow` rule listed before a `block` rule does **not** save
 //!   a path the block rule's key covers. [`Policy::shadowed_by_kernel`] finds
 //!   those rules so startup can say so out loud.
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
@@ -22,8 +22,13 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use globset::{Glob, GlobMatcher};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use serde::Deserialize;
-use wardyn_common::NAME_LEN;
+use serde::{Deserialize, Serialize};
+use wardyn_common::{
+    fmode, proto as ipproto, InodeKey, PortKey4, PortKey6, ProtoKey4, ProtoKey6, ProtoPortKey4,
+    ProtoPortKey6, NAME_LEN, PORT_BITS, PROTO_BITS,
+};
+
+use crate::identity::{self, Anchor, AnchorBase, AnchorKind, ResolveOutcome, UnresolvedAnchor};
 
 /// The policy schema version this build understands.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -35,6 +40,89 @@ pub enum Action {
     Allow,
     Warn,
     Block,
+}
+
+/// Which operation a file rule applies to.
+///
+/// Two axes, and the split is not cosmetic — they are enforced at different
+/// kernel hooks and mean different things:
+///
+/// - **opens** (`any`, `read`, `write`). `block` used to mean "this file cannot
+///   be opened at all", which also forbids *writing* it — so a policy could not
+///   say "the agent may create a `.env`, it just may not read one", and a rule
+///   meant to protect a secret also broke the tools that write it. The kernel
+///   has always known the difference (`f_mode` carries `FMODE_READ`/`FMODE_WRITE`
+///   at `file_open`); the policy simply had no way to ask.
+/// - **lifecycle** (`create`, `delete`). An `rm` is not an open: `file_open`
+///   never fires for `unlink(2)`, so a rule guarding a secret's *contents* said
+///   nothing whatsoever about destroying it. `rm -rf` was never a read.
+///
+/// [`Access::All`] is the union, and it exists because "protect this thing"
+/// should be one line rather than three.
+///
+/// `any` deliberately does **not** cover the lifecycle axis. It is the default,
+/// so widening it would mean every `block` rule in every policy already written
+/// silently starts refusing `rm` — a behaviour change nobody asked for, on the
+/// rules people are least likely to re-read. Lifecycle coverage is opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    /// Every open, whatever it asked for. The default, and exactly the
+    /// behaviour of a rule written before either axis existed.
+    #[default]
+    Any,
+    Read,
+    Write,
+    /// A new name for this object may not be created.
+    Create,
+    /// This object may not be removed, renamed away, or replaced.
+    Delete,
+    /// Every open *and* both lifecycle operations.
+    All,
+}
+
+impl Access {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Access::Any => "any",
+            Access::Read => "read",
+            Access::Write => "write",
+            Access::Create => "create",
+            Access::Delete => "delete",
+            Access::All => "all",
+        }
+    }
+
+    /// The mask stored beside a block key in the kernel maps; see
+    /// [`wardyn_common::fmode`].
+    pub fn mask(self) -> u8 {
+        match self {
+            Access::Any => fmode::MASK_ANY,
+            Access::Read => fmode::READ as u8,
+            Access::Write => fmode::WRITE as u8,
+            Access::Create => fmode::CREATE,
+            Access::Delete => fmode::DELETE,
+            Access::All => fmode::OPEN_ANY | fmode::CREATE | fmode::DELETE,
+        }
+    }
+
+    /// Does an open requesting `requested` (raw `f_mode` bits) match this rule?
+    pub fn matches(self, requested: u32) -> bool {
+        fmode::matches(self.mask(), requested)
+    }
+
+    /// Does this rule cover the lifecycle operation `op` ([`fmode::CREATE`] or
+    /// [`fmode::DELETE`])?
+    pub fn covers(self, op: u8) -> bool {
+        fmode::covers(self.mask(), op)
+    }
+
+    /// Whether this rule says anything at all about creating or removing.
+    /// Drives `CFG_LIFECYCLE_ON`, so a policy that never mentions the axis keeps
+    /// the five lifecycle hooks switched off entirely.
+    pub fn is_lifecycle(self) -> bool {
+        self.mask() & fmode::LIFECYCLE_BITS != 0
+    }
 }
 
 impl Action {
@@ -56,6 +144,45 @@ impl Action {
     }
 }
 
+/// The transport a network rule can name.
+///
+/// Two values, not 256: these are the protocols an egress policy can say
+/// anything useful about, and a rule able to name any IP protocol number would
+/// mostly be able to name ones no socket the hooks see ever carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Proto {
+    Tcp,
+    Udp,
+}
+
+impl Proto {
+    /// The IP protocol number the kernel key is built from.
+    pub fn number(self) -> u8 {
+        match self {
+            Proto::Tcp => ipproto::TCP,
+            Proto::Udp => ipproto::UDP,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+        }
+    }
+
+    /// The rule vocabulary for a protocol number seen on the wire, or `None` for
+    /// anything a rule cannot name.
+    pub fn from_number(n: u8) -> Option<Proto> {
+        match n {
+            ipproto::TCP => Some(Proto::Tcp),
+            ipproto::UDP => Some(Proto::Udp),
+            _ => None,
+        }
+    }
+}
+
 /// A policy decision plus the rule that produced it (for audit / display).
 #[derive(Debug, Clone)]
 pub struct Verdict {
@@ -67,11 +194,46 @@ pub struct Verdict {
     pub enforceable: bool,
 }
 
+/// Which lifecycle hook refused, for a [`DenialKey::Lifecycle`].
+///
+/// The kernel matches a removal and a creation against the *same* four maps as
+/// an open; only the bit of the stored mask differs. So the operation has to
+/// ride alongside the key rather than inside it — an exception lifts one bit,
+/// and dropping the key outright would also unblock reading the file, which is
+/// not what the operator approved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleOp {
+    Create,
+    Delete,
+}
+
+impl LifecycleOp {
+    /// The [`fmode`] bit this operation consults.
+    pub fn bit(self) -> u8 {
+        match self {
+            LifecycleOp::Create => fmode::CREATE,
+            LifecycleOp::Delete => fmode::DELETE,
+        }
+    }
+
+    /// The verb, for the feed and the confirm prompt.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LifecycleOp::Create => "create",
+            LifecycleOp::Delete => "delete",
+        }
+    }
+}
+
 /// The exact key the kernel's coarse matcher denies on — and therefore the
 /// exact unit an approve-once exception operates at. An exception can't be
 /// narrower than what the kernel matches, so this type is also the honest
 /// vocabulary for telling the operator what they are about to allow.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// `kind`/`value` rather than serde's default shape, because this type is
+/// written into an overrides file a human is expected to audit and edit.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum DenialKey {
     /// LSM `file_open`: basename match (BLOCK_NAMES), e.g. `.env`.
     FileName(String),
@@ -82,6 +244,61 @@ pub enum DenialKey {
     /// cgroup connect/sendmsg: destination address (NET_RULES LPM trie).
     Net4(Ipv4Addr),
     Net6(Ipv6Addr),
+    /// The same hooks, but the decision came from the **port** trie
+    /// (`NET_PORT_RULES`). A separate key because an exception has to be written
+    /// into the trie that denied — an allow in the address trie would be
+    /// overruled by the port rule on the very next connect, and the operator
+    /// would watch their approval do nothing.
+    Net4Port {
+        ip: Ipv4Addr,
+        port: u16,
+    },
+    Net6Port {
+        ip: Ipv6Addr,
+        port: u16,
+    },
+    /// LSM `file_open`: the opened object's own `(dev, ino)` matched
+    /// `BLOCK_INODES` — the rule found the file regardless of its current name.
+    FileInode {
+        dev: u32,
+        ino: u64,
+    },
+    /// LSM `file_open`: an ancestor directory's `(dev, ino)` matched
+    /// `BLOCK_DIR_INODES`.
+    DirInode {
+        dev: u32,
+        ino: u64,
+    },
+    /// LSM `bprm_check`: the executable's `(dev, ino)` matched.
+    ExecInode {
+        dev: u32,
+        ino: u64,
+    },
+    /// The same cgroup hooks, but the decision came from one of the two
+    /// **protocol** tries.
+    ///
+    /// `key` is the address-or-port key inside that trie, and `proto` says which
+    /// trie holds it. Wrapping rather than adding four flat variants keeps the
+    /// overrides file readable, and keeps the invariant that matters: an
+    /// exception is written into the trie that denied, or the rule that is still
+    /// there overrules it on the very next connect.
+    NetProto {
+        proto: Proto,
+        key: Box<DenialKey>,
+    },
+    /// One of the lifecycle hooks (`inode_unlink`, `inode_rmdir`,
+    /// `inode_create`, `inode_mkdir`, `inode_rename`) refused.
+    ///
+    /// `key` is the ordinary file key the kernel matched — the lifecycle hooks
+    /// share `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_INODES` / `BLOCK_DIR_INODES`
+    /// with `file_open` — and `op` says which bit of its mask fired. Both halves
+    /// are needed: an exception must clear that one bit and leave the rest of
+    /// the rule standing, or approving a single `rm` would quietly also grant
+    /// every read of the file.
+    Lifecycle {
+        op: LifecycleOp,
+        key: Box<DenialKey>,
+    },
 }
 
 impl DenialKey {
@@ -97,8 +314,146 @@ impl DenialKey {
             DenialKey::Exec(n) => format!("executing ANY program named `{n}` (any path)"),
             DenialKey::Net4(ip) => format!("ALL egress to {ip} (any port/protocol)"),
             DenialKey::Net6(ip) => format!("ALL egress to [{ip}] (any port/protocol)"),
+            // Narrower than the address form, and saying so matters: this is a
+            // smaller thing to approve, and an operator who has been told "ALL
+            // egress to this host" for a single-port denial will approve less
+            // than they safely could — or trust the prompt less next time.
+            DenialKey::Net4Port { ip, port } => format!("egress to {ip} on port {port} only"),
+            DenialKey::Net6Port { ip, port } => format!("egress to [{ip}] on port {port} only"),
+            // An identity key is the one exception to "the honest scope is
+            // always broader": it names exactly one object. Saying so is the
+            // point — approving it is a far smaller decision than approving a
+            // name, and an operator should be able to see that.
+            DenialKey::FileInode { dev, ino } => {
+                format!(
+                    "opening ONE file — {} — under any name",
+                    dev_ino(*dev, *ino)
+                )
+            }
+            DenialKey::DirInode { dev, ino } => format!(
+                "opening ANY file under ONE directory — {} — under any name",
+                dev_ino(*dev, *ino)
+            ),
+            DenialKey::ExecInode { dev, ino } => format!(
+                "executing ONE program — {} — under any name",
+                dev_ino(*dev, *ino)
+            ),
+            // Narrower than the key it wraps, and the prompt should say so:
+            // granting this lifts one operation, not the whole rule. The file
+            // stays as unreadable as the policy made it.
+            DenialKey::Lifecycle { op, key } => {
+                format!("{}-ing, and only that, for: {}", op.as_str(), key.scope())
+            }
+            // Narrower than the key it wraps, in the same way and for the same
+            // reason as a port key: this grants one transport, not the host.
+            DenialKey::NetProto { proto, key } => {
+                format!(
+                    "{} only — {}",
+                    proto.as_str().to_uppercase(),
+                    key.blast_radius()
+                )
+            }
         }
     }
+
+    /// The object a key covers, without the leading verb — so
+    /// [`Self::blast_radius`] can put a different verb in front of it.
+    fn scope(&self) -> String {
+        match self {
+            DenialKey::FileName(n) => format!("ANY file named `{n}` (any directory)"),
+            DenialKey::FileDir(d) => format!("ANY file anywhere under a directory named `{d}`"),
+            DenialKey::FileInode { dev, ino } => {
+                format!("ONE file — {} — under any name", dev_ino(*dev, *ino))
+            }
+            DenialKey::DirInode { dev, ino } => format!(
+                "ANY file under ONE directory — {} — under any name",
+                dev_ino(*dev, *ino)
+            ),
+            // The lifecycle hooks only ever match the four file keys above, so
+            // the rest cannot appear here; fall back to the full sentence rather
+            // than inventing a phrasing for a case that never occurs.
+            other => other.blast_radius(),
+        }
+    }
+
+    /// The kernel-map identity this key addresses, if it is an identity key.
+    pub fn inode(&self) -> Option<InodeKey> {
+        match self {
+            DenialKey::FileInode { dev, ino }
+            | DenialKey::DirInode { dev, ino }
+            | DenialKey::ExecInode { dev, ino } => Some(InodeKey::new(*dev, *ino)),
+            DenialKey::Lifecycle { key, .. } | DenialKey::NetProto { key, .. } => key.inode(),
+            _ => None,
+        }
+    }
+}
+
+/// A kernel name key with the access mask stored beside it — the exact shape of
+/// one `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_EXEC` entry.
+pub type NameEntry = ([u8; NAME_LEN], u8);
+
+/// The identity keys a policy compiles to, split by the kernel map each set
+/// goes into. Each entry is `(key, access mask)`.
+#[derive(Default, Debug)]
+pub struct InodeKeys {
+    pub files: Vec<(InodeKey, u8)>,
+    pub dirs: Vec<(InodeKey, u8)>,
+    pub execs: Vec<(InodeKey, u8)>,
+}
+
+impl InodeKeys {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.dirs.is_empty() && self.execs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len() + self.dirs.len() + self.execs.len()
+    }
+}
+
+/// What a stored mask denies, as a verb phrase for a sentence.
+///
+/// The two axes are listed separately and joined rather than collapsed into one
+/// word, because a mask can carry both and "access to" would hide the single
+/// thing an operator most needs to check: whether a rule that says `block`
+/// actually stops an `rm`.
+pub fn mask_verbs(mask: u8) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let rw = mask & (fmode::READ as u8 | fmode::WRITE as u8);
+    if mask == fmode::MASK_ANY || mask & fmode::OPEN_ANY != 0 {
+        parts.push("opening");
+    } else if rw == fmode::READ as u8 {
+        parts.push("READS of");
+    } else if rw == fmode::WRITE as u8 {
+        parts.push("WRITES to");
+    } else if rw != 0 {
+        parts.push("reads or writes of");
+    }
+    if fmode::covers(mask, fmode::CREATE) {
+        parts.push("CREATING");
+    }
+    if fmode::covers(mask, fmode::DELETE) {
+        parts.push("DELETING");
+    }
+    // A mask with no bit at all is never compiled, but one that denies nothing
+    // must not read as if it denied everything.
+    if parts.is_empty() {
+        return "nothing about".to_string();
+    }
+    parts.join(" / ")
+}
+
+/// Name → fixed-width kernel key, carrying the access mask.
+fn keyed(map: &BTreeMap<String, u8>) -> Vec<NameEntry> {
+    map.iter()
+        .filter_map(|(s, &mask)| name_key(s).map(|k| (k, mask)))
+        .collect()
+}
+
+/// `dev 8:1 ino 4242`, the form `stat` and `/proc/self/mountinfo` also speak.
+fn dev_ino(dev: u32, ino: u64) -> String {
+    let (maj, min) = crate::identity::split_dev(dev);
+    format!("dev {maj}:{min} ino {ino}")
 }
 
 impl fmt::Display for DenialKey {
@@ -109,6 +464,13 @@ impl fmt::Display for DenialKey {
             DenialKey::Exec(n) => write!(f, "exec={n}"),
             DenialKey::Net4(ip) => write!(f, "ip={ip}"),
             DenialKey::Net6(ip) => write!(f, "ip=[{ip}]"),
+            DenialKey::Net4Port { ip, port } => write!(f, "ip={ip}:{port}"),
+            DenialKey::Net6Port { ip, port } => write!(f, "ip=[{ip}]:{port}"),
+            DenialKey::FileInode { dev, ino } => write!(f, "ino={}", dev_ino(*dev, *ino)),
+            DenialKey::DirInode { dev, ino } => write!(f, "dir-ino={}", dev_ino(*dev, *ino)),
+            DenialKey::ExecInode { dev, ino } => write!(f, "exec-ino={}", dev_ino(*dev, *ino)),
+            DenialKey::Lifecycle { op, key } => write!(f, "{}:{key}", op.as_str()),
+            DenialKey::NetProto { proto, key } => write!(f, "{}/{key}", proto.as_str()),
         }
     }
 }
@@ -156,12 +518,18 @@ struct RawPolicy {
     exec: Vec<PathRuleRaw>,
 }
 
+/// A file or exec rule. Exactly one of `match:` (a glob over names) and `path:`
+/// (a concrete object, pinned by identity) — they are different questions, and a
+/// rule that tried to be both would have to lie about one of them.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PathRuleRaw {
     #[serde(rename = "match")]
-    pattern: String,
+    pattern: Option<String>,
+    path: Option<String>,
     action: Action,
+    #[serde(default)]
+    access: Access,
 }
 
 #[derive(Deserialize)]
@@ -169,17 +537,67 @@ struct PathRuleRaw {
 struct NetRuleRaw {
     cidr: Option<String>,
     domain: Option<String>,
+    /// Destination port. A rule that names one is treated as more specific than
+    /// any rule that does not, whatever their address prefixes — see
+    /// [`Policy::eval_connect`].
+    port: Option<u16>,
+    /// Transport. Same idea one dimension further: a rule naming a protocol is
+    /// more specific than one that does not, and the two combine — `proto` +
+    /// `port` is the most specific rule there is.
+    proto: Option<Proto>,
     action: Action,
 }
 
 // ── compiled policy ─────────────────────────────────────────────────────────
 
+/// How a compiled rule decides whether it covers a path.
+enum Matcher {
+    /// A `match:` glob, over the path as the syscall reported it.
+    Glob(GlobMatcher),
+    /// A `path:` rule, resolved to a concrete location. Compared exactly rather
+    /// than compiled to a glob, so a literal `[` or `*` in a filename means
+    /// itself.
+    ///
+    /// This is only the *userspace prediction*: the observed path can be
+    /// relative, or reach the object through a symlink, and then it will not
+    /// compare equal even though the kernel denies the open. The kernel's own
+    /// `DENY_FILE` event remains the authority — which is exactly why identity
+    /// rules are enforced by inode and not by this comparison.
+    Path {
+        exact: std::path::PathBuf,
+        subtree: bool,
+    },
+}
+
+impl Matcher {
+    fn is_match(&self, path: &str) -> bool {
+        match self {
+            Matcher::Glob(g) => g.is_match(path),
+            Matcher::Path { exact, subtree } => {
+                let p = Path::new(path);
+                p == exact || (*subtree && p.starts_with(exact))
+            }
+        }
+    }
+}
+
 struct PathRule {
     pattern: String,
-    matcher: GlobMatcher,
+    matcher: Matcher,
     action: Action,
-    /// `action == block` AND the pattern reduces to a kernel-enforceable key.
+    access: Access,
+    /// `action == block` AND the rule reduces to a kernel-enforceable key —
+    /// a basename/directory name, or a resolved `(dev, ino)`.
     enforceable: bool,
+}
+
+impl PathRule {
+    /// Whether this came from `match:`. The name-key analyses (over-broad keys,
+    /// kernel shadowing) only apply to globs — a `path:` rule has no basename
+    /// semantics to over-reach with.
+    fn is_glob(&self) -> bool {
+        matches!(self.matcher, Matcher::Glob(_))
+    }
 }
 
 enum NetMatch {
@@ -192,6 +610,12 @@ enum NetMatch {
 struct NetRule {
     label: String,
     which: NetMatch,
+    /// `Some(p)` puts this rule in a port trie, which the kernel consults
+    /// before the address-only ones.
+    port: Option<u16>,
+    /// `Some(p)` puts this rule in a protocol trie. With `port`, that is four
+    /// tries in all, consulted most-specific first.
+    proto: Option<Proto>,
     action: Action,
 }
 
@@ -213,6 +637,16 @@ impl NetRule {
             _ => None,
         }
     }
+    /// Does this rule's port constraint (if any) admit `dport`?
+    fn port_matches(&self, dport: u16) -> bool {
+        self.port.is_none_or(|p| p == dport)
+    }
+
+    /// Which of the four tiers this rule lives in: `(names a proto, names a
+    /// port)`. The tuple is the trie, and the order tiers are consulted in.
+    fn tier(&self) -> (bool, bool) {
+        (self.proto.is_some(), self.port.is_some())
+    }
 }
 
 pub struct Policy {
@@ -220,16 +654,28 @@ pub struct Policy {
     files: Vec<PathRule>,
     exec: Vec<PathRule>,
     network: Vec<NetRule>,
-    /// Mirror of the kernel's `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_EXEC` maps.
-    /// The LSM hook can only see dentry names, so these are what it *actually*
-    /// matches on — kept here so userspace can reproduce the kernel's verdict
-    /// instead of guessing from the glob.
-    kern_names: BTreeSet<String>,
-    kern_dirs: BTreeSet<String>,
-    kern_execs: BTreeSet<String>,
+    /// Mirror of the kernel's `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_EXEC` maps:
+    /// name → the access mask stored with it. The LSM hook can only see dentry
+    /// names, so these are what it *actually* matches on — kept here so
+    /// userspace can reproduce the kernel's verdict instead of guessing from the
+    /// glob.
+    kern_names: BTreeMap<String, u8>,
+    kern_dirs: BTreeMap<String, u8>,
+    kern_execs: BTreeMap<String, u8>,
+    /// Mirror of `BLOCK_INODES` / `BLOCK_DIR_INODES` / `BLOCK_EXEC_INODES`:
+    /// every `path:` rule that resolved to a real object.
+    anchors: Vec<Anchor>,
+    /// `path:` rules that resolved to nothing. They enforce nothing, and a
+    /// policy whose identity rules quietly evaporated is worse than one that
+    /// never had them — startup and `--dry-run` name every one.
+    unresolved_anchors: Vec<UnresolvedAnchor>,
     /// `domain:` rules that resolved to nothing at load time — they enforce
     /// nothing at all, so startup says so instead of leaving a silent hole.
     unresolved_domains: Vec<String>,
+    /// Identifies this exact policy source, so a stored approval granted under
+    /// it stops applying the moment the rules change. Computed here because
+    /// this is the only place the source text exists.
+    fingerprint: String,
 }
 
 /// The default policy, embedded so `wardyn` runs out of the box with no file.
@@ -255,26 +701,35 @@ pub fn null_resolver(_domain: &str) -> Vec<IpAddr> {
 }
 
 impl Policy {
+    /// Identifies this policy's source. A stored approval records it and
+    /// applies to no other, so editing the rules retires the approvals granted
+    /// against the version that no longer exists.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
     /// Load from an explicit path, else `./policy.yaml`, else the embedded default.
     pub fn load(path: Option<&Path>) -> Result<Policy> {
-        if let Some(p) = path {
-            let text = std::fs::read_to_string(p)
-                .with_context(|| format!("reading policy {}", p.display()))?;
-            return Policy::from_yaml_str(&text)
-                .with_context(|| format!("parsing {}", p.display()));
-        }
-        if let Ok(text) = std::fs::read_to_string("policy.yaml") {
-            return Policy::from_yaml_str(&text).context("parsing ./policy.yaml");
-        }
-        Policy::from_yaml_str(DEFAULT_POLICY).context("parsing embedded default policy")
+        Loader::new().load(path)
     }
 
     /// Parse with the system DNS resolver (what the binary uses).
     pub fn from_yaml_str(text: &str) -> Result<Policy> {
-        Policy::from_yaml_str_with(text, &system_resolver)
+        Loader::new().from_str(text)
     }
 
+    /// Parse with a custom DNS resolver and no identity resolution — the shape
+    /// most tests want.
     pub fn from_yaml_str_with(text: &str, resolve: Resolver<'_>) -> Result<Policy> {
+        Loader::offline().resolver(resolve).from_str(text)
+    }
+
+    fn compile(
+        text: &str,
+        resolve: Resolver<'_>,
+        stat: identity::Stat<'_>,
+        base: &AnchorBase,
+    ) -> Result<Policy> {
         let raw: RawPolicy = serde_yaml::from_str(text).context("invalid policy YAML")?;
         if let Some(v) = raw.version {
             if v != SCHEMA_VERSION {
@@ -285,33 +740,28 @@ impl Policy {
             }
         }
 
-        // `dir_capable` files support the `**/dir/**` parent-directory form; exec
-        // rules are basename-only.
-        let compile_paths = |rules: Vec<PathRuleRaw>, dir_capable: bool| -> Result<Vec<PathRule>> {
-            rules
-                .into_iter()
-                .map(|r| {
-                    let matcher = Glob::new(&r.pattern)
-                        .with_context(|| format!("bad glob `{}`", r.pattern))?
-                        .compile_matcher();
-                    let enforceable = r.action == Action::Block
-                        && if dir_capable {
-                            file_key(&r.pattern).is_some()
-                        } else {
-                            last_segment(&r.pattern).and_then(name_key).is_some()
-                        };
-                    Ok(PathRule {
-                        pattern: r.pattern,
-                        matcher,
-                        action: r.action,
-                        enforceable,
-                    })
-                })
-                .collect()
-        };
-
-        let files = compile_paths(raw.files, true)?;
-        let exec = compile_paths(raw.exec, false)?;
+        let mut anchors = Vec::new();
+        let mut unresolved_anchors = Vec::new();
+        let files = compile_rules(
+            raw.files,
+            true,
+            false,
+            base,
+            stat,
+            &mut anchors,
+            &mut unresolved_anchors,
+        )
+        .context("in `files:`")?;
+        let exec = compile_rules(
+            raw.exec,
+            false,
+            true,
+            base,
+            stat,
+            &mut anchors,
+            &mut unresolved_anchors,
+        )
+        .context("in `exec:`")?;
 
         // Network: cidr rules compile directly; domain rules resolve (best effort)
         // at load time, expanding to one Ip rule per resolved address, preserving
@@ -319,6 +769,12 @@ impl Policy {
         let mut network = Vec::new();
         let mut unresolved_domains = Vec::new();
         for r in raw.network {
+            let suffix = match (r.proto, r.port) {
+                (Some(t), Some(p)) => format!(" {} port {p}", t.as_str()),
+                (Some(t), None) => format!(" {}", t.as_str()),
+                (None, Some(p)) => format!(" port {p}"),
+                (None, None) => String::new(),
+            };
             match (&r.cidr, &r.domain) {
                 (Some(cidr), Some(domain)) => {
                     anyhow::bail!(
@@ -332,8 +788,10 @@ impl Policy {
                         IpNet::V6(n) => NetMatch::V6Cidr(n),
                     };
                     network.push(NetRule {
-                        label: format!("cidr:{cidr}"),
+                        label: format!("cidr:{cidr}{suffix}"),
                         which,
+                        port: r.port,
+                        proto: r.proto,
                         action: r.action,
                     });
                 }
@@ -348,42 +806,77 @@ impl Policy {
                             IpAddr::V6(v6) => NetMatch::V6Ip(v6),
                         };
                         network.push(NetRule {
-                            label: format!("domain:{domain}"),
+                            label: format!("domain:{domain}{suffix}"),
                             which,
+                            port: r.port,
+                            proto: r.proto,
                             action: r.action,
                         });
                     }
                 }
+                // `port:` on its own means "this port, anywhere" — the most
+                // useful port rule there is ("never SMTP"). It covers BOTH
+                // families: a v4-only reading would leave the same port open
+                // over IPv6, which is the exact shape of the hole the `::/0`
+                // rule had to be added for.
                 (None, None) => {
-                    anyhow::bail!("network rule needs `cidr` or `domain`");
+                    if r.port.is_none() && r.proto.is_none() {
+                        anyhow::bail!("network rule needs `cidr`, `domain`, `port`, or `proto`");
+                    }
+                    let label = match (r.proto, r.port) {
+                        (Some(t), Some(p)) => format!("{}:{p}", t.as_str()),
+                        (Some(t), None) => format!("proto:{}", t.as_str()),
+                        (None, Some(p)) => format!("port:{p}"),
+                        (None, None) => unreachable!("guarded above"),
+                    };
+                    for which in [
+                        NetMatch::V4Cidr("0.0.0.0/0".parse().expect("valid")),
+                        NetMatch::V6Cidr("::/0".parse().expect("valid")),
+                    ] {
+                        network.push(NetRule {
+                            label: label.clone(),
+                            which,
+                            port: r.port,
+                            proto: r.proto,
+                            action: r.action,
+                        });
+                    }
                 }
             }
         }
 
         // Compile the kernel-side matcher once, from the same rules, so the
-        // feed and the LSM hook can never drift apart.
-        let mut kern_names = BTreeSet::new();
-        let mut kern_dirs = BTreeSet::new();
+        // feed and the LSM hook can never drift apart. Only `match:` rules
+        // contribute names; a `path:` rule deliberately does not, because it
+        // means "this object", and turning it into a basename would silently
+        // widen it back into the thing it exists to replace.
+        let mut kern_names = BTreeMap::new();
+        let mut kern_dirs = BTreeMap::new();
         for r in &files {
-            if r.action != Action::Block {
+            if r.action != Action::Block || !matches!(r.matcher, Matcher::Glob(_)) {
                 continue;
             }
             if let Some((is_dir, seg)) = file_seg(&r.pattern) {
-                if is_dir {
-                    kern_dirs.insert(seg.to_string());
+                let target = if is_dir {
+                    &mut kern_dirs
                 } else {
-                    kern_names.insert(seg.to_string());
-                }
+                    &mut kern_names
+                };
+                merge_mask(target, seg, r.access.mask());
             }
         }
-        let kern_execs = exec
-            .iter()
-            .filter(|r| r.action == Action::Block)
-            .filter_map(|r| last_segment(&r.pattern).filter(|s| name_key(s).is_some()))
-            .map(str::to_string)
-            .collect();
+        let mut kern_execs = BTreeMap::new();
+        for r in &exec {
+            if r.action != Action::Block || !matches!(r.matcher, Matcher::Glob(_)) {
+                continue;
+            }
+            if let Some(seg) = last_segment(&r.pattern).filter(|s| name_key(s).is_some()) {
+                merge_mask(&mut kern_execs, seg, r.access.mask());
+            }
+        }
 
         Ok(Policy {
+            fingerprint: crate::overrides::fingerprint(text),
             default_action: raw.default_action,
             files,
             exec,
@@ -391,6 +884,8 @@ impl Policy {
             kern_names,
             kern_dirs,
             kern_execs,
+            anchors,
+            unresolved_anchors,
             unresolved_domains,
         })
     }
@@ -419,6 +914,12 @@ impl Policy {
         self.network
             .iter()
             .rev()
+            // A rule that names a port or a protocol lives in one of the three
+            // more specific tries; leaving it here as well would make
+            // `{ cidr: "0.0.0.0/0", port: 25, action: block }` read as a
+            // deny-all for every port, and `{ proto: udp, action: block }` as a
+            // deny-all for every transport.
+            .filter(|r| r.tier() == (false, false))
             .filter_map(|r| {
                 let (plen, data) = match &r.which {
                     NetMatch::V4Cidr(net) => (
@@ -433,12 +934,162 @@ impl Policy {
             .collect()
     }
 
+    /// Port-qualified IPv4 rules for `NET_PORT_RULES`, as
+    /// `(prefix_len, key, action)`.
+    ///
+    /// The prefix covers the whole 16-bit port plus however much of the address
+    /// the rule constrained, so two rules for different ports can never match
+    /// each other and, within one port, the more specific address still wins.
+    pub fn port_entries(&self) -> Vec<(u32, PortKey4, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter_map(|r| {
+                let port = r.port.filter(|_| r.proto.is_none())?;
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V4Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V4Ip(a) => (32u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PORT_BITS + addr_bits,
+                    PortKey4::new(port, octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Same, for IPv6.
+    pub fn port_entries6(&self) -> Vec<(u32, PortKey6, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter_map(|r| {
+                let port = r.port.filter(|_| r.proto.is_none())?;
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V6Ip(a) => (128u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PORT_BITS + addr_bits,
+                    PortKey6::new(port, octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Whether any rule names a port — i.e. whether the kernel needs to consult
+    /// the port tries at all.
+    pub fn has_port_rules(&self) -> bool {
+        self.network.iter().any(|r| r.tier() == (false, true))
+    }
+
+    /// Whether any rule names a protocol, for the same reason.
+    pub fn has_proto_rules(&self) -> bool {
+        self.network.iter().any(|r| r.proto.is_some())
+    }
+
+    /// Rules naming a protocol AND a port, for `NET_PROTO_PORT_RULES`.
+    ///
+    /// The prefix covers the protocol and port bits in full and only the address
+    /// is prefixed — a rule reaches this trie by naming both, so neither leading
+    /// field is ever a don't-care, and the address keeps exactly the meaning it
+    /// has in the tries with no protocol at all.
+    pub fn proto_port_entries(&self) -> Vec<(u32, ProtoPortKey4, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter_map(|r| {
+                let (proto, port) = (r.proto?, r.port?);
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V4Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V4Ip(a) => (32u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PROTO_BITS + PORT_BITS + addr_bits,
+                    ProtoPortKey4::new(proto.number(), port, octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Same, for IPv6.
+    pub fn proto_port_entries6(&self) -> Vec<(u32, ProtoPortKey6, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter_map(|r| {
+                let (proto, port) = (r.proto?, r.port?);
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V6Ip(a) => (128u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PROTO_BITS + PORT_BITS + addr_bits,
+                    ProtoPortKey6::new(proto.number(), port, octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Rules naming a protocol but no port, for `NET_PROTO_RULES`.
+    pub fn proto_entries(&self) -> Vec<(u32, ProtoKey4, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter(|r| r.port.is_none())
+            .filter_map(|r| {
+                let proto = r.proto?;
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V4Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V4Ip(a) => (32u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PROTO_BITS + addr_bits,
+                    ProtoKey4::new(proto.number(), octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Same, for IPv6.
+    pub fn proto_entries6(&self) -> Vec<(u32, ProtoKey6, u32)> {
+        self.network
+            .iter()
+            .rev()
+            .filter(|r| r.port.is_none())
+            .filter_map(|r| {
+                let proto = r.proto?;
+                let (addr_bits, octets) = match &r.which {
+                    NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
+                    NetMatch::V6Ip(a) => (128u32, a.octets()),
+                    _ => return None,
+                };
+                Some((
+                    PROTO_BITS + addr_bits,
+                    ProtoKey6::new(proto.number(), octets),
+                    r.action.code(),
+                ))
+            })
+            .collect()
+    }
+
     /// IPv6 network rules as `(prefix_len, address bytes (network order), action
     /// code)` for the v6 LPM trie.
     pub fn net_entries6(&self) -> Vec<(u32, [u8; 16], u32)> {
         self.network
             .iter()
             .rev()
+            .filter(|r| r.port.is_none())
             .filter_map(|r| {
                 let (plen, data) = match &r.which {
                     NetMatch::V6Cidr(net) => (net.prefix_len() as u32, net.network().octets()),
@@ -454,11 +1105,65 @@ impl Policy {
     /// (e.g. `.env`, `shadow`) and exact directory names (e.g. `.ssh`), the
     /// latter matched against every ancestor of the opened file.
     /// Patterns that can't reduce to a literal segment stay observe/warn only.
-    pub fn file_enforcement(&self) -> (Vec<[u8; NAME_LEN]>, Vec<[u8; NAME_LEN]>) {
-        let keys = |set: &BTreeSet<String>| -> Vec<[u8; NAME_LEN]> {
-            set.iter().filter_map(|s| name_key(s)).collect()
-        };
-        (keys(&self.kern_names), keys(&self.kern_dirs))
+    pub fn file_enforcement(&self) -> (Vec<NameEntry>, Vec<NameEntry>) {
+        (keyed(&self.kern_names), keyed(&self.kern_dirs))
+    }
+
+    /// Identity keys for `BLOCK_INODES` / `BLOCK_DIR_INODES` / `BLOCK_EXEC_INODES`,
+    /// each with the access mask stored beside it.
+    pub fn inode_enforcement(&self) -> InodeKeys {
+        let mut out = InodeKeys::default();
+        for a in &self.anchors {
+            let entry = (a.key, a.access_mask);
+            match (a.exec, a.kind) {
+                (true, _) => out.execs.push(entry),
+                (false, AnchorKind::Dir) => out.dirs.push(entry),
+                (false, AnchorKind::File) => out.files.push(entry),
+            }
+        }
+        out
+    }
+
+    /// Every resolved identity anchor, for `--dry-run` and startup reporting.
+    pub fn anchors(&self) -> &[Anchor] {
+        &self.anchors
+    }
+
+    /// Does any block rule name a `create`/`delete` access?
+    ///
+    /// Drives `CFG_LIFECYCLE_ON`. False leaves the five lifecycle hooks inert,
+    /// which is both a hot-path saving and the compatibility guarantee: a policy
+    /// that never mentions the axis cannot begin refusing an `rm` because of it.
+    pub fn has_lifecycle_rules(&self) -> bool {
+        self.files
+            .iter()
+            .any(|r| r.action == Action::Block && r.access.is_lifecycle())
+    }
+
+    /// Does any block rule narrow itself to reads or writes?
+    ///
+    /// Narrowing needs the kernel to read `file->f_mode`, which needs an offset
+    /// resolved from BTF. When that is unavailable the rule still fires — it
+    /// just covers every open, i.e. it is broader than written. Over-blocking is
+    /// the safe direction, but it is not what the policy says, so startup has to
+    /// be able to say so.
+    pub fn uses_access_narrowing(&self) -> bool {
+        self.files
+            .iter()
+            .any(|r| r.action == Action::Block && r.access != Access::Any)
+    }
+
+    /// `path:` block rules that resolved to nothing — they enforce nothing.
+    pub fn unresolved_anchors(&self) -> &[UnresolvedAnchor] {
+        &self.unresolved_anchors
+    }
+
+    /// The anchor a kernel identity denial refers to, so a `DENY_FILE` carrying
+    /// only `(dev, ino)` can be rendered as the path the operator wrote in the
+    /// policy — which is the whole story: *this* is the file you named, whatever
+    /// it is called now.
+    pub fn anchor_for(&self, key: &InodeKey) -> Option<&Anchor> {
+        self.anchors.iter().find(|a| a.key == *key)
     }
 
     /// The key the LSM `file_open` hook would deny `path` on, if any — the
@@ -472,15 +1177,29 @@ impl Policy {
     /// always claimed. Consult this (not just the glob) before reporting a
     /// verdict, otherwise the feed says `ok` for an open the kernel actually
     /// turned into `-EPERM`.
-    pub fn kernel_file_denial(&self, path: &str) -> Option<DenialKey> {
+    ///
+    /// `requested` is the access the open asked for ([`fmode`] bits, derived
+    /// from the syscall's flags). A key whose rule only covers reads must not
+    /// predict a denial for a write-only open — the kernel would not have made
+    /// one, and a claimed denial that never happened is the failure mode this
+    /// whole mirror exists to avoid.
+    ///
+    /// Identity keys are deliberately absent here: this mirror only has the
+    /// path string, and the point of an identity rule is that the path string
+    /// is not what decides. Those denials arrive as kernel `DENY_FILE` events.
+    pub fn kernel_file_denial(&self, path: &str, requested: u32) -> Option<DenialKey> {
+        let hit = |m: &BTreeMap<String, u8>, k: &str| -> bool {
+            m.get(k)
+                .is_some_and(|&mask| fmode::matches(mask, requested))
+        };
         let mut segs = path.rsplit('/').filter(|s| !s.is_empty());
         let name = segs.next()?;
-        if self.kern_names.contains(name) {
+        if hit(&self.kern_names, name) {
             return Some(DenialKey::FileName(name.to_string()));
         }
         // Ancestors, nearest first, bounded exactly like the kernel walk.
         for dir in segs.take(MAX_DIR_WALK) {
-            if self.kern_dirs.contains(dir) {
+            if hit(&self.kern_dirs, dir) {
                 return Some(DenialKey::FileDir(dir.to_string()));
             }
         }
@@ -490,7 +1209,7 @@ impl Policy {
     /// Same, for the LSM `bprm_check_security` hook (exec basenames).
     pub fn kernel_exec_denial(&self, path: &str) -> Option<DenialKey> {
         let name = last_segment(path)?;
-        if self.kern_execs.contains(name) {
+        if self.kern_execs.contains_key(name) {
             return Some(DenialKey::Exec(name.to_string()));
         }
         None
@@ -501,10 +1220,12 @@ impl Policy {
     /// `**/dir/**` survive the reduction intact; anything more specific
     /// (`/etc/shadow`, `**/.aws/credentials`) loses its directory context and
     /// over-blocks. Startup prints these so the over-reach is never a surprise.
+    /// A `path:` rule is never over-broad — it names exactly one object — so
+    /// only glob rules are considered here and in [`Self::shadowed_by_kernel`].
     pub fn overbroad_block_keys(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for r in &self.files {
-            if r.action != Action::Block {
+            if r.action != Action::Block || !r.is_glob() {
                 continue;
             }
             if let Some((is_dir, seg)) = file_seg(&r.pattern) {
@@ -522,7 +1243,7 @@ impl Policy {
             }
         }
         for r in &self.exec {
-            if r.action != Action::Block {
+            if r.action != Action::Block || !r.is_glob() {
                 continue;
             }
             if let Some(seg) = last_segment(&r.pattern) {
@@ -542,36 +1263,38 @@ impl Policy {
     /// covers. Each entry is `(allow-rule pattern, the key that beats it)`.
     pub fn shadowed_by_kernel(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        let mut check = |rules: &[PathRule], names: &BTreeSet<String>, dirs: &BTreeSet<String>| {
-            for (i, r) in rules.iter().enumerate() {
-                if r.action == Action::Block {
-                    continue;
-                }
-                // Does a *later* block rule's key cover paths this rule matches?
-                let later_blocks = rules[i + 1..].iter().any(|b| b.action == Action::Block);
-                if !later_blocks {
-                    continue;
-                }
-                if let Some(seg) = last_segment(&r.pattern) {
-                    if names.contains(seg) {
-                        out.push((r.pattern.clone(), format!("name={seg}")));
+        let empty = BTreeMap::new();
+        let mut check =
+            |rules: &[PathRule], names: &BTreeMap<String, u8>, dirs: &BTreeMap<String, u8>| {
+                for (i, r) in rules.iter().enumerate() {
+                    if r.action == Action::Block || !r.is_glob() {
                         continue;
                     }
+                    // Does a *later* block rule's key cover paths this rule matches?
+                    let later_blocks = rules[i + 1..].iter().any(|b| b.action == Action::Block);
+                    if !later_blocks {
+                        continue;
+                    }
+                    if let Some(seg) = last_segment(&r.pattern) {
+                        if names.contains_key(seg) {
+                            out.push((r.pattern.clone(), format!("name={seg}")));
+                            continue;
+                        }
+                    }
+                    // Any literal segment of this pattern that is a blocked dir name
+                    // makes the whole subtree denied, wherever it appears.
+                    if let Some(seg) = r
+                        .pattern
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .find(|s| dirs.contains_key(*s))
+                    {
+                        out.push((r.pattern.clone(), format!("dir={seg}")));
+                    }
                 }
-                // Any literal segment of this pattern that is a blocked dir name
-                // makes the whole subtree denied, wherever it appears.
-                if let Some(seg) = r
-                    .pattern
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .find(|s| dirs.contains(*s))
-                {
-                    out.push((r.pattern.clone(), format!("dir={seg}")));
-                }
-            }
-        };
+            };
         check(&self.files, &self.kern_names, &self.kern_dirs);
-        check(&self.exec, &self.kern_execs, &BTreeSet::new());
+        check(&self.exec, &self.kern_execs, &empty);
         out
     }
 
@@ -584,7 +1307,9 @@ impl Policy {
     pub fn net_coverage_gaps(&self) -> Vec<String> {
         let has_block_all = |v6: bool| {
             self.network.iter().any(|r| {
+                // A port-qualified `0.0.0.0/0` denies one port, not all egress.
                 r.action == Action::Block
+                    && r.port.is_none()
                     && match &r.which {
                         NetMatch::V4Cidr(n) => !v6 && n.prefix_len() == 0,
                         NetMatch::V6Cidr(n) => v6 && n.prefix_len() == 0,
@@ -654,40 +1379,110 @@ impl Policy {
         let _ = writeln!(s, "policy: {}", self.summary());
 
         let _ = writeln!(s, "\nkernel-enforced under --enforce:");
-        for n in &self.kern_names {
+        for (n, &mask) in &self.kern_names {
             let _ = writeln!(
                 s,
-                "  file  name={n:<24} denies opening ANY file named `{n}`"
+                "  file  name={n:<24} denies {} ANY file named `{n}`",
+                mask_verbs(mask)
             );
         }
-        for d in &self.kern_dirs {
+        for (d, &mask) in &self.kern_dirs {
             let _ = writeln!(
                 s,
-                "  file  dir={d:<25} denies ANY file under a directory named `{d}` (any depth)"
+                "  file  dir={d:<25} denies {} ANY file under a directory named `{d}` (any depth)",
+                mask_verbs(mask)
             );
         }
-        for e in &self.kern_execs {
+        for e in self.kern_execs.keys() {
             let _ = writeln!(
                 s,
                 "  exec  name={e:<24} denies executing ANY program named `{e}`"
             );
         }
-        let blocked_nets: Vec<&str> = self
-            .network
-            .iter()
-            .filter(|r| r.action == Action::Block)
-            .map(|r| r.label.as_str())
-            .collect();
-        if blocked_nets.is_empty() {
-            let _ = writeln!(s, "  net   (no block rules — no egress is denied)");
-        } else {
-            let _ = writeln!(s, "  net   blocked: {}", blocked_nets.join(", "));
+        // Identity keys, which is where the operator can see that a rule follows
+        // the object rather than the label — and see the exact object it landed
+        // on, so a mis-resolved `~` or a wrong working directory is visible here
+        // rather than after an incident.
+        for a in &self.anchors {
+            let axis = if a.exec { "exec" } else { "file" };
+            let _ = writeln!(s, "  {axis}  {:<29} {}", a.to_string(), a.blast_radius());
         }
-        if self.kern_names.is_empty() && self.kern_dirs.is_empty() && self.kern_execs.is_empty() {
+        // Deduplicated: a bare `port:`/`proto:` rule is compiled into one entry
+        // per address family, and a rule listed twice reads as two rules.
+        let blocked = |tier: (bool, bool)| -> Vec<&str> {
+            let mut out: Vec<&str> = Vec::new();
+            for r in &self.network {
+                if r.action == Action::Block && r.tier() == tier && !out.contains(&r.label.as_str())
+                {
+                    out.push(&r.label);
+                }
+            }
+            out
+        };
+        // Listed in the order the kernel consults them, because that order IS
+        // the semantics: reading them in policy order would suggest a
+        // first-match rule that does not exist.
+        let tiers = [
+            ((true, true), "blocked by protocol+port"),
+            ((false, true), "blocked by port"),
+            ((true, false), "blocked by protocol"),
+            ((false, false), "blocked"),
+        ];
+        let mut any = false;
+        for (tier, label) in tiers {
+            let rules = blocked(tier);
+            if !rules.is_empty() {
+                any = true;
+                let _ = writeln!(s, "  net   {label}: {}", rules.join(", "));
+            }
+        }
+        if !any {
+            let _ = writeln!(s, "  net   (no block rules — no egress is denied)");
+        }
+        // The one thing about these rules that cannot be inferred from the list.
+        if self.has_port_rules() || self.has_proto_rules() {
             let _ = writeln!(
                 s,
-                "  file/exec: NOTHING is kernel-enforced (no block rule reduces to a name or dir)"
+                "\nnote: rules are consulted MOST SPECIFIC FIRST — protocol+port, then port, then\
+                 \n      protocol, then address — whatever their address prefixes. \
+                 `{{ port: 25,\n      action: block }}` denies SMTP even to a network another rule \
+                 allows in full, and\n      `{{ proto: udp, action: block }}` denies UDP there too."
             );
+        }
+        // A protocol rule enforces nothing on a connect whose protocol the feed
+        // could not read, and the feed reads none of them — so the row an
+        // operator sees may say `ok` for a connection the kernel then refuses.
+        // The kernel's own DENY_NET event still reports it; saying so here is
+        // what keeps that from looking like a contradiction.
+        if self.has_proto_rules() {
+            let _ = writeln!(
+                s,
+                "      A `proto:` rule is enforced by the kernel but NOT predicted in the feed: \
+                 the\n      connect tracepoint sees a sockaddr, not a socket, so it has no \
+                 protocol to\n      match on. Such a denial arrives as a kernel-reported row \
+                 instead."
+            );
+        }
+        if self.kern_names.is_empty()
+            && self.kern_dirs.is_empty()
+            && self.kern_execs.is_empty()
+            && self.anchors.is_empty()
+        {
+            let _ = writeln!(
+                s,
+                "  file/exec: NOTHING is kernel-enforced (no block rule reduces to a name, a dir, \
+                 or a resolved object)"
+            );
+        }
+
+        if !self.unresolved_anchors.is_empty() {
+            let _ = writeln!(
+                s,
+                "\n`path:` rules that resolved to NOTHING (they enforce nothing):"
+            );
+            for u in &self.unresolved_anchors {
+                let _ = writeln!(s, "  {}  ->  {} — {}", u.rule, u.path.display(), u.reason);
+            }
         }
 
         // A name-form rule (`**/.aws`) denies opening the entry itself; it does
@@ -695,8 +1490,8 @@ impl Policy {
         // write believing the opposite, so state it per rule rather than guess.
         let name_only: Vec<&String> = self
             .kern_names
-            .iter()
-            .filter(|n| !self.kern_dirs.contains(*n))
+            .keys()
+            .filter(|n| !self.kern_dirs.contains_key(*n))
             .collect();
         if !name_only.is_empty() {
             let _ = writeln!(
@@ -749,18 +1544,22 @@ impl Policy {
     /// Patterns of `block` file/exec rules that CANNOT be kernel-enforced (glob
     /// segments, or a name at/over the [`NAME_LEN`] key width). The feed flags
     /// these distinctly and startup warns about them.
+    /// Glob rules only: an unenforceable `path:` rule has a different cause (it
+    /// resolved to nothing) and its own report, and listing it here as well —
+    /// under a heading that explains it as a glob problem — would be two wrong
+    /// answers where one right one exists.
     pub fn observe_only_blocks(&self) -> Vec<String> {
         self.files
             .iter()
             .chain(&self.exec)
-            .filter(|r| r.action == Action::Block && !r.enforceable)
+            .filter(|r| r.action == Action::Block && !r.enforceable && r.is_glob())
             .map(|r| r.pattern.clone())
             .collect()
     }
 
     /// Exec block rules compiled to exact basenames for the LSM bprm_check matcher.
-    pub fn exec_enforcement(&self) -> Vec<[u8; NAME_LEN]> {
-        self.kern_execs.iter().filter_map(|s| name_key(s)).collect()
+    pub fn exec_enforcement(&self) -> Vec<NameEntry> {
+        keyed(&self.kern_execs)
     }
 
     pub fn eval_file(&self, path: &str) -> Verdict {
@@ -771,48 +1570,146 @@ impl Policy {
         eval_path(&self.exec, path, self.default_action)
     }
 
-    pub fn eval_connect(&self, ip: Ipv4Addr) -> Verdict {
-        self.net_verdict(
-            self.network
-                .iter()
-                .filter_map(|r| Some((r, r.v4_prefix(ip)?))),
-        )
+    /// The verdict for a connect whose transport is not known.
+    ///
+    /// That is every *observed* connect: the `sys_enter` tracepoint sees a
+    /// `sockaddr`, not a socket, so it cannot report the protocol and does not
+    /// guess one. See [`Self::eval_connect_proto`] for what the mirror does with
+    /// that.
+    pub fn eval_connect(&self, ip: Ipv4Addr, dport: u16) -> Verdict {
+        self.eval_connect_proto(ip, dport, None)
     }
 
-    pub fn eval_connect6(&self, ip: Ipv6Addr) -> Verdict {
-        self.net_verdict(
-            self.network
-                .iter()
-                .filter_map(|r| Some((r, r.v6_prefix(ip)?))),
-        )
+    pub fn eval_connect6(&self, ip: Ipv6Addr, dport: u16) -> Verdict {
+        self.eval_connect6_proto(ip, dport, None)
     }
 
-    /// Pick the verdict for a connect from the matching `(rule, prefix_len)`
-    /// pairs, MOST-SPECIFIC first (longest prefix wins), ties broken by policy
-    /// order. This is longest-prefix-match, not first-match — the kernel decides
-    /// egress with an LPM trie, and CIDRs matching one IP are always nested, so
-    /// this is the semantics the kernel actually enforces. Evaluating it any
-    /// other way would make the feed disagree with the block that really fired.
-    fn net_verdict<'a>(&self, matches: impl Iterator<Item = (&'a NetRule, u8)>) -> Verdict {
-        let mut best: Option<(&NetRule, u8)> = None;
-        for (r, plen) in matches {
-            // Strictly-greater keeps the earliest rule on a prefix-length tie,
-            // matching the kernel trie (net_entries inserts earliest rule last).
-            if best.is_none_or(|(_, bp)| plen > bp) {
-                best = Some((r, plen));
+    /// The verdict for a connect on a known transport.
+    ///
+    /// `None` means "not known", and the mirror then evaluates **both**
+    /// transports. Where they agree, the answer is certain and nothing about the
+    /// prediction changes. Where they disagree, the policy has made the outcome
+    /// depend on something the feed cannot see, and the verdict comes back as
+    /// the least severe of the two with `enforceable: false`.
+    ///
+    /// Neither half of that is arbitrary. Simply skipping the protocol tiers
+    /// looks safe and is not: a proto-qualified *allow* outranks a lower-tier
+    /// block, so ignoring it makes the mirror claim a denial the kernel never
+    /// made — which is the failure this mirror exists to prevent, and which the
+    /// e2e suite caught doing exactly that. Leaning to the permissive side
+    /// instead costs nothing, because a denial the mirror misses still reaches
+    /// the feed: the cgroup hook reports its own decision, exactly as it does
+    /// for an identity match no path string could have predicted.
+    pub fn eval_connect_proto(&self, ip: Ipv4Addr, dport: u16, proto: Option<Proto>) -> Verdict {
+        self.net_verdict(|r| r.v4_prefix(ip), dport, proto)
+    }
+
+    pub fn eval_connect6_proto(&self, ip: Ipv6Addr, dport: u16, proto: Option<Proto>) -> Verdict {
+        self.net_verdict(|r| r.v6_prefix(ip), dport, proto)
+    }
+
+    /// Pick the verdict for a connect, mirroring what the kernel will do.
+    ///
+    /// Four passes, and the order between them is the one thing about these
+    /// rules that has to be stated rather than guessed:
+    ///
+    /// 1. **Rules naming this protocol AND this port**, most-specific address first.
+    /// 2. **Rules naming this port** (any protocol), most-specific address first.
+    /// 3. **Rules naming this protocol** (any port), most-specific address first.
+    /// 4. **Rules naming neither**, most-specific address first.
+    /// 5. `default_action`.
+    ///
+    /// So a rule that names a dimension beats one that does not, whatever their
+    /// address prefixes — `{ port: 25, action: block }` denies SMTP even to a
+    /// `/8` the policy otherwise allows, and `{ proto: udp, action: block }`
+    /// denies UDP there too. That is what the kernel does, because each tier is
+    /// its own LPM trie and the hook consults them in this order; it is also
+    /// what people mean when they write "never SMTP" or "no UDP at all".
+    ///
+    /// Letting prefix length decide *across* dimensions instead would make
+    /// `{ proto: udp, action: block }` a `/0` rule that any `/8` allow outranks,
+    /// so the most useful protocol rule there is would quietly not mean what it
+    /// says. Within each pass it is longest-prefix-match, not first-match,
+    /// because the kernel decides with an LPM trie; ties keep the earliest rule.
+    fn net_verdict(
+        &self,
+        prefix_of: impl Fn(&NetRule) -> Option<u8>,
+        dport: u16,
+        proto: Option<Proto>,
+    ) -> Verdict {
+        // A known transport, or a policy with nothing protocol-dependent in it:
+        // one pass, and the answer is exact.
+        if proto.is_some() || !self.has_proto_rules() {
+            return self.net_verdict_for(&prefix_of, dport, proto);
+        }
+        // Otherwise ask both transports. Agreement means the protocol never
+        // mattered here, so the prediction is as good as it ever was.
+        let tcp = self.net_verdict_for(&prefix_of, dport, Some(Proto::Tcp));
+        let udp = self.net_verdict_for(&prefix_of, dport, Some(Proto::Udp));
+        if tcp.action == udp.action {
+            return tcp;
+        }
+        // Disagreement means the feed genuinely cannot say. Report the least
+        // severe of the two and mark it unenforceable, so the row never asserts
+        // a denial the kernel may not make; if the kernel does deny, its own
+        // `DENY_NET` event says so, and that row is the authority.
+        let (lenient, other) = if tcp.action.code() <= udp.action.code() {
+            (tcp, udp)
+        } else {
+            (udp, tcp)
+        };
+        Verdict {
+            action: lenient.action,
+            rule: format!(
+                "{} (transport-dependent: `{}` if the other protocol)",
+                lenient.rule, other.rule
+            ),
+            enforceable: false,
+        }
+    }
+
+    /// One pass of the four-tier match, for a single (possibly unknown) transport.
+    fn net_verdict_for(
+        &self,
+        prefix_of: &impl Fn(&NetRule) -> Option<u8>,
+        dport: u16,
+        proto: Option<Proto>,
+    ) -> Verdict {
+        for tier in [(true, true), (false, true), (true, false), (false, false)] {
+            // An unknown protocol matches no protocol rule.
+            if tier.0 && proto.is_none() {
+                continue;
+            }
+            let mut best: Option<(&NetRule, u8)> = None;
+            for r in &self.network {
+                if r.tier() != tier || !r.port_matches(dport) {
+                    continue;
+                }
+                if r.proto.is_some() && r.proto != proto {
+                    continue;
+                }
+                let Some(plen) = prefix_of(r) else {
+                    continue;
+                };
+                // Strictly-greater keeps the earliest rule on a prefix-length
+                // tie, matching the kernel trie (the entry lists insert the
+                // earliest rule last, and LPM `insert` overwrites on collision).
+                if best.is_none_or(|(_, bp)| plen > bp) {
+                    best = Some((r, plen));
+                }
+            }
+            if let Some((r, _)) = best {
+                return Verdict {
+                    action: r.action,
+                    rule: r.label.clone(),
+                    enforceable: true,
+                };
             }
         }
-        match best {
-            Some((r, _)) => Verdict {
-                action: r.action,
-                rule: r.label.clone(),
-                enforceable: true,
-            },
-            None => Verdict {
-                action: self.default_action,
-                rule: "default".to_string(),
-                enforceable: true,
-            },
+        Verdict {
+            action: self.default_action,
+            rule: "default".to_string(),
+            enforceable: true,
         }
     }
 }
@@ -838,6 +1735,225 @@ fn eval_path(rules: &[PathRule], path: &str, default: Action) -> Verdict {
         action: default,
         rule: "default".to_string(),
         enforceable: false,
+    }
+}
+
+/// Assemble a policy: where DNS comes from, where `stat` comes from, and what a
+/// relative or `~` path is relative to.
+///
+/// A struct rather than more `from_yaml_str_*` overloads because identity
+/// resolution needs three injectables, and every one of them touches the outside
+/// world — a test that could not replace them would depend on the machine it
+/// runs on.
+pub struct Loader<'a> {
+    resolve: Resolver<'a>,
+    stat: identity::Stat<'a>,
+    base: AnchorBase,
+}
+
+impl Default for Loader<'_> {
+    fn default() -> Self {
+        Loader::new()
+    }
+}
+
+impl<'a> Loader<'a> {
+    /// The real thing: system DNS, real `stat`, relative paths anchored at the
+    /// current working directory.
+    pub fn new() -> Self {
+        Loader {
+            resolve: &system_resolver,
+            stat: &identity::system_stat,
+            base: AnchorBase {
+                cwd: std::env::current_dir().ok(),
+                home: None,
+            },
+        }
+    }
+
+    /// Touches nothing outside the process: no DNS, no filesystem. What
+    /// `--dry-run` and the tests want.
+    pub fn offline() -> Self {
+        Loader {
+            resolve: &null_resolver,
+            stat: &identity::null_stat,
+            base: AnchorBase::default(),
+        }
+    }
+
+    pub fn resolver(mut self, r: Resolver<'a>) -> Self {
+        self.resolve = r;
+        self
+    }
+
+    pub fn stat(mut self, s: identity::Stat<'a>) -> Self {
+        self.stat = s;
+        self
+    }
+
+    pub fn base(mut self, b: AnchorBase) -> Self {
+        self.base = b;
+        self
+    }
+
+    pub fn from_str(&self, text: &str) -> Result<Policy> {
+        Policy::compile(text, self.resolve, self.stat, &self.base)
+    }
+
+    /// From an explicit path, else `./policy.yaml`, else the embedded default.
+    pub fn load(&self, path: Option<&Path>) -> Result<Policy> {
+        if let Some(p) = path {
+            let text = std::fs::read_to_string(p)
+                .with_context(|| format!("reading policy {}", p.display()))?;
+            return self
+                .from_str(&text)
+                .with_context(|| format!("parsing {}", p.display()));
+        }
+        if let Ok(text) = std::fs::read_to_string("policy.yaml") {
+            return self.from_str(&text).context("parsing ./policy.yaml");
+        }
+        self.from_str(DEFAULT_POLICY)
+            .context("parsing embedded default policy")
+    }
+}
+
+/// Compile one axis' rules. `dir_capable` files support the `**/dir/**`
+/// parent-directory form; exec rules are basename-only.
+#[allow(clippy::too_many_arguments)]
+fn compile_rules(
+    rules: Vec<PathRuleRaw>,
+    dir_capable: bool,
+    is_exec: bool,
+    base: &AnchorBase,
+    stat: identity::Stat<'_>,
+    anchors: &mut Vec<Anchor>,
+    unresolved: &mut Vec<UnresolvedAnchor>,
+) -> Result<Vec<PathRule>> {
+    let mut out = Vec::with_capacity(rules.len());
+    for r in rules {
+        // An `exec:` rule compiles into `BLOCK_EXEC` / `BLOCK_EXEC_INODES`, and
+        // the lifecycle hooks do not consult either — they match the *file*
+        // maps. A `delete` here would therefore enforce nothing at all while
+        // reading exactly like a rule that does, which is the failure this
+        // codebase refuses to ship. Say so at load, and point at the axis that
+        // works: a program is a file, so `files:` can protect it from `rm`.
+        if is_exec && r.access.is_lifecycle() {
+            let named = r.pattern.as_deref().or(r.path.as_deref()).unwrap_or("?");
+            anyhow::bail!(
+                "`exec:` rule `{named}` has `access: {}` — exec rules are matched when a program \
+                 is RUN, and nothing about creating or deleting it. Move it to `files:`, where \
+                 that axis is enforced",
+                r.access.as_str()
+            );
+        }
+        let compiled = match (r.pattern, r.path) {
+            (Some(p), Some(q)) => anyhow::bail!(
+                "rule has both `match: {p}` and `path: {q}` — a glob describes names, a path \
+                 describes one object; pick one"
+            ),
+            (None, None) => {
+                anyhow::bail!("rule needs `match:` (a glob) or `path:` (one concrete object)")
+            }
+            (Some(pattern), None) => {
+                let glob = Glob::new(&pattern)
+                    .with_context(|| format!("bad glob `{pattern}`"))?
+                    .compile_matcher();
+                let enforceable = r.action == Action::Block
+                    && if dir_capable {
+                        file_key(&pattern).is_some()
+                    } else {
+                        last_segment(&pattern).and_then(name_key).is_some()
+                    };
+                PathRule {
+                    pattern,
+                    matcher: Matcher::Glob(glob),
+                    action: r.action,
+                    access: r.access,
+                    enforceable,
+                }
+            }
+            (None, Some(raw)) => {
+                let label = format!("path:{raw}");
+                let outcome = identity::resolve(&label, &raw, base, stat);
+                match outcome {
+                    // An exec rule names a program. Anchoring it to a directory
+                    // would put the inode in a map the bprm hook never consults,
+                    // which reads as "enforced" and is not.
+                    ResolveOutcome::Anchored(a) if is_exec && a.kind == AnchorKind::Dir => {
+                        if r.action == Action::Block {
+                            unresolved.push(UnresolvedAnchor {
+                                rule: label.clone(),
+                                path: a.path.clone(),
+                                reason: "is a directory; an `exec:` rule must name a program"
+                                    .into(),
+                            });
+                        }
+                        PathRule {
+                            pattern: label,
+                            matcher: Matcher::Path {
+                                exact: a.path,
+                                subtree: false,
+                            },
+                            action: r.action,
+                            access: r.access,
+                            enforceable: false,
+                        }
+                    }
+                    ResolveOutcome::Anchored(mut a) => {
+                        a.exec = is_exec;
+                        a.access_mask = r.access.mask();
+                        let subtree = a.kind == AnchorKind::Dir;
+                        let exact = a.path.clone();
+                        if r.action == Action::Block {
+                            anchors.push(a);
+                        }
+                        PathRule {
+                            pattern: label,
+                            matcher: Matcher::Path { exact, subtree },
+                            action: r.action,
+                            access: r.access,
+                            enforceable: r.action == Action::Block,
+                        }
+                    }
+                    ResolveOutcome::Unresolved(u) => {
+                        let exact = base
+                            .expand(&raw)
+                            .unwrap_or_else(|| std::path::PathBuf::from(&raw));
+                        if r.action == Action::Block {
+                            unresolved.push(u);
+                        }
+                        PathRule {
+                            pattern: label,
+                            matcher: Matcher::Path {
+                                exact,
+                                subtree: false,
+                            },
+                            action: r.action,
+                            access: r.access,
+                            enforceable: false,
+                        }
+                    }
+                }
+            }
+        };
+        out.push(compiled);
+    }
+    Ok(out)
+}
+
+/// Fold a rule's access mask into a kernel key set.
+///
+/// One key, one value: if two rules name the same basename with different
+/// access, the kernel map can only hold one mask, so the merge has to widen
+/// rather than narrow — the alternative is a rule that silently stops applying
+/// because an unrelated rule was added next to it. [`fmode::widen`] owns that
+/// algebra, because the kernel side needs the same answer.
+fn merge_mask(map: &mut BTreeMap<String, u8>, key: &str, mask: u8) {
+    match map.get_mut(key) {
+        Some(existing) => *existing = fmode::widen(*existing, mask),
+        None => {
+            map.insert(key.to_string(), mask);
+        }
     }
 }
 
@@ -887,6 +2003,7 @@ pub fn name_key(seg: &str) -> Option<[u8; NAME_LEN]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const P: &str = r#"
 version: 1
@@ -918,10 +2035,351 @@ exec:
         parse(P).expect("policy parses")
     }
 
+    /// A destination port no test policy names, so an assertion about address
+    /// matching stays an assertion about address matching.
+    const ANY_PORT: u16 = 4242;
+
     fn key(s: &str) -> [u8; NAME_LEN] {
         let mut k = [0u8; NAME_LEN];
         k[..s.len()].copy_from_slice(s.as_bytes());
         k
+    }
+
+    /// "Would the kernel deny *reading* this?" — the question every one of these
+    /// assertions is really asking, now that a rule can name an access.
+    fn denies_read(p: &Policy, path: &str) -> Option<DenialKey> {
+        p.kernel_file_denial(path, fmode::READ)
+    }
+
+    /// A filesystem for identity tests: `/proj/.env` and `/proj/nc` are files,
+    /// `/home/a/.ssh` is a directory, and nothing else exists.
+    fn fake_fs(p: &Path) -> Option<(u64, u64, bool)> {
+        match p.to_str()? {
+            "/proj/.env" => Some((0x801, 100, false)),
+            "/proj/nc" => Some((0x801, 101, false)),
+            "/home/a/.ssh" => Some((0x801, 200, true)),
+            _ => None,
+        }
+    }
+
+    fn identity_loader<'a>() -> Loader<'a> {
+        Loader::offline().stat(&fake_fs).base(AnchorBase {
+            cwd: Some(PathBuf::from("/proj")),
+            home: Some(PathBuf::from("/home/a")),
+        })
+    }
+
+    #[test]
+    fn path_rules_resolve_to_identity_keys() {
+        let p = identity_loader()
+            .from_str(
+                r#"
+files:
+  - { path: ".env",  action: block }
+  - { path: "~/.ssh", action: block }
+exec:
+  - { path: "nc", action: block }
+"#,
+            )
+            .expect("parses");
+
+        let keys = p.inode_enforcement();
+        assert_eq!(keys.files, vec![(InodeKey::new(0x0080_0001, 100), 0)]);
+        assert_eq!(keys.dirs, vec![(InodeKey::new(0x0080_0001, 200), 0)]);
+        assert_eq!(keys.execs, vec![(InodeKey::new(0x0080_0001, 101), 0)]);
+
+        // The whole claim: the rule is about the object, so it does NOT put a
+        // basename in the name maps where a rename could shake it off.
+        let (names, dirs) = p.file_enforcement();
+        assert!(names.is_empty(), "{names:?}");
+        assert!(dirs.is_empty(), "{dirs:?}");
+        assert!(p.exec_enforcement().is_empty());
+    }
+
+    /// A `path:` rule that resolves to nothing enforces nothing, and must say so
+    /// rather than look like coverage.
+    #[test]
+    fn unresolved_path_rules_are_reported_not_silently_dropped() {
+        let p = identity_loader()
+            .from_str("files:\n  - { path: \"nope.txt\", action: block }\n")
+            .expect("parses");
+        assert!(p.inode_enforcement().is_empty());
+        let u = p.unresolved_anchors();
+        assert_eq!(u.len(), 1);
+        assert!(u[0].reason.contains("does not exist"), "{:?}", u[0]);
+        assert!(
+            p.explain().contains("resolved to NOTHING"),
+            "{}",
+            p.explain()
+        );
+    }
+
+    #[test]
+    fn a_rule_must_be_either_a_glob_or_a_path_never_both_and_never_neither() {
+        let err = |yaml: &str| -> String {
+            match identity_loader().from_str(yaml) {
+                Ok(_) => panic!("expected a parse error for: {yaml}"),
+                Err(e) => format!("{e:?}"),
+            }
+        };
+        assert!(
+            err("files:\n  - { match: \"**/.env\", path: \".env\", action: block }\n")
+                .contains("pick one")
+        );
+        assert!(err("files:\n  - { action: block }\n").contains("needs `match:`"));
+    }
+
+    /// The access axis: a read-only rule must not claim a denial for an open
+    /// that only asked to write, because the kernel would not have made one.
+    #[test]
+    fn access_narrows_which_opens_a_key_denies() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/secret", action: block, access: read }
+  - { match: "**/logfile", action: block, access: write }
+"#,
+            )
+            .expect("parses");
+
+        assert!(p.kernel_file_denial("/x/secret", fmode::READ).is_some());
+        assert!(p.kernel_file_denial("/x/secret", fmode::WRITE).is_none());
+        assert!(p.kernel_file_denial("/x/logfile", fmode::WRITE).is_some());
+        assert!(p.kernel_file_denial("/x/logfile", fmode::READ).is_none());
+        // O_RDWR asks for both, so either rule fires.
+        let rw = fmode::READ | fmode::WRITE;
+        assert!(p.kernel_file_denial("/x/secret", rw).is_some());
+        assert!(p.kernel_file_denial("/x/logfile", rw).is_some());
+    }
+
+    /// A rule with no `access:` must behave exactly as it did before the axis
+    /// existed — including for an open that requests neither read nor write
+    /// (`O_PATH`), which a naive `READ|WRITE` mask would have stopped covering.
+    #[test]
+    fn omitting_access_still_means_every_open() {
+        let p = Loader::offline()
+            .from_str("files:\n  - { match: \"**/secret\", action: block }\n")
+            .expect("parses");
+        for requested in [fmode::READ, fmode::WRITE, fmode::READ | fmode::WRITE, 0] {
+            assert!(
+                p.kernel_file_denial("/x/secret", requested).is_some(),
+                "an unqualified block must cover fmode {requested}"
+            );
+        }
+    }
+
+    /// Two rules naming the same basename with different access collapse into
+    /// one kernel key, and the merge must widen — never silently drop one.
+    #[test]
+    fn masks_for_the_same_key_merge_by_widening() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/secret", action: block, access: read }
+  - { match: "/etc/secret", action: block, access: write }
+"#,
+            )
+            .expect("parses");
+        let (names, _) = p.file_enforcement();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].1, (fmode::READ | fmode::WRITE) as u8);
+    }
+
+    /// An `exec:` rule pointing at a directory can never be enforced — the
+    /// bprm hook never consults the directory map — so it must be reported
+    /// rather than counted as coverage.
+    #[test]
+    fn an_exec_path_rule_naming_a_directory_is_refused() {
+        let p = identity_loader()
+            .from_str("exec:\n  - { path: \"~/.ssh\", action: block }\n")
+            .expect("parses");
+        assert!(p.inode_enforcement().is_empty());
+        assert!(
+            p.unresolved_anchors()[0].reason.contains("directory"),
+            "{:?}",
+            p.unresolved_anchors()
+        );
+    }
+
+    const PORTED: &str = r#"
+default_action: allow
+network:
+  - { cidr: "10.0.0.0/8", action: allow }        # the whole private LAN
+  - { port: 25, action: block }                  # ...but never SMTP, anywhere
+  - { cidr: "10.0.0.5/32", port: 25, action: allow }  # except this one relay
+  - { cidr: "0.0.0.0/0", action: block }
+"#;
+
+    /// The ordering decision, stated as behaviour: a rule that names a port is
+    /// consulted before one that does not, whatever their address prefixes.
+    #[test]
+    fn a_port_rule_beats_an_address_rule_with_a_longer_prefix() {
+        let p = parse(PORTED).expect("parses");
+        // 10.0.0.0/8 allows the LAN...
+        assert_eq!(
+            p.eval_connect("10.1.2.3".parse().unwrap(), 443).action,
+            Action::Allow
+        );
+        // ...but the /0 port rule still denies SMTP inside it, despite a
+        // 0-bit address prefix losing to /8 on address specificity alone.
+        assert_eq!(
+            p.eval_connect("10.1.2.3".parse().unwrap(), 25).action,
+            Action::Block
+        );
+        // Within the port pass, the more specific address wins as usual.
+        assert_eq!(
+            p.eval_connect("10.0.0.5".parse().unwrap(), 25).action,
+            Action::Allow
+        );
+        // And an address with no port rule falls through to the address pass.
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap(), 443).action,
+            Action::Block
+        );
+    }
+
+    /// `port:` with no address covers BOTH families. A v4-only reading would
+    /// leave the same port open over IPv6 — the exact shape of the hole the
+    /// `::/0` rule had to be added for.
+    #[test]
+    fn a_bare_port_rule_covers_ipv6_too() {
+        let p = parse("default_action: allow\nnetwork:\n  - { port: 25, action: block }\n")
+            .expect("parses");
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap(), 25).action,
+            Action::Block
+        );
+        assert_eq!(
+            p.eval_connect6("2606:4700::1111".parse().unwrap(), 25)
+                .action,
+            Action::Block
+        );
+        assert_eq!(
+            p.eval_connect("1.1.1.1".parse().unwrap(), 26).action,
+            Action::Allow
+        );
+    }
+
+    /// Port rules must not leak into the address-only trie: a port-qualified
+    /// `0.0.0.0/0 block` there would read as a deny-all for every port.
+    #[test]
+    fn port_rules_are_kept_out_of_the_address_trie() {
+        let p = parse("default_action: allow\nnetwork:\n  - { port: 25, action: block }\n")
+            .expect("parses");
+        assert!(p.net_entries().is_empty(), "{:?}", p.net_entries());
+        assert!(p.net_entries6().is_empty());
+        assert_eq!(p.port_entries().len(), 1);
+        assert_eq!(p.port_entries6().len(), 1);
+        // Prefix covers the whole port and no address bits.
+        assert_eq!(p.port_entries()[0].0, PORT_BITS);
+    }
+
+    /// The key's bit layout IS the semantics — port first, so a prefix can pin a
+    /// port without pinning an address. If these ever swap, "port 25 anywhere"
+    /// silently becomes inexpressible.
+    #[test]
+    fn the_port_key_puts_the_port_before_the_address() {
+        let p = parse(
+            "default_action: allow\nnetwork:\n  - { cidr: \"10.0.0.0/8\", port: 5432, action: allow }\n",
+        )
+        .expect("parses");
+        let (plen, key, _) = p.port_entries()[0];
+        assert_eq!(plen, PORT_BITS + 8);
+        assert_eq!(key.port, 5432u16.to_be_bytes());
+        assert_eq!(key.addr, [10, 0, 0, 0]);
+        assert_eq!(key._pad, [0, 0]);
+    }
+
+    /// A rule with no address and no port is still an error — `port:` widened
+    /// what a rule may be, it did not make every field optional.
+    #[test]
+    fn a_network_rule_still_needs_something_to_match_on() {
+        let Err(e) = parse("network:\n  - { action: block }\n") else {
+            panic!("a rule with nothing to match on must be refused");
+        };
+        assert!(
+            format!("{e:?}").contains("`cidr`, `domain`, `port`, or `proto`"),
+            "{e:?}"
+        );
+    }
+
+    /// A port-qualified deny-all is not a deny-all, and the IPv6 coverage
+    /// warning must not be silenced by one.
+    #[test]
+    fn a_port_qualified_catch_all_does_not_count_as_deny_all() {
+        let p = parse(
+            "default_action: allow\nnetwork:\n  - { cidr: \"0.0.0.0/0\", port: 25, action: block }\n",
+        )
+        .expect("parses");
+        assert!(
+            p.net_coverage_gaps().is_empty(),
+            "a port rule is not a v4 deny-all"
+        );
+
+        let q =
+            parse("default_action: allow\nnetwork:\n  - { cidr: \"0.0.0.0/0\", action: block }\n")
+                .expect("parses");
+        assert_eq!(
+            q.net_coverage_gaps().len(),
+            1,
+            "a real v4 deny-all still warns"
+        );
+    }
+
+    /// An exception for a port-trie denial names the port, because it has to be
+    /// written into the trie that denied — and it is a smaller thing to approve.
+    #[test]
+    fn a_port_denial_key_is_narrower_than_an_address_one() {
+        let ported = DenialKey::Net4Port {
+            ip: "1.1.1.1".parse().unwrap(),
+            port: 25,
+        };
+        assert_eq!(ported.to_string(), "ip=1.1.1.1:25");
+        let text = ported.blast_radius();
+        assert!(text.contains("port 25 only"), "{text}");
+        assert!(!text.contains("ALL egress"), "{text}");
+        // The address form is the broad one, and still says so.
+        let broad = DenialKey::Net4("1.1.1.1".parse().unwrap());
+        assert!(broad.blast_radius().contains("ALL egress"));
+    }
+
+    /// An unresolved `path:` rule has its own report, with its own reason. It
+    /// must not ALSO appear under "no kernel key — glob segment, or name too
+    /// long", which is a different problem and a wrong explanation.
+    #[test]
+    fn an_unresolved_path_rule_is_reported_once_and_for_the_right_reason() {
+        let p = identity_loader()
+            .from_str(
+                "files:\n  - { path: \"nope.txt\", action: block }\n  \
+                 - { match: \"**/*.pem\", action: block }\n",
+            )
+            .expect("parses");
+        // The glob still belongs there — it genuinely reduces to no kernel key.
+        assert_eq!(p.observe_only_blocks(), vec!["**/*.pem".to_string()]);
+        let text = p.explain();
+        // Counted by LINE: the one legitimate report names both the rule and the
+        // path it expanded to, so the substring appears twice on it.
+        let lines = text.lines().filter(|l| l.contains("nope.txt")).count();
+        assert_eq!(
+            lines, 1,
+            "the unresolved path rule is reported twice:\n{text}"
+        );
+    }
+
+    /// `--dry-run` must show the object an identity rule landed on: a wrong
+    /// working directory or an unexpanded `~` is otherwise invisible until an
+    /// incident.
+    #[test]
+    fn explain_names_the_object_each_identity_rule_resolved_to() {
+        let p = identity_loader()
+            .from_str("files:\n  - { path: \".env\", action: block }\n")
+            .expect("parses");
+        let text = p.explain();
+        assert!(text.contains("/proj/.env"), "{text}");
+        assert!(text.contains("ino 100"), "{text}");
+        assert!(text.contains("ANY name"), "{text}");
     }
 
     #[test]
@@ -948,19 +2406,21 @@ exec:
     fn network_cidr_matching() {
         let p = policy();
         assert_eq!(
-            p.eval_connect("127.0.0.1".parse().unwrap()).action,
+            p.eval_connect("127.0.0.1".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect("192.168.1.5".parse().unwrap()).action,
+            p.eval_connect("192.168.1.5".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect("1.1.1.1".parse().unwrap()).action,
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT).action,
             Action::Block
         );
         assert_eq!(
-            p.eval_connect("8.8.8.8".parse().unwrap()).action,
+            p.eval_connect("8.8.8.8".parse().unwrap(), ANY_PORT).action,
             Action::Block
         );
     }
@@ -969,17 +2429,34 @@ exec:
     fn network_v6_matching() {
         let p = policy();
         assert_eq!(
-            p.eval_connect6("::1".parse().unwrap()).action,
+            p.eval_connect6("::1".parse().unwrap(), ANY_PORT).action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect6("2001:db8::5".parse().unwrap()).action,
+            p.eval_connect6("2001:db8::5".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Block
         );
         // unmatched v6 -> default (allow in P); the v4 0.0.0.0/0 rule does not apply
         assert_eq!(
-            p.eval_connect6("2606:4700::1".parse().unwrap()).action,
+            p.eval_connect6("2606:4700::1".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Allow
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_tracks_the_rules_a_policy_was_approved_against() {
+        let a = "files:\n  - match: \"**/.env\"\n    action: block\n";
+        let b = "files:\n  - match: \"**/.env\"\n    action: warn\n";
+        let pa = Policy::from_yaml_str_with(a, &null_resolver).unwrap();
+        let pb = Policy::from_yaml_str_with(b, &null_resolver).unwrap();
+        let pa2 = Policy::from_yaml_str_with(a, &null_resolver).unwrap();
+        assert_eq!(pa.fingerprint(), pa2.fingerprint(), "same source, same id");
+        assert_ne!(
+            pa.fingerprint(),
+            pb.fingerprint(),
+            "block -> warn must retire approvals granted under the block"
         );
     }
 
@@ -988,7 +2465,7 @@ exec:
         let p = policy();
         assert_eq!(p.eval_file("/x/.env").rule, "**/.env");
         assert_eq!(
-            p.eval_connect("1.1.1.1".parse().unwrap()).rule,
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT).rule,
             "cidr:0.0.0.0/0"
         );
         assert_eq!(p.eval_file("/x/main.rs").rule, "**");
@@ -998,14 +2475,21 @@ exec:
     fn file_enforcement_compiles_block_rules() {
         let p = policy();
         let (names, dirs) = p.file_enforcement();
-        assert!(names.contains(&key(".env"))); // **/.env
-        assert!(names.contains(&key("shadow"))); // /etc/shadow
-        assert!(dirs.contains(&key(".ssh"))); // **/.ssh/**
-        assert!(!names.contains(&key(".env.*"))); // glob segment -> not enforced
+        let has = |v: &[([u8; NAME_LEN], u8)], s: &str| v.iter().any(|(k, _)| *k == key(s));
+        assert!(has(&names, ".env")); // **/.env
+        assert!(has(&names, "shadow")); // /etc/shadow
+        assert!(has(&dirs, ".ssh")); // **/.ssh/**
+        assert!(!has(&names, ".env.*")); // glob segment -> not enforced
 
         let execs = p.exec_enforcement();
-        assert!(execs.contains(&key("nc"))); // **/nc block
-        assert!(!execs.contains(&key("curl"))); // curl is warn, not block
+        assert!(has(&execs, "nc")); // **/nc block
+        assert!(!has(&execs, "curl")); // curl is warn, not block
+
+        // Every key here is stored with MASK_ANY: none of these rules named an
+        // access, so they must behave exactly as they did before the axis existed.
+        for (_, mask) in names.iter().chain(&dirs).chain(&execs) {
+            assert_eq!(*mask, fmode::MASK_ANY);
+        }
     }
 
     #[test]
@@ -1018,7 +2502,10 @@ exec:
         assert_eq!(v.action, Action::Block);
         assert!(!v.enforceable);
         // network blocks are always enforceable
-        assert!(p.eval_connect("1.1.1.1".parse().unwrap()).enforceable);
+        assert!(
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT)
+                .enforceable
+        );
 
         let oo = p.observe_only_blocks();
         assert!(oo.contains(&"**/.env.*".to_string()));
@@ -1030,7 +2517,7 @@ exec:
         let p = parse("default_action: warn").unwrap();
         assert_eq!(p.eval_file("/anything").action, Action::Warn);
         assert_eq!(
-            p.eval_connect("8.8.8.8".parse().unwrap()).action,
+            p.eval_connect("8.8.8.8".parse().unwrap(), ANY_PORT).action,
             Action::Warn
         );
     }
@@ -1042,17 +2529,17 @@ exec:
         // ANYWHERE, even where the glob-based eval says allow.
         assert_eq!(p.eval_file("/home/u/shadow").action, Action::Allow);
         assert_eq!(
-            p.kernel_file_denial("/home/u/shadow"),
+            denies_read(&p, "/home/u/shadow"),
             Some(DenialKey::FileName("shadow".into()))
         );
         // A file directly in `.ssh` IS denied by the kernel.
         assert_eq!(
-            p.kernel_file_denial("/home/u/.ssh/id_ed25519"),
+            denies_read(&p, "/home/u/.ssh/id_ed25519"),
             Some(DenialKey::FileDir(".ssh".into()))
         );
         // `.env.*` is a glob segment: never a kernel key, so never denied here.
-        assert_eq!(p.kernel_file_denial("/home/u/.env.local"), None);
-        assert_eq!(p.kernel_file_denial("/home/u/src/main.rs"), None);
+        assert_eq!(denies_read(&p, "/home/u/.env.local"), None);
+        assert_eq!(denies_read(&p, "/home/u/src/main.rs"), None);
     }
 
     #[test]
@@ -1065,7 +2552,7 @@ exec:
         );
         // ...and the kernel now agrees, because the hook walks every ancestor.
         assert_eq!(
-            p.kernel_file_denial("/home/u/.ssh/sub/deep/id"),
+            denies_read(&p, "/home/u/.ssh/sub/deep/id"),
             Some(DenialKey::FileDir(".ssh".into()))
         );
     }
@@ -1076,13 +2563,13 @@ exec:
         // `secret` sits MAX_DIR_WALK levels above the file: still caught.
         let just_inside = format!("/secret{}/f", "/d".repeat(MAX_DIR_WALK - 1));
         assert_eq!(
-            p.kernel_file_denial(&just_inside),
+            denies_read(&p, &just_inside),
             Some(DenialKey::FileDir("secret".into()))
         );
         // One level deeper than the kernel walks: not claimed, because the hook
         // would not have seen it either.
         let too_deep = format!("/secret{}/f", "/d".repeat(MAX_DIR_WALK));
-        assert_eq!(p.kernel_file_denial(&too_deep), None);
+        assert_eq!(denies_read(&p, &too_deep), None);
     }
 
     #[test]
@@ -1122,15 +2609,15 @@ network:
         )
         .unwrap();
         assert_eq!(
-            p.eval_connect("1.1.1.1".parse().unwrap()).action,
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT).action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect("1.1.1.1".parse().unwrap()).rule,
+            p.eval_connect("1.1.1.1".parse().unwrap(), ANY_PORT).rule,
             "cidr:1.1.1.1/32"
         );
         assert_eq!(
-            p.eval_connect("8.8.8.8".parse().unwrap()).action,
+            p.eval_connect("8.8.8.8".parse().unwrap(), ANY_PORT).action,
             Action::Block
         );
     }
@@ -1216,11 +2703,13 @@ network:
         )
         .unwrap();
         assert_eq!(
-            p.eval_connect("203.0.113.7".parse().unwrap()).action,
+            p.eval_connect("203.0.113.7".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Allow
         );
         assert_eq!(
-            p.eval_connect("203.0.113.8".parse().unwrap()).action,
+            p.eval_connect("203.0.113.8".parse().unwrap(), ANY_PORT)
+                .action,
             Action::Block
         );
         assert!(p
@@ -1324,7 +2813,7 @@ files:
         ))
         .unwrap();
         assert!(p.observe_only_blocks().len() == 1);
-        assert_eq!(p.kernel_file_denial(&format!("/x/{long}")), None);
+        assert_eq!(denies_read(&p, &format!("/x/{long}")), None);
     }
 
     // ── the policies actually shipped ───────────────────────────────────────
@@ -1368,7 +2857,7 @@ files:
                     "{name} does not block {secret}"
                 );
                 assert!(
-                    p.kernel_file_denial(secret).is_some(),
+                    denies_read(&p, secret).is_some(),
                     "{name} blocks {secret} only in userspace — the kernel would allow it"
                 );
             }
@@ -1387,7 +2876,7 @@ files:
                 "/home/u/proj/Cargo.toml",
             ] {
                 assert_eq!(
-                    p.kernel_file_denial(ordinary),
+                    denies_read(&p, ordinary),
                     None,
                     "{name} would make the kernel deny {ordinary}"
                 );
@@ -1405,5 +2894,426 @@ files:
                 p.net_coverage_gaps()
             );
         }
+    }
+
+    // ── the create/delete axis (M6) ─────────────────────────────────────────
+
+    /// The compatibility guarantee, stated as a test because it is the one
+    /// thing a new axis can silently break: a rule written before this axis
+    /// existed must not begin refusing an `rm` because wardyn was updated.
+    #[test]
+    fn a_plain_block_rule_says_nothing_about_deleting() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.env", action: block }
+  - { match: "**/logfile", action: block, access: any }
+"#,
+            )
+            .expect("parses");
+
+        // Still blocks opens, exactly as before.
+        assert!(p.kernel_file_denial("/x/.env", fmode::READ).is_some());
+        // And still stores the canonical MASK_ANY, so the map bytes are
+        // identical to a build that predates the axis.
+        let (names, _) = p.file_enforcement();
+        for (_, mask) in &names {
+            assert_eq!(*mask, fmode::MASK_ANY);
+            assert!(!fmode::covers(*mask, fmode::DELETE));
+            assert!(!fmode::covers(*mask, fmode::CREATE));
+        }
+        // And the five lifecycle hooks stay switched off entirely.
+        assert!(!p.has_lifecycle_rules());
+    }
+
+    #[test]
+    fn a_delete_rule_blocks_removal_without_blocking_reads() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/keep.txt", action: block, access: delete }
+"#,
+            )
+            .expect("parses");
+
+        assert!(p.has_lifecycle_rules());
+        let (names, _) = p.file_enforcement();
+        let (_, mask) = names
+            .iter()
+            .find(|(k, _)| *k == key("keep.txt"))
+            .expect("key");
+        assert!(fmode::covers(*mask, fmode::DELETE));
+        assert!(!fmode::covers(*mask, fmode::CREATE));
+
+        // The whole point: the agent may still read and write the file.
+        assert!(p.kernel_file_denial("/x/keep.txt", fmode::READ).is_none());
+        assert!(p.kernel_file_denial("/x/keep.txt", fmode::WRITE).is_none());
+        // Including an `O_PATH` open, which asks for neither bit — the case a
+        // `READ | WRITE` mask would have got wrong.
+        assert!(p.kernel_file_denial("/x/keep.txt", 0).is_none());
+    }
+
+    #[test]
+    fn access_all_covers_every_open_and_both_lifecycle_operations() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.env", action: block, access: all }
+"#,
+            )
+            .expect("parses");
+
+        let (names, _) = p.file_enforcement();
+        let (_, mask) = names.iter().find(|(k, _)| *k == key(".env")).expect("key");
+        assert!(fmode::covers(*mask, fmode::DELETE));
+        assert!(fmode::covers(*mask, fmode::CREATE));
+        // `all` must keep covering an `O_PATH` open, which sets neither
+        // FMODE_READ nor FMODE_WRITE — the reason it is not spelled READ|WRITE.
+        assert!(p.kernel_file_denial("/x/.env", 0).is_some());
+        assert!(p.kernel_file_denial("/x/.env", fmode::READ).is_some());
+    }
+
+    /// Two rules, one kernel key, one stored value. Neither rule may be lost.
+    #[test]
+    fn an_open_rule_and_a_delete_rule_on_one_key_keep_both_axes() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.env", action: block, access: read }
+  - { match: "**/.env", action: block, access: delete }
+"#,
+            )
+            .expect("parses");
+
+        let (names, _) = p.file_enforcement();
+        let (_, mask) = names.iter().find(|(k, _)| *k == key(".env")).expect("key");
+        assert!(fmode::covers(*mask, fmode::DELETE), "delete rule was lost");
+        assert!(p.kernel_file_denial("/x/.env", fmode::READ).is_some());
+        // The read rule is still a READ rule: widening must not turn it into
+        // "every open" just because a delete rule sat next to it.
+        assert!(p.kernel_file_denial("/x/.env", fmode::WRITE).is_none());
+    }
+
+    /// `any` and `delete` together mean "every open, and no removal" — the
+    /// case that forced `OPEN_ANY` to exist, because MASK_ANY is zero and zero
+    /// cannot carry a second bit.
+    #[test]
+    fn merging_any_with_delete_keeps_every_open_covered() {
+        let merged = fmode::widen(fmode::MASK_ANY, fmode::DELETE);
+        assert!(fmode::matches(merged, 0), "O_PATH open stopped matching");
+        assert!(fmode::matches(merged, fmode::READ));
+        assert!(fmode::matches(merged, fmode::WRITE));
+        assert!(fmode::covers(merged, fmode::DELETE));
+        assert!(!fmode::covers(merged, fmode::CREATE));
+    }
+
+    /// An approve-once exception lifts one operation, not the whole rule.
+    #[test]
+    fn lifting_a_lifecycle_bit_leaves_the_rest_of_the_rule_standing() {
+        let both = Access::All.mask();
+        let after = fmode::without(both, fmode::DELETE).expect("something is left");
+        assert!(!fmode::covers(after, fmode::DELETE));
+        assert!(fmode::covers(after, fmode::CREATE));
+        assert!(fmode::matches(after, fmode::READ), "reads were unblocked");
+
+        // A delete-only key has nothing left, and must be REMOVED rather than
+        // written back as zero — zero is MASK_ANY, i.e. "block every open",
+        // which would be the opposite of the exception that was granted.
+        assert_eq!(fmode::without(Access::Delete.mask(), fmode::DELETE), None);
+    }
+
+    /// The kernel matches a removal against the same key as an open, so an
+    /// exception has to name the operation alongside it.
+    #[test]
+    fn a_lifecycle_exception_is_narrower_than_the_key_it_wraps() {
+        let inner = DenialKey::FileName(".env".into());
+        let wrapped = DenialKey::Lifecycle {
+            op: LifecycleOp::Delete,
+            key: Box::new(inner.clone()),
+        };
+        assert_eq!(wrapped.inode(), None);
+        let radius = wrapped.blast_radius();
+        assert!(radius.contains("delete"), "{radius}");
+        assert!(radius.contains(".env"), "{radius}");
+        // Distinct keys: granting the removal must not also grant the open.
+        assert_ne!(wrapped, inner);
+    }
+
+    /// `exec:` rules compile into maps the lifecycle hooks never read, so a
+    /// `delete` there would enforce nothing while reading as if it did.
+    #[test]
+    fn an_exec_rule_cannot_carry_a_lifecycle_access() {
+        let err = Loader::offline()
+            .from_str(
+                r#"
+exec:
+  - { match: "**/nc", action: block, access: delete }
+"#,
+            )
+            .err()
+            .expect("must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("files:"), "{msg}");
+    }
+
+    /// A `path:` rule carries the axis into the identity maps, and `--dry-run`
+    /// has to say which operations it really covers — a rule that pins the
+    /// right object and the wrong axis looks identical otherwise.
+    #[test]
+    fn a_path_rule_reports_the_lifecycle_axis_it_enforces() {
+        let p = identity_loader()
+            .from_str(
+                r#"
+files:
+  - { path: "/home/a/.ssh", action: block, access: delete }
+"#,
+            )
+            .expect("parses");
+
+        let keys = p.inode_enforcement();
+        assert_eq!(keys.dirs.len(), 1);
+        assert!(fmode::covers(keys.dirs[0].1, fmode::DELETE));
+
+        let text = p.explain();
+        assert!(text.contains("DELETING"), "{text}");
+    }
+
+    // ── the protocol axis (M6) ──────────────────────────────────────────────
+
+    /// The claim the whole tiering exists to make: a rule that names a protocol
+    /// beats one that does not, whatever their address prefixes. Prefix-length
+    /// ordering alone would make this a `/0` losing to a `/8`.
+    #[test]
+    fn a_proto_rule_beats_an_address_rule_with_a_longer_prefix() {
+        let p = parse(
+            r#"
+network:
+  - { cidr: "10.0.0.0/8", action: allow }
+  - { proto: udp,         action: block }
+"#,
+        )
+        .expect("parses");
+
+        let host: Ipv4Addr = "10.1.2.3".parse().unwrap();
+        assert_eq!(
+            p.eval_connect_proto(host, 443, Some(Proto::Udp)).action,
+            Action::Block,
+            "a /8 allow outranked `no UDP at all`"
+        );
+        // ...and says nothing about the other transport.
+        assert_eq!(
+            p.eval_connect_proto(host, 443, Some(Proto::Tcp)).action,
+            Action::Allow
+        );
+    }
+
+    /// Naming both dimensions is more specific than naming either, and the two
+    /// combine in the order the kernel consults its tries.
+    #[test]
+    fn protocol_and_port_together_are_the_most_specific_tier() {
+        let p = parse(
+            r#"
+network:
+  - { port: 53, proto: udp, action: allow }
+  - { port: 53,             action: block }
+  - { cidr: "0.0.0.0/0",    action: allow }
+"#,
+        )
+        .expect("parses");
+
+        let dns: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        // The proto+port rule is consulted first, so DNS over UDP is allowed...
+        assert_eq!(
+            p.eval_connect_proto(dns, 53, Some(Proto::Udp)).action,
+            Action::Allow
+        );
+        // ...while the bare port rule still denies the same port over TCP.
+        assert_eq!(
+            p.eval_connect_proto(dns, 53, Some(Proto::Tcp)).action,
+            Action::Block
+        );
+        // And a port nobody mentioned falls through to the address tier.
+        assert_eq!(
+            p.eval_connect_proto(dns, 443, Some(Proto::Tcp)).action,
+            Action::Allow
+        );
+    }
+
+    /// The feed cannot read a socket's protocol, so where the policy makes the
+    /// outcome depend on one it must not pretend to know.
+    ///
+    /// This is the regression the e2e suite caught: skipping the protocol tiers
+    /// looks like the safe direction and is not. A proto-qualified *allow*
+    /// outranks a lower-tier block, so ignoring it made the mirror record
+    /// `block, enforced: true` for a connection the kernel had just permitted —
+    /// the exact claim this mirror exists to never make.
+    #[test]
+    fn a_transport_dependent_outcome_is_reported_as_unknown_not_as_a_denial() {
+        let p = parse(
+            r#"
+network:
+  - { port: 11, proto: udp, action: allow }
+  - { port: 11,             action: block }
+  - { cidr: "0.0.0.0/0",    action: allow }
+"#,
+        )
+        .expect("parses");
+
+        let host: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        // Known transports: exact, and they disagree.
+        assert_eq!(
+            p.eval_connect_proto(host, 11, Some(Proto::Udp)).action,
+            Action::Allow
+        );
+        assert_eq!(
+            p.eval_connect_proto(host, 11, Some(Proto::Tcp)).action,
+            Action::Block
+        );
+        // Unknown: the lenient side, and explicitly not enforceable, so the row
+        // never asserts a denial. The kernel reports its own if it makes one.
+        let v = p.eval_connect(host, 11);
+        assert_eq!(
+            v.action,
+            Action::Allow,
+            "the feed claimed a denial it cannot know about"
+        );
+        assert!(
+            !v.enforceable,
+            "an uncertain verdict was recorded as enforced"
+        );
+        assert!(v.rule.contains("transport-dependent"), "{}", v.rule);
+    }
+
+    /// Where both transports agree, nothing about the prediction changes — a
+    /// policy whose protocol rules do not reach this connection keeps the exact
+    /// verdict it had before the axis existed.
+    #[test]
+    fn agreement_between_transports_keeps_the_verdict_certain() {
+        let p = parse(
+            r#"
+network:
+  - { cidr: "10.0.0.0/8", proto: udp, action: block }
+  - { cidr: "0.0.0.0/0",  action: block }
+"#,
+        )
+        .expect("parses");
+
+        // 1.1.1.1 is outside the /8, so both transports land on the deny-all.
+        let v = p.eval_connect("1.1.1.1".parse().unwrap(), 443);
+        assert_eq!(v.action, Action::Block);
+        assert!(
+            v.enforceable,
+            "a verdict both transports agree on must stay enforceable"
+        );
+    }
+
+    /// Each tier owns its own trie, and a rule must appear in exactly one —
+    /// leaving a `proto:` rule in the address trie as well would turn
+    /// `{ proto: udp, action: block }` into a deny-all for every transport.
+    #[test]
+    fn proto_rules_are_kept_out_of_the_less_specific_tries() {
+        let p = parse(
+            r#"
+network:
+  - { cidr: "0.0.0.0/0", proto: udp, action: block }
+  - { cidr: "1.1.1.1/32", port: 53, proto: udp, action: block }
+"#,
+        )
+        .expect("parses");
+
+        assert!(p.has_proto_rules());
+        assert!(!p.has_port_rules(), "a proto+port rule is not a port rule");
+        assert!(
+            p.net_entries().is_empty(),
+            "a protocol rule leaked into the address trie"
+        );
+        assert!(
+            p.port_entries().is_empty(),
+            "a protocol+port rule leaked into the port trie"
+        );
+        assert_eq!(p.proto_entries().len(), 1);
+        assert_eq!(p.proto_port_entries().len(), 1);
+    }
+
+    /// The prefix has to cover the protocol and port bits in full: a rule
+    /// reaches these tries by naming them, so neither is ever a don't-care.
+    #[test]
+    fn the_protocol_key_puts_the_protocol_before_everything_else() {
+        let p = parse(
+            r#"
+network:
+  - { cidr: "10.0.0.0/8", port: 25, proto: tcp, action: block }
+"#,
+        )
+        .expect("parses");
+
+        let (plen, key, _) = p.proto_port_entries()[0];
+        assert_eq!(
+            plen,
+            PROTO_BITS + PORT_BITS + 8,
+            "prefix must cover proto+port in full"
+        );
+        assert_eq!(key.proto, 6, "IPPROTO_TCP");
+        assert_eq!(key.port, 25u16.to_be_bytes(), "port in network order");
+        assert_eq!(key.addr, [10, 0, 0, 0]);
+
+        let (plen, key, _) = parse("network:\n  - { proto: udp, action: block }\n")
+            .expect("parses")
+            .proto_entries()[0];
+        assert_eq!(plen, PROTO_BITS, "a bare proto rule pins the protocol only");
+        assert_eq!(key.proto, 17, "IPPROTO_UDP");
+    }
+
+    /// A bare `proto:` with no address covers BOTH families — a v4-only reading
+    /// would leave the same transport open over IPv6, which is the exact shape
+    /// of the hole the `::/0` rule had to be added for.
+    #[test]
+    fn a_bare_protocol_rule_covers_both_address_families() {
+        let p = parse("network:\n  - { proto: udp, action: block }\n").expect("parses");
+        assert_eq!(p.proto_entries().len(), 1);
+        assert_eq!(p.proto_entries6().len(), 1);
+        assert_eq!(
+            p.eval_connect6_proto("2606:4700::1".parse().unwrap(), 443, Some(Proto::Udp))
+                .action,
+            Action::Block
+        );
+    }
+
+    /// An exception must name the trie that denied, or the rule still sitting in
+    /// it overrules the approval on the very next connect.
+    #[test]
+    fn a_protocol_exception_is_narrower_than_the_address_it_wraps() {
+        let inner = DenialKey::Net4("1.1.1.1".parse().unwrap());
+        let wrapped = DenialKey::NetProto {
+            proto: Proto::Udp,
+            key: Box::new(inner.clone()),
+        };
+        assert_ne!(wrapped, inner);
+        let radius = wrapped.blast_radius();
+        assert!(radius.contains("UDP"), "{radius}");
+        assert!(radius.contains("1.1.1.1"), "{radius}");
+    }
+
+    /// `--dry-run` has to state the order, because it is the one thing about
+    /// these rules that cannot be read off the list.
+    #[test]
+    fn dry_run_lists_the_protocol_tiers_and_names_the_prediction_gap() {
+        let p = parse(
+            r#"
+network:
+  - { port: 53, proto: udp, action: block }
+  - { proto: udp,           action: block }
+"#,
+        )
+        .expect("parses");
+        let text = p.explain();
+        assert!(text.contains("blocked by protocol+port"), "{text}");
+        assert!(text.contains("blocked by protocol"), "{text}");
+        assert!(text.contains("MOST SPECIFIC FIRST"), "{text}");
+        assert!(text.contains("NOT predicted in the feed"), "{text}");
     }
 }

@@ -21,6 +21,36 @@ files:
   - { match: "**/.pypirc", action: block }
   - { match: "/etc/shadow", action: block }
   - { match: "**/.git/config", action: warn }
+
+  # Identity rules. Every `match:` rule above keys on a NAME, and a name comes
+  # off with one `mv`. These pin the same secrets by `(dev, ino)` — the object
+  # itself — so a rename or a hard link does not shake the rule off, and a copy
+  # cannot help either because copying means reading, and the read is denied.
+  #
+  # They resolve when the policy loads: `~` is the *agent's* home (not root's,
+  # even under sudo) and a bare name is relative to the directory wardyn is
+  # launched in. A path that does not exist is reported at startup and by
+  # `--dry-run`, and pins nothing — the `match:` rule above still covers it if
+  # it appears later. Run `wardyn --dry-run` from your project to see exactly
+  # which objects these landed on.
+  # `access: all` is the second half of the same idea. A `block` rule is matched
+  # at `file_open`, which does not fire for `unlink(2)` at all — so without this
+  # the agent cannot READ `~/.ssh/id_ed25519` and can still `rm -rf ~/.ssh`.
+  # `all` adds both lifecycle operations: nothing under these may be removed,
+  # and nothing new may be created in them either (which is what an
+  # `authorized_keys` written by an agent would be).
+  #
+  # It is spelled out rather than implied because `block` on its own deliberately
+  # still means only "opens": widening the default would change what every
+  # policy already written does, silently, on the rules people re-read least.
+  - { path: "~/.ssh", action: block, access: all }
+  - { path: "~/.aws", action: block, access: all }
+  - { path: "~/.kube", action: block, access: all }
+  - { path: "~/.docker", action: block, access: all }
+  - { path: "~/.netrc", action: block, access: all }
+  - { path: ".env", action: block, access: all }
+  - { path: "/etc/shadow", action: block, access: all }
+
   - { match: "**", action: allow }
 
 network:
@@ -34,6 +64,19 @@ network:
   - { domain: "github.com", action: allow }
   - { domain: "api.anthropic.com", action: allow }
   - { domain: "registry.npmjs.org", action: allow }
+  # Port rules are consulted BEFORE any rule above, whatever its prefix — so
+  # these hold even inside the private ranges this preset allows in full.
+  # An agent has no business speaking SMTP, and a reverse shell to a LAN host
+  # would otherwise be waved through by the 10.0.0.0/8 allow.
+  - { port: 25, action: block } # SMTP
+  - { port: 465, action: block } # SMTPS
+  - { port: 587, action: block } # submission
+  - { port: 4444, action: block } # the reverse-shell port of folklore
+  # `proto:` is one dimension further out, and consulted before `port:`. DNS is
+  # the case that needs it: the resolver has to work, and port 53 over TCP is
+  # also a serviceable tunnel, so allow exactly the transport a resolver uses.
+  - { port: 53, proto: udp, action: allow }
+  - { port: 53, action: block }
   - { cidr: "0.0.0.0/0", action: block } # deny everything else (IPv4)
   - { cidr: "::/0", action: block } # deny everything else (IPv6 + v4-mapped)
 

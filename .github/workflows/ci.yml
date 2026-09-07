@@ -48,13 +48,16 @@ jobs:
       - uses: actions/checkout@v7
 
       # nightly + rust-src is required: build.rs (aya-build) compiles the eBPF
-      # crate for bpfel-unknown-none with -Z build-std. The exact nightly comes
-      # from rust-toolchain.toml — the emitted BPF bytecode depends on the
-      # compiler, so it is pinned rather than floating.
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, rustfmt, clippy
+      # crate for bpfel-unknown-none with -Z build-std.
+      #
+      # `rustup show` inside the repo materialises exactly the toolchain
+      # rust-toolchain.toml pins, with its components — rather than a toolchain
+      # action that installs the *floating* nightly and leaves the pinned one to
+      # be fetched later without them. The emitted BPF bytecode is a function of
+      # this compiler, and build.rs now hands the same pinned channel to
+      # aya-build, so this is the one place the version is decided.
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show
 
       - uses: Swatinem/rust-cache@v2
 

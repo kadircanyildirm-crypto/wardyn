@@ -11,11 +11,11 @@ or dialing an unknown IP, and can *block* it before the operation completes.
 ![eBPF](https://img.shields.io/badge/eBPF-tracepoints%20%C2%B7%20cgroup%20%C2%B7%20LSM-6f42c1)
 ![status](https://img.shields.io/badge/status-early%20development-yellow)
 
-<!-- Demo GIF: record with docs/RECORDING.md, drop it at docs/wardyn-demo.gif, then
-     uncomment this:
 <p align="center"><img src="docs/wardyn-demo.gif" width="820"
-  alt="Wardyn blocking an agent from reading .env and dialing an unknown IP"></p>
--->
+  alt="Wardyn blocking an agent from reading .env, deleting ~/.ssh, and dialing an unknown IP"></p>
+
+<p align="center"><sub>Recorded on a BPF-LSM kernel, so every <code>⛔BLOCK</code> row is a real
+<code>-EPERM</code> — see <a href="docs/RECORDING.md">docs/RECORDING.md</a> to reproduce it.</sub></p>
 
 ```console
 $ sudo wardyn --enforce run -- claude "refactor the auth module"
@@ -52,9 +52,17 @@ For the process subtree you launch (`wardyn run -- <cmd>`, followed across `fork
 
 | Axis | Observe | Enforce (`--enforce`) | eBPF hook |
 |---|---|---|---|
-| **exec** — programs run | ✅ path + comm | ⛔ deny blocked binaries | `tracepoint/execve` + LSM `bprm_check_security` |
-| **file** — files opened | ✅ path | ⛔ deny secret reads (`.env`, `.ssh/*`) | `tracepoint/openat` + LSM `file_open` |
+| **exec** — programs run | ✅ path + comm | ⛔ deny blocked binaries, by name **or identity** | `tracepoint/execve` + LSM `bprm_check_security` |
+| **file** — files opened | ✅ path + access | ⛔ deny secret reads (`.env`, `.ssh/*`), by name **or identity**, and per read/write | `tracepoint/openat` + LSM `file_open` |
+| **file** — files created or deleted | ⛔ only when refused (no tracepoint) | ⛔ deny `rm`, `rmdir`, `mv` and file creation, by name **or identity** | LSM `inode_unlink` / `inode_rmdir` / `inode_rename` / `inode_create` / `inode_mkdir` |
 | **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs (TCP + UDP, IPv4/IPv6) | `tracepoint/connect` + `cgroup/connect4·6` + `sendmsg4·6` |
+
+**Rules match names or identities.** A `match:` rule is a glob over the path —
+it covers files that do not exist yet, and it comes off with a single `mv`. A
+`path:` rule pins the object itself: wardyn resolves it to `(dev, ino)` when the
+policy loads, and the kernel keys on that. Renaming the file does not help, hard
+-linking it does not help, and copying it does not help either — a copy has to
+*read* the source, and the read is exactly what is denied.
 
 Every action is checked against a [`policy.yaml`](#policy) → `allow` / `warn` /
 `block`, shown live (coloured) and written to a JSONL audit log. Under
@@ -78,7 +86,10 @@ process on the host reaches it fine.
 ## Quickstart
 
 Wardyn needs Linux with **BTF**, **cgroup v2**, and — for file/exec blocking —
-**BPF LSM** enabled. On macOS/Windows, run it in a Linux VM.
+**BPF LSM** enabled. On macOS, run it in a Linux VM. **On Windows, use WSL2** —
+its kernel already ships BTF, cgroup v2 and `CONFIG_BPF_LSM=y`, and one line in
+`.wslconfig` turns the LSM on, so the full tool (file and exec blocking included)
+runs and is testable there. See [`docs/WSL2.md`](./docs/WSL2.md).
 
 **Prebuilt binary** (x86_64, statically linked — no toolchain, no glibc floor;
 the eBPF object is compiled into it, so this one file is the whole tool):
@@ -137,7 +148,55 @@ saying "first match wins" everywhere would be wrong:
 |---|---|
 | `files` / `exec` | first match wins |
 | `network` | **longest prefix wins** (the kernel uses an LPM trie) |
+| `network`, rules naming a `port:` | **consulted first**, whatever the address prefixes — see below |
 | `files` / `exec` under `--enforce` | **no order** — the kernel holds a *set* of block keys, so an earlier `allow` does not exempt what a later `block` covers |
+
+A network rule may name a **`port:`** and a **`proto:`** (`tcp`/`udp`), and a
+rule that names more of them beats one that names fewer — whatever their address
+prefixes. Rules are consulted in four tiers, most specific first:
+
+| tier | example | beats |
+| --- | --- | --- |
+| protocol **and** port | `{ port: 53, proto: udp, action: allow }` | everything below |
+| port | `{ port: 25, action: block }` | address rules, at any prefix |
+| protocol | `{ proto: udp, action: block }` | address rules, at any prefix |
+| address | `{ cidr: "10.0.0.0/8", action: allow }` | the default |
+
+So `{ port: 25, action: block }` denies SMTP even to a `/8` the policy allows in
+full, and `{ proto: udp, action: block }` denies UDP there too. Within a tier it
+is longest-prefix as usual, so a specific relay can still be allowed back. A bare
+`port:`/`proto:` with no `cidr:` covers **both** address families — a v4-only
+reading would leave the same port open over IPv6.
+
+Letting prefix length decide *across* dimensions instead would make
+`{ proto: udp, action: block }` a `/0` rule that any `/8` allow outranks, so the
+most useful protocol rule there is would quietly not mean what it says.
+
+> A `proto:` rule is enforced by the kernel but **not predicted in the feed**:
+> the connect tracepoint sees a `sockaddr`, not a socket, so it has no protocol
+> to match on. Where a policy makes the outcome depend on the transport, the
+> observed row says so and does not claim a verdict; if the kernel denies, its
+> own row reports it. `--dry-run` prints the same warning.
+
+A file or exec rule is written with **either** `match:` (a glob over names) or
+`path:` (one concrete object, pinned by identity) — never both. File rules also
+take an **`access:`**, which picks the operation the rule covers across two axes:
+
+| `access:` | matched when | hook |
+| --- | --- | --- |
+| `any` (default), `read`, `write` | the file is **opened** | `file_open` |
+| `create` | a name **comes into existence** | `inode_create`, `inode_mkdir`, and a rename's destination |
+| `delete` | a name is **removed** | `inode_unlink`, `inode_rmdir`, and a rename's source |
+| `all` | every one of the above | all of them |
+
+The split exists because `rm` is not an open: `file_open` never fires for
+`unlink(2)`, so a rule that protects a secret's *contents* said nothing at all
+about destroying it. `rm -rf` was never a read.
+
+The default stays `any`, and **`any` covers only opens**. Widening it would mean
+every `block` rule ever written silently started refusing `rm` the day wardyn was
+updated — a change of meaning on the rules people re-read least. Ask for `delete`
+(or `all`) where you mean it; `policies/strict.yaml` does.
 
 `wardyn --dry-run` prints exactly which keys the kernel will hold, which rules are
 flagged but never denied, which enforce more broadly than written, and which
@@ -148,15 +207,26 @@ disable a whole rule class silently.
 ```yaml
 default_action: allow
 
-files:                                   # glob against the opened path (** spans dirs)
+files:
+  # `match:` — a glob over names. Covers files that do not exist yet.
   - { match: "**/.env",      action: block }   # any file named .env
   - { match: "**/.ssh/**",   action: block }   # anything under a dir named .ssh, at any depth
   - { match: "/etc/shadow",  action: block }
+  # `path:` — one object, pinned by (dev, ino) at load. `mv` and `ln` do not
+  # shake it off. `~` is the AGENT's home; a bare name is relative to where
+  # wardyn was launched. `wardyn --dry-run` prints what each one resolved to.
+  - { path:  "~/.ssh",       action: block, access: all }   # ...and no rm, no new files in it
+  - { path:  ".env",         action: block }
+  # `access:` picks which operation the rule covers (default: any = opens only).
+  - { match: "**/id_rsa",    action: block, access: read }
+  - { match: "**/*.sqlite",  action: block, access: delete }
   - { match: "**",           action: allow }
 
 network:                                 # cidr, or domain (resolved at load)
   - { cidr: "127.0.0.0/8",   action: allow }
   - { domain: "github.com",  action: allow }
+  - { port: 25,              action: block }   # never SMTP — beats any rule above
+  - { port: 53, proto: udp,  action: allow }   # ...but DNS over UDP is fine
   - { cidr: "0.0.0.0/0",     action: block }   # deny all other egress
 
 exec:                                    # glob against the executable path
@@ -259,15 +329,24 @@ Full design, hook map, and the eBPF-verifier war stories are in
 - Works from inside pid namespaces (containers, WSL2 distros): wardyn learns its
   kernel-view pid via an in-kernel handshake and says so when it differs.
 
-> The LSM file/exec matcher reads a few `dentry` fields by offset. Wardyn now
-> resolves those offsets **at runtime from the kernel's own BTF**
-> (`/sys/kernel/btf/vmlinux`) and passes them to the eBPF program, so it adapts to
-> the running kernel instead of being pinned to one layout; if BTF resolution
-> fails it falls back to the built-in kernel-6.8 offsets and says so. (True
-> CO-RE — compiler-emitted BTF relocations — is *not* available for the Rust BPF
-> target; this is a `rustc`/LLVM limitation, not an aya one, so runtime resolution
-> is the portable answer.) [`scripts/kernel-offsets.sh`](./scripts/kernel-offsets.sh)
-> remains a manual cross-check.
+> The LSM file/exec matcher reads a few `struct file`, `dentry` and `inode`
+> fields by offset. Wardyn resolves those offsets **at runtime from the kernel's
+> own BTF** (`/sys/kernel/btf/vmlinux`), so it adapts to the running kernel
+> instead of being pinned to one layout; if resolution fails it falls back to the
+> built-in kernel-6.8 offsets, **names the reason**, and demotes file/exec rows to
+> `block~` unless the running kernel really is 6.8. (True CO-RE — compiler-emitted
+> BTF relocations — is *not* available for the Rust BPF target; this is a
+> `rustc`/LLVM limitation, not an aya one, so runtime resolution is the portable
+> answer.) [`scripts/kernel-offsets.sh`](./scripts/kernel-offsets.sh) remains a
+> manual cross-check.
+>
+> The resolver descends into **anonymous** struct members, which is not a detail:
+> Linux 6.13 moved `f_path` inside an anonymous union in `struct file`, and a
+> resolver that only inspected direct members found nothing, fell back to the 6.8
+> offsets, read the wrong words, and failed open — with the feed still looking
+> healthy. Every kernel from 6.13 on was silently unenforced for files and execs
+> until this was fixed; `cargo test -p wardyn --bin wardyn btf::` now checks
+> resolution against the kernel the tests are running on.
 
 ## Roadmap
 
@@ -275,19 +354,26 @@ Full design, hook map, and the eBPF-verifier war stories are in
 - [x] **M2 — Policy:** `policy.yaml` (glob + CIDR), allow/warn/block, JSONL audit.
 - [x] **M3 — Block:** deny egress (cgroup — TCP + UDP, IPv4 + IPv6) + secret reads
   & blocked execs (LSM).
-- [ ] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓,
+- [x] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓,
   presets ✓, `--dry-run` policy checker ✓, portable policy tests on Linux/macOS/
-  Windows ✓, dev container ✓, static musl release builds ✓)_ Next: the demo GIF
-  — the tapes are checked in ([`docs/RECORDING.md`](./docs/RECORDING.md)), the
-  recording needs a BPF-LSM kernel so the `⛔BLOCK` rows are real.
-- [ ] **M5 — Agent feedback:** the agent learns what was denied and why, instead
+  Windows ✓, dev container ✓, static musl release builds ✓, demo GIF ✓ — recorded
+  on a BPF-LSM kernel, so every `⛔BLOCK` row in it is a real `-EPERM`; the tapes
+  are checked in, see [`docs/RECORDING.md`](./docs/RECORDING.md))_
+- [x] **M5 — Agent feedback:** the agent learns what was denied and why, instead
   of flailing at a bare `EPERM`. _(denial receipts ✓, approve-once exceptions
-  from the TUI ✓, kernel-reported denials ✓)_ Next: persistent overrides kept
-  outside the watched tree's reach.
-- [ ] **M6 — Match on identity, not names:** full-path (`bpf_d_path`) and
-  `(dev, ino)` keying, a read/write/create axis, and port/protocol in network
-  rules. Until then a rename or a copy defeats a file rule — see
-  [`SECURITY.md`](./SECURITY.md).
+  from the TUI ✓, kernel-reported denials ✓, persistent overrides kept outside the
+  watched tree's reach and bound to the policy fingerprint they were granted
+  against ✓)_
+- [x] **M6 — Match on identity, not names:** _(`(dev, ino)` keying for files,
+  directories and executables ✓, read/write axis ✓, create/delete axis ✓,
+  `port:` in network rules ✓, `proto:` (`tcp`/`udp`) alongside it ✓, offsets
+  resolved from the running kernel's BTF ✓, e2e proof that rename/hard-link/copy
+  no longer defeat a rule — including a control run showing they still do
+  without it ✓, and that a plain
+  `block` rule still permits `rm`, so no existing policy changed meaning ✓)_
+  Copying a *blocked binary* to a new name still runs it — a copy is a different
+  object with a different name, and unlike a secret there is no read to deny;
+  see [`SECURITY.md`](./SECURITY.md).
 
 ## Contributing
 
