@@ -15,7 +15,9 @@ Output docs/wardyn-demo.mp4
 
 # ── look & feel ────────────────────────────────────────────────────────────
 Set Shell        "bash"
-Set FontSize     20
+# 18, not 20: at 20 the terminal is ~96 columns and the header's block
+# counter — the number the GIF exists to show — falls off the right edge.
+Set FontSize     18
 Set FontFamily   "JetBrains Mono"   # VHS's bundled default; falls back if absent
 Set Width        1280
 Set Height       760
@@ -25,10 +27,20 @@ Set MarginFill   "#1e1e2e"          # framed backdrop (Catppuccin base)
 Set BorderRadius 10
 Set WindowBar    Colorful           # fake macOS title bar — delete for a bare term
 Set Theme        "Catppuccin Mocha" # good reds for the ⛔BLOCK lines
-Set TypingSpeed  50ms
+Set TypingSpeed  25ms
+
+# Fixtures, off-camera: the policy blocks creating files under ~/.ssh, so a
+# demo that made its own would be denied by the rule it exists to show.
+Hide
+Type "bash scripts/demo-setup.sh"
+Enter
+Sleep 2s
+Type "clear"
+Enter
+Show
 
 # ── scene 1 · set the stage ───────────────────────────────────────────────
-Type "# Wardyn: run an agent-like workload under --enforce, watch secret reads & unknown egress get BLOCKED"
+Type "# an agent under --enforce: secret reads, deletions and unknown egress are BLOCKED in-kernel"
 Sleep 800ms
 Enter
 Sleep 700ms
@@ -41,4 +53,4 @@ Enter
 # ── scene 3 · let the live feed stream allow / warn / ⛔BLOCK ──────────────
 # demo.sh loops ~9s then exits; Wardyn auto-quits and prints its summary line.
 # Overshoot a little so the final "N policy violation(s)" frame is captured.
-Sleep 12s
+Sleep 20s

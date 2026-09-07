@@ -11,11 +11,11 @@ or dialing an unknown IP, and can *block* it before the operation completes.
 ![eBPF](https://img.shields.io/badge/eBPF-tracepoints%20%C2%B7%20cgroup%20%C2%B7%20LSM-6f42c1)
 ![status](https://img.shields.io/badge/status-early%20development-yellow)
 
-<!-- Demo GIF: record with docs/RECORDING.md, drop it at docs/wardyn-demo.gif, then
-     uncomment this:
 <p align="center"><img src="docs/wardyn-demo.gif" width="820"
-  alt="Wardyn blocking an agent from reading .env and dialing an unknown IP"></p>
--->
+  alt="Wardyn blocking an agent from reading .env, deleting ~/.ssh, and dialing an unknown IP"></p>
+
+<p align="center"><sub>Recorded on a BPF-LSM kernel, so every <code>⛔BLOCK</code> row is a real
+<code>-EPERM</code> — see <a href="docs/RECORDING.md">docs/RECORDING.md</a> to reproduce it.</sub></p>
 
 ```console
 $ sudo wardyn --enforce run -- claude "refactor the auth module"
@@ -354,20 +354,22 @@ Full design, hook map, and the eBPF-verifier war stories are in
 - [x] **M2 — Policy:** `policy.yaml` (glob + CIDR), allow/warn/block, JSONL audit.
 - [x] **M3 — Block:** deny egress (cgroup — TCP + UDP, IPv4 + IPv6) + secret reads
   & blocked execs (LSM).
-- [ ] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓,
+- [x] **M4 — Ship:** demo GIF, devcontainer, packaging. _(IPv6/UDP egress ✓,
   presets ✓, `--dry-run` policy checker ✓, portable policy tests on Linux/macOS/
-  Windows ✓, dev container ✓, static musl release builds ✓)_ Next: the demo GIF
-  — the tapes are checked in ([`docs/RECORDING.md`](./docs/RECORDING.md)), the
-  recording needs a BPF-LSM kernel so the `⛔BLOCK` rows are real.
-- [ ] **M5 — Agent feedback:** the agent learns what was denied and why, instead
+  Windows ✓, dev container ✓, static musl release builds ✓, demo GIF ✓ — recorded
+  on a BPF-LSM kernel, so every `⛔BLOCK` row in it is a real `-EPERM`; the tapes
+  are checked in, see [`docs/RECORDING.md`](./docs/RECORDING.md))_
+- [x] **M5 — Agent feedback:** the agent learns what was denied and why, instead
   of flailing at a bare `EPERM`. _(denial receipts ✓, approve-once exceptions
-  from the TUI ✓, kernel-reported denials ✓)_ Next: persistent overrides kept
-  outside the watched tree's reach.
+  from the TUI ✓, kernel-reported denials ✓, persistent overrides kept outside the
+  watched tree's reach and bound to the policy fingerprint they were granted
+  against ✓)_
 - [x] **M6 — Match on identity, not names:** _(`(dev, ino)` keying for files,
   directories and executables ✓, read/write axis ✓, create/delete axis ✓,
   `port:` in network rules ✓, `proto:` (`tcp`/`udp`) alongside it ✓, offsets
-  resolved from the running kernel's BTF ✓, e2e proof that rename/hard-link/copy no longer defeat a rule —
-  including a control run showing they still do without it ✓, and that a plain
+  resolved from the running kernel's BTF ✓, e2e proof that rename/hard-link/copy
+  no longer defeat a rule — including a control run showing they still do
+  without it ✓, and that a plain
   `block` rule still permits `rm`, so no existing policy changed meaning ✓)_
   Copying a *blocked binary* to a new name still runs it — a copy is a different
   object with a different name, and unlike a secret there is no read to deny;
