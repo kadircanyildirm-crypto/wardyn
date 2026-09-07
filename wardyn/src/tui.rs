@@ -82,6 +82,12 @@ impl App {
 
     fn push(&mut self, d: Desc) {
         if !d.notice {
+            // Observation counters: one per syscall class the feed can see.
+            // `DENY_DELETE`/`DENY_CREATE` are deliberately absent — there is no
+            // tracepoint for `unlink`/`rename`/`mkdir`, so counting a refusal
+            // here would claim an observation total the feed cannot back up.
+            // They still land in `block` and `denied` below, which is where a
+            // reader looks for what enforcement did.
             match d.kind {
                 kind::EXEC | kind::DENY_EXEC => self.exec += 1,
                 kind::OPEN | kind::DENY_FILE => self.open += 1,

@@ -21,6 +21,7 @@ operation by returning an error to the kernel, not after the fact.
 |---|---|---|---|---|
 | **exec** | `tracepoint/syscalls/sys_enter_execve` + `sys_enter_execveat` | LSM `bprm_check_security` | ✅ (LSM) | deny returns `-EPERM` to `execve`; both syscall variants observed so a denial can't happen off-feed |
 | **file open** (`.env`, `~/.ssh`) | `tracepoint/syscalls/sys_enter_openat` + `sys_enter_openat2` | LSM `file_open` | ✅ (LSM only) | `bpf_override_return` can't deny `openat` — not on the kernel error-injection allowlist, so blocking *requires* BPF LSM. Matches the basename, then **every ancestor directory** (bounded walk) |
+| **file create / delete** | *(none — see note)* | LSM `inode_unlink`, `inode_rmdir`, `inode_rename`, `inode_create`, `inode_mkdir` | ✅ (LSM only) | `file_open` does not fire for `unlink(2)`, so the `delete` axis needed its own hooks. Matches the same four maps as `file_open`, on a different bit of the stored mask. `inode_rename` checks **both** ends: source as a delete, destination as a create |
 | **outbound connect** | `tracepoint/syscalls/sys_enter_connect` + `sys_enter_sendto` | `cgroup/connect4·6` + `cgroup/sendmsg4·6` | ✅ (cgroup v2) | cgroup hook denies `connect()`/`sendmsg()` **without** LSM — works even on stock WSL2. `sendmsg`'s msghdr destination is enforce-only (not observed), but a denial there still reports itself |
 | **fork / child tracking** | `tracepoint/sched/sched_process_fork` (+ `sched_process_exit` to evict) | — | — | maintains the watched PID set; the parent's tgid comes from `bpf_get_current_pid_tgid` (the hook runs in the parent), the child's pid offset from tracefs at runtime |
 
@@ -242,6 +243,44 @@ claiming to).
 - **Exec** — LSM `bprm_check_security` applies the same two-step to
   `linux_binprm->file`: `BLOCK_EXEC_INODES` by identity, then `BLOCK_EXEC` by
   basename.
+
+- **Create / delete** — five LSM hooks (`inode_unlink`, `inode_rmdir`,
+  `inode_create`, `inode_mkdir`, `inode_rename`) run the *same* three-step match
+  as `file_open` — identity, own name, ancestor walk — against the *same* four
+  maps. Only the test differs: `fmode::covers(mask, CREATE|DELETE)` instead of
+  the `f_mode` the open requested. Sharing the maps is what keeps
+  `{ path: "~/.ssh", access: all }` one rule rather than two, and what lets an
+  approve-once exception land on a key the operator already recognises.
+
+  Three things are worth stating plainly:
+
+  1. **`MASK_ANY` does not cover this axis.** `fmode::covers` has no zero escape
+     hatch, so a mask of zero — every `block` rule written before the axis
+     existed — matches no lifecycle operation. Without that, updating wardyn
+     would have made every deployed policy start refusing `rm`. The e2e test
+     asserts it in the kernel, not in a comment.
+  2. **A negative dentry has no identity.** At `inode_create` the object does not
+     exist yet, so `inode_key_of_dentry` fails and identity matching is skipped
+     with no special case — a `create` rule can only ever pin the *name* being
+     made, or an ancestor directory. That is not a gap; it is what "this file
+     does not exist" means.
+  3. **A rename is two operations.** `inode_rename` checks the source for
+     `DELETE` (or `mv secret /tmp/x` empties a protected directory one file at a
+     time) and the destination for `CREATE|DELETE` (or `mv evil
+     ~/.ssh/authorized_keys` writes into one, and `mv junk protected` destroys
+     it). Both destination cases are reported as a refused *create*, because
+     from the destination's side that is what was attempted.
+
+  The five hooks are gated on `CONFIG[lifecycle_on]` and are only *attached* when
+  a policy asks for the axis. They attach best-effort, separately from the two
+  core hooks: `file_open` failing means wardyn cannot do its job, while
+  `inode_mkdir` failing means one axis of one rule is unenforced — and startup
+  names any hook that did not take rather than leaving the policy claiming
+  something the kernel is not holding.
+
+  There is **no observation tracepoint** for these syscalls. A removal appears in
+  the feed only when it is refused, and the row says so. Adding `sys_enter_unlink`
+  and friends would make the feed symmetric; it would not change what is enforced.
 
 **Feed/kernel reconciliation.** The basename/dir reduction is coarser than the glob
 a rule was written as (`/etc/shadow` → deny any file named `shadow`; `**/.ssh/**`

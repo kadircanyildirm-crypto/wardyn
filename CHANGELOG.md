@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A rejected eBPF program could pass the verifier smoke test as an environment
+  skip.** The test tells "this kernel cannot host the program" from "the kernel
+  read the program and refused it" by looking for aya's `Verifier output` marker
+  — but it looked in `{err:?}` only, and aya renders the log through `Display`.
+  So a real rejection was filed as a skip and the test went green, which is
+  exactly the outcome it exists to make impossible. It now searches both forms.
+  Two genuinely rejected programs went by that way before it was noticed (both
+  dereferencing a context pointer at a non-constant offset — legal Rust, and
+  `dereference of modified ctx ptr` at load).
+
 - **File and exec enforcement was silently off on every kernel newer than 6.12.**
   The LSM matcher reads `struct file` / `dentry` fields by byte offset, resolved
   at runtime from the kernel's BTF. Linux 6.13 reorganised `struct file` and moved
@@ -34,6 +44,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rust-toolchain.toml`, keeping one source of truth.
 
 ### Added
+
+- **A create/delete axis — `access: create` / `delete` / `all` (M6).** `rm` is not
+  an open. Every file rule wardyn had was matched at `file_open`, and that hook
+  does not fire for `unlink(2)` at all — so a policy could guard a secret's
+  contents and still watch the agent delete it, and `rm -rf` was never a read.
+
+  ```yaml
+  files:
+    - { match: "**/*.sqlite", action: block, access: delete }  # may edit, may not remove
+    - { path:  "~/.ssh",      action: block, access: all }     # no reads, no rm, no new files
+  ```
+
+  Seven LSM hooks carry it — `inode_unlink`, `inode_rmdir`, `inode_rename`,
+  `inode_create`, `inode_mkdir`, `inode_link`, `inode_symlink` — running the same
+  three-step match as `file_open` (identity, own name, bounded ancestor walk)
+  against the same four maps. Only the test differs: a bit of the stored mask
+  instead of the `f_mode` an open requested. Sharing the maps is what keeps
+  `{ path: "~/.ssh", access: all }` one rule rather than two, and what lets an
+  approve-once exception land on a key the operator already recognises.
+
+  ## `any` still means opens only, and always will
+
+  The default is `access: any`, and it covers **no** lifecycle operation. That is
+  not an oversight to be tidied up later: `MASK_ANY` is the mask every `block`
+  rule ever written already carries, so widening it would mean every deployed
+  policy silently started refusing `rm` the day wardyn was updated — a change of
+  meaning on the rules people re-read least. `fmode::covers` therefore has no
+  zero escape hatch, and the e2e suite asserts the guarantee *in the kernel*:
+  a plain `block` on `.env`, and the agent deletes it.
+
+  Making the two axes coexist in one byte is why `OPEN_ANY` exists. `MASK_ANY` is
+  zero and zero cannot also carry a `DELETE` bit, so a mask that covers both
+  spells "every open" explicitly — and `fmode::widen` returns the canonical zero
+  whenever the result is opens-and-nothing-else, keeping map bytes identical to a
+  build that predates the axis.
+
+  ## A rename is two operations, and both ends are checked
+
+  `inode_rename` checks its **source** for `DELETE` — without it, `mv secret
+  /tmp/x` empties a protected directory one file at a time — and its
+  **destination** for `CREATE|DELETE`, without which `mv evil
+  ~/.ssh/authorized_keys` writes into one and `mv junk protected` destroys it.
+  `link` and `symlink` are hooked for the same reason: they are the other two
+  one-word ways to make a name exist.
+
+  ## The rest of the honesty budget
+
+  An approve-once exception on a lifecycle denial **narrows the stored mask**
+  rather than dropping the key — approving one `rm` must not also unblock every
+  read of the file — and the key is removed only when clearing the bit leaves
+  nothing, because writing zero back would mean `MASK_ANY`, the opposite of what
+  was granted. The hooks are gated on a `CONFIG` flag and attached only when a
+  policy asks for the axis; they attach individually, and any hook a kernel
+  refuses is named at startup instead of leaving the policy claiming something
+  the kernel is not holding. An `exec:` rule that names `create`/`delete` is
+  refused at load, because exec rules compile into maps these hooks never read.
+
+  There is no observation tracepoint for these syscalls: a removal appears in the
+  feed only when it is refused, and the row says so rather than implying a
+  missing observation.
+
+  Proven end-to-end on a BPF-LSM kernel, not asserted: the agent's `rm`, `rmdir`,
+  `touch`, `mkdir`, `mv`, `ln` and `ln -s` are each refused where a rule covers
+  them, its read of the delete-protected file still succeeds, and its `rm` of a
+  plainly-blocked `.env` still succeeds — that last one being the compatibility
+  guarantee, checked by the kernel rather than by a comment.
 
 - **Identity matching — `path:` rules (M6).** A file or exec rule can now name one
   concrete object instead of a glob over names:

@@ -51,6 +51,8 @@ In scope — issues that let a **watched** process:
 
 - read a file, run a binary, or open a network connection that policy marks
   `block`, while `--enforce` is active and the rule is kernel-enforceable;
+- delete, rename away, or create a file that a rule marks `block` with
+  `access: create`, `delete` or `all`, under the same conditions;
 - escape the watched subtree so its children are no longer followed;
 - crash, hang, or otherwise disable Wardyn from userspace.
 
@@ -84,9 +86,11 @@ Out of scope (known limitations, documented, not vulnerabilities):
   matcher keys a glob rule on the file's basename and on the names of its ancestor
   directories (a bounded walk, so a `**/dir/**` rule does cover the whole subtree).
   That stops *accidental and naive* access, and is **bypassable** by renaming or
-  hard-linking the target before opening it — `mv` and `link()` are not hooked.
-  Write a `path:` rule alongside it for anything that matters: those are pinned to
-  `(dev, ino)` at load and follow the object through renames and hard links.
+  hard-linking the target before opening it: a rule that does not name
+  `access: delete` permits the `mv`, and `link()` is only consulted for the name
+  it creates, never the object it aliases. Write a `path:` rule alongside it for
+  anything that matters: those are pinned to `(dev, ino)` at load and follow the
+  object through renames and hard links, so the bypass buys nothing.
 
 - **What identity matching still does not cover.**
   - **Objects that do not exist when the policy loads** cannot be pinned. A `path:`
@@ -106,7 +110,37 @@ Out of scope (known limitations, documented, not vulnerabilities):
 
 - **Rules are matched, not the intent behind them.** `access: read` narrows a rule
   to opens requesting `FMODE_READ`. An `O_PATH` open requests neither read nor
-  write and is covered only by a rule with no `access:` (the default).
+  write and is covered only by a rule with no `access:` (the default), or by
+  `access: all`.
+
+- **A `block` rule on its own says nothing about deleting.** `file_open` does not
+  fire for `unlink(2)`, so an ordinary `block` protects a file's *contents* and
+  leaves `rm` untouched. That is deliberate and permanent: making the default
+  cover removals would change the meaning of every policy already written. Use
+  `access: delete` (or `all`), and check `wardyn --dry-run`, which prints
+  `DELETING` beside the keys that really have it.
+
+- **What the `delete` axis does not protect.** It protects the *name*, not the
+  bytes. An agent that may still write the file can empty it (`> secret`,
+  `truncate`, or an in-place rewrite) without ever unlinking anything, and no
+  lifecycle hook fires. If the contents matter, deny the write as well —
+  `access: all` does both. Similarly, `create` governs which names may appear
+  (`open(O_CREAT)`, `mkdir`, `link`, `symlink`, and a rename's destination); it
+  cannot govern what is written into a name that already exists.
+
+- **`create` rules can only match names and ancestors, never identity.** At
+  `inode_create` the object does not exist, so there is no `(dev, ino)` to pin.
+  A `path:` rule therefore contributes nothing to the create axis for the file
+  itself — only for the directory it would appear in, which is the useful case
+  (`{ path: "~/.ssh", access: all }` refuses a new `authorized_keys` however it
+  is spelled).
+
+- **The lifecycle hooks are attached best-effort.** `file_open` and
+  `bprm_check_security` are load-bearing and a failure to attach either disables
+  LSM enforcement outright. The seven create/delete hooks are attached
+  individually, and any that a kernel refuses are **named at startup** while the
+  rest keep working — a policy is never left quietly claiming an axis the kernel
+  is not holding. They are attached only when a policy asks for the axis.
 
 - **Rule *order* does not survive into the kernel.** Under `--enforce` the LSM hook
   holds an unordered set of block keys, so an `allow` rule listed before a `block`

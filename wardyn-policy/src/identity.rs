@@ -93,16 +93,27 @@ pub struct Anchor {
 
 impl Anchor {
     /// What denying this key really covers, phrased for an operator.
+    ///
+    /// The access mask is spelled out rather than assumed, because the two
+    /// halves of a `path:` rule fail differently: a mis-resolved path denies the
+    /// wrong object, but a mask that says nothing about `delete` denies the
+    /// right object and still lets the agent remove it. Only one of those is
+    /// visible without being told.
     pub fn blast_radius(&self) -> String {
         let (maj, min) = split_dev(self.key.dev);
-        let what = match (self.exec, self.kind) {
-            (true, _) => "executing the program",
-            (false, AnchorKind::Dir) => "opening ANY file under the directory",
-            (false, AnchorKind::File) => "opening the file",
+        let object = match (self.exec, self.kind) {
+            (true, _) => "the program",
+            (false, AnchorKind::Dir) => "ANY file under the directory",
+            (false, AnchorKind::File) => "the file",
+        };
+        let what = if self.exec {
+            "executing".to_string()
+        } else {
+            crate::policy::mask_verbs(self.access_mask)
         };
         format!(
-            "{what} that is currently `{}` (dev {maj}:{min}, ino {}) — under ANY name it is later \
-             given",
+            "{what} {object} that is currently `{}` (dev {maj}:{min}, ino {}) — under ANY name it \
+             is later given",
             self.path.display(),
             self.key.ino
         )

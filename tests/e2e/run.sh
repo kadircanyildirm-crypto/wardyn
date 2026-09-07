@@ -88,6 +88,15 @@ make_fixtures() {
   chmod -R 755 "$d/.ssh"
   chmod 644 "$d/.ssh/sub/deeper/id_ed25519"
 
+  # Lifecycle fixtures. `precious.txt` is protected from removal but not from
+  # reading; `vault/` is pinned by identity and protects what is under it.
+  printf 'do not delete me\n' >"$d/precious.txt"
+  chmod 644 "$d/precious.txt"
+  mkdir -p "$d/vault/empty"
+  printf 'vaulted\n' >"$d/vault/note.txt"
+  chmod 755 "$d/vault" "$d/vault/empty"
+  chmod 644 "$d/vault/note.txt"
+
   # A stand-in for a blocked binary. A shell script is enough:
   # `bprm_check_security` fires for the script itself, so the `**/nc` exec rule
   # denies it exactly as it would deny the real netcat, and the fixture needs
@@ -205,6 +214,41 @@ if cp renamed_nc copied_nc 2>/dev/null; then
   if ./copied_nc >/dev/null 2>&1; then echo allowed >"$WS/copy_exec.txt"
   else echo denied >"$WS/copy_exec.txt"; fi
 else echo cp-failed >"$WS/copy_exec.txt"; fi
+
+# ── lifecycle axis: an `rm` is not an open ───────────────────────────────────
+# Every rule exercised above is matched at `file_open`, which does not fire for
+# unlink(2) at all — so before the lifecycle hooks existed, a policy could guard
+# a secret's contents and still watch the agent delete it.
+did() { if "$@" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
+
+# `access: delete` must refuse the removal...
+did rm -f "$WS/precious.txt" >"$WS/rm_precious.txt"
+# ...and must NOT refuse reading the very same file. A delete rule that also
+# blocks reads is indistinguishable from the old `block`, which is the thing
+# the axis exists to stop being.
+say "$WS/precious.txt" >"$WS/read_precious.txt"
+
+# An ancestor pinned by identity covers what is under it, for removals exactly
+# as it does for opens.
+did rm -f "$WS/vault/note.txt" >"$WS/rm_vaulted.txt"
+did rmdir "$WS/vault/empty" >"$WS/rmdir_vaulted.txt"
+
+# The create side: a name the policy refuses to let appear at all.
+did touch "$WS/forbidden.new" >"$WS/touch_forbidden.txt"
+did mkdir "$WS/forbidden.dir" >"$WS/mkdir_forbidden.txt"
+# ...including when it appears as the DESTINATION of a rename, which is the
+# hole a create rule would have if only `inode_create` were hooked.
+did mv "$WS/ok.txt" "$WS/forbidden.new" >"$WS/mv_forbidden.txt"
+# ...and as a hard link or a symlink, which are the other two one-word ways to
+# make a name exist.
+did ln "$WS/ok.txt" "$WS/forbidden.new" >"$WS/ln_forbidden.txt"
+did ln -s "$WS/ok.txt" "$WS/forbidden.new" >"$WS/symlink_forbidden.txt"
+
+# COMPATIBILITY. `.env` is blocked with no `access:` at all. That rule said
+# nothing about deleting before this axis existed, and must still say nothing —
+# otherwise every policy already written changed meaning when wardyn updated.
+# Last, because it destroys a fixture the assertions above rely on.
+did rm -f "$WS/.env" >"$WS/rm_env.txt"
 
 # a deliberate non-zero exit, so the test can assert wardyn propagates it
 exit 7
@@ -385,6 +429,62 @@ if [[ $LSM_ACTIVE -eq 1 ]]; then
     denied)  fail "copy-then-exec was blocked — better than documented; update SECURITY.md" ;;
     *)       skip "copy-then-exec limitation (the agent could not copy the fixture)" ;;
   esac
+  # ── lifecycle: the axis that had to be hooked somewhere else entirely ─────
+
+  case "$(verdict rm_precious.txt)" in
+    denied)  pass "delete: a rule with access: delete refused the removal" ;;
+    allowed) fail "the agent DELETED a file a delete rule was supposed to protect" ;;
+    *)       fail "delete check produced no verdict" ;;
+  esac
+  case "$(verdict read_precious.txt)" in
+    allowed) pass "delete: that same rule still permits READING the file" ;;
+    denied)  fail "a rule with access: delete also blocked a read — the axis is not narrowing" ;;
+    *)       fail "delete-read check produced no verdict" ;;
+  esac
+  case "$(verdict rm_vaulted.txt)" in
+    denied)  pass "delete: a path: rule on a directory covers removing what is UNDER it" ;;
+    allowed) fail "a file under a delete-protected directory was removed" ;;
+    *)       fail "vault delete check produced no verdict" ;;
+  esac
+  case "$(verdict rmdir_vaulted.txt)" in
+    denied)  pass "delete: rmdir under that directory is refused too (inode_rmdir)" ;;
+    allowed) fail "rmdir under a delete-protected directory succeeded" ;;
+    *)       fail "rmdir check produced no verdict" ;;
+  esac
+  case "$(verdict touch_forbidden.txt)" in
+    denied)  pass "create: a create-blocked name could not be brought into existence" ;;
+    allowed) fail "a file with a create-blocked name was created" ;;
+    *)       fail "create check produced no verdict" ;;
+  esac
+  case "$(verdict mkdir_forbidden.txt)" in
+    denied)  pass "create: mkdir of a create-blocked directory name is refused" ;;
+    allowed) fail "a directory with a create-blocked name was created" ;;
+    *)       fail "mkdir check produced no verdict" ;;
+  esac
+  case "$(verdict mv_forbidden.txt)" in
+    denied)  pass "create: a rename INTO that name is refused at the destination" ;;
+    allowed) fail "mv produced a name the create rule forbids — the rename destination is unhooked" ;;
+    *)       fail "rename-destination check produced no verdict" ;;
+  esac
+  case "$(verdict ln_forbidden.txt)" in
+    denied)  pass "create: a hard link cannot bring a blocked name into existence either" ;;
+    allowed) fail "ln produced a name the create rule forbids — inode_link is unhooked" ;;
+    *)       fail "hard-link create check produced no verdict" ;;
+  esac
+  case "$(verdict symlink_forbidden.txt)" in
+    denied)  pass "create: nor can a symlink (the name is the point, not the target)" ;;
+    allowed) fail "ln -s produced a name the create rule forbids — inode_symlink is unhooked" ;;
+    *)       fail "symlink create check produced no verdict" ;;
+  esac
+  # The compatibility guarantee, proved in the kernel instead of asserted in a
+  # comment. This is the assertion that fails if `MASK_ANY` ever starts covering
+  # the lifecycle axis, and with it every policy anyone has already written.
+  case "$(verdict rm_env.txt)" in
+    allowed) pass "compat: a plain block rule still says NOTHING about deleting" ;;
+    denied)  fail "a plain block rule began refusing rm — existing policies changed meaning" ;;
+    *)       fail "compat delete check produced no verdict" ;;
+  esac
+
   # The receipt must be readable by the agent (it is chowned to the drop
   # target) and by nobody else.
   DPERM="$(stat -c '%a' "$DENIALS" 2>/dev/null || echo '?')"
@@ -402,6 +502,16 @@ if grep -q 'kernel denials —' "$WLOG"; then
   pass "kernel denial counters reported at exit"
 else
   fail "no 'kernel denials' line — the STATS map was not read"
+fi
+# The lifecycle hooks keep their own counters, so a refusal the agent saw with a
+# zero counter here would mean the `rm` failed for some unrelated reason —
+# ownership, a read-only mount — and the test would be green for nothing.
+if [[ $LSM_ACTIVE -eq 1 ]]; then
+  if grep -qE 'kernel denials — [1-9][0-9]* delete, [1-9][0-9]* create' "$WLOG"; then
+    pass "kernel counted the delete AND create denials it made"
+  else
+    fail "no lifecycle denial counters — the create/delete hooks did not fire"
+  fi
 fi
 if grep -q 'enforcement did NOT fire' "$WLOG"; then
   fail "wardyn reported denials to the agent that the kernel never made"
@@ -423,8 +533,9 @@ fi
 
 # 9) --dry-run explains the policy without root, eBPF, or a target.
 DRY="$("$WARDYN" --dry-run --policy "$POLICY" 2>&1)"
-if [[ "$DRY" == *"name=.env"* && "$DRY" == *"dir=.ssh"* && "$DRY" == *"cidr:0.0.0.0/0"* ]]; then
-  pass "--dry-run reports every key the kernel will enforce on"
+if [[ "$DRY" == *"name=.env"* && "$DRY" == *"dir=.ssh"* && "$DRY" == *"cidr:0.0.0.0/0"* \
+   && "$DRY" == *"DELETING"* && "$DRY" == *"CREATING"* ]]; then
+  pass "--dry-run reports every key the kernel will enforce on, and on which axis"
 else
   fail "--dry-run did not describe the policy's kernel keys"
 fi

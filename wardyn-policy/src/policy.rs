@@ -39,23 +39,43 @@ pub enum Action {
     Block,
 }
 
-/// Which access a file rule applies to.
+/// Which operation a file rule applies to.
 ///
-/// `block` used to mean "this file cannot be opened at all", which also forbids
-/// *writing* it — so a policy could not say "the agent may create a `.env`, it
-/// just may not read one", and a rule meant to protect a secret also broke the
-/// tools that write it. The kernel has always known the difference (`f_mode`
-/// carries `FMODE_READ`/`FMODE_WRITE` at `file_open`); the policy simply had no
-/// way to ask.
+/// Two axes, and the split is not cosmetic — they are enforced at different
+/// kernel hooks and mean different things:
+///
+/// - **opens** (`any`, `read`, `write`). `block` used to mean "this file cannot
+///   be opened at all", which also forbids *writing* it — so a policy could not
+///   say "the agent may create a `.env`, it just may not read one", and a rule
+///   meant to protect a secret also broke the tools that write it. The kernel
+///   has always known the difference (`f_mode` carries `FMODE_READ`/`FMODE_WRITE`
+///   at `file_open`); the policy simply had no way to ask.
+/// - **lifecycle** (`create`, `delete`). An `rm` is not an open: `file_open`
+///   never fires for `unlink(2)`, so a rule guarding a secret's *contents* said
+///   nothing whatsoever about destroying it. `rm -rf` was never a read.
+///
+/// [`Access::All`] is the union, and it exists because "protect this thing"
+/// should be one line rather than three.
+///
+/// `any` deliberately does **not** cover the lifecycle axis. It is the default,
+/// so widening it would mean every `block` rule in every policy already written
+/// silently starts refusing `rm` — a behaviour change nobody asked for, on the
+/// rules people are least likely to re-read. Lifecycle coverage is opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
     /// Every open, whatever it asked for. The default, and exactly the
-    /// behaviour of a rule written before this axis existed.
+    /// behaviour of a rule written before either axis existed.
     #[default]
     Any,
     Read,
     Write,
+    /// A new name for this object may not be created.
+    Create,
+    /// This object may not be removed, renamed away, or replaced.
+    Delete,
+    /// Every open *and* both lifecycle operations.
+    All,
 }
 
 impl Access {
@@ -64,6 +84,9 @@ impl Access {
             Access::Any => "any",
             Access::Read => "read",
             Access::Write => "write",
+            Access::Create => "create",
+            Access::Delete => "delete",
+            Access::All => "all",
         }
     }
 
@@ -74,12 +97,28 @@ impl Access {
             Access::Any => fmode::MASK_ANY,
             Access::Read => fmode::READ as u8,
             Access::Write => fmode::WRITE as u8,
+            Access::Create => fmode::CREATE,
+            Access::Delete => fmode::DELETE,
+            Access::All => fmode::OPEN_ANY | fmode::CREATE | fmode::DELETE,
         }
     }
 
     /// Does an open requesting `requested` (raw `f_mode` bits) match this rule?
     pub fn matches(self, requested: u32) -> bool {
         fmode::matches(self.mask(), requested)
+    }
+
+    /// Does this rule cover the lifecycle operation `op` ([`fmode::CREATE`] or
+    /// [`fmode::DELETE`])?
+    pub fn covers(self, op: u8) -> bool {
+        fmode::covers(self.mask(), op)
+    }
+
+    /// Whether this rule says anything at all about creating or removing.
+    /// Drives `CFG_LIFECYCLE_ON`, so a policy that never mentions the axis keeps
+    /// the five lifecycle hooks switched off entirely.
+    pub fn is_lifecycle(self) -> bool {
+        self.mask() & fmode::LIFECYCLE_BITS != 0
     }
 }
 
@@ -111,6 +150,38 @@ pub struct Verdict {
     /// exec globs that don't reduce to a basename/dir are observe-only (the feed
     /// flags them, but they are NOT enforced). Network blocks are always true.
     pub enforceable: bool,
+}
+
+/// Which lifecycle hook refused, for a [`DenialKey::Lifecycle`].
+///
+/// The kernel matches a removal and a creation against the *same* four maps as
+/// an open; only the bit of the stored mask differs. So the operation has to
+/// ride alongside the key rather than inside it — an exception lifts one bit,
+/// and dropping the key outright would also unblock reading the file, which is
+/// not what the operator approved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleOp {
+    Create,
+    Delete,
+}
+
+impl LifecycleOp {
+    /// The [`fmode`] bit this operation consults.
+    pub fn bit(self) -> u8 {
+        match self {
+            LifecycleOp::Create => fmode::CREATE,
+            LifecycleOp::Delete => fmode::DELETE,
+        }
+    }
+
+    /// The verb, for the feed and the confirm prompt.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LifecycleOp::Create => "create",
+            LifecycleOp::Delete => "delete",
+        }
+    }
 }
 
 /// The exact key the kernel's coarse matcher denies on — and therefore the
@@ -161,6 +232,19 @@ pub enum DenialKey {
         dev: u32,
         ino: u64,
     },
+    /// One of the lifecycle hooks (`inode_unlink`, `inode_rmdir`,
+    /// `inode_create`, `inode_mkdir`, `inode_rename`) refused.
+    ///
+    /// `key` is the ordinary file key the kernel matched — the lifecycle hooks
+    /// share `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_INODES` / `BLOCK_DIR_INODES`
+    /// with `file_open` — and `op` says which bit of its mask fired. Both halves
+    /// are needed: an exception must clear that one bit and leave the rest of
+    /// the rule standing, or approving a single `rm` would quietly also grant
+    /// every read of the file.
+    Lifecycle {
+        op: LifecycleOp,
+        key: Box<DenialKey>,
+    },
 }
 
 impl DenialKey {
@@ -200,6 +284,32 @@ impl DenialKey {
                 "executing ONE program — {} — under any name",
                 dev_ino(*dev, *ino)
             ),
+            // Narrower than the key it wraps, and the prompt should say so:
+            // granting this lifts one operation, not the whole rule. The file
+            // stays as unreadable as the policy made it.
+            DenialKey::Lifecycle { op, key } => {
+                format!("{}-ing, and only that, for: {}", op.as_str(), key.scope())
+            }
+        }
+    }
+
+    /// The object a key covers, without the leading verb — so
+    /// [`Self::blast_radius`] can put a different verb in front of it.
+    fn scope(&self) -> String {
+        match self {
+            DenialKey::FileName(n) => format!("ANY file named `{n}` (any directory)"),
+            DenialKey::FileDir(d) => format!("ANY file anywhere under a directory named `{d}`"),
+            DenialKey::FileInode { dev, ino } => {
+                format!("ONE file — {} — under any name", dev_ino(*dev, *ino))
+            }
+            DenialKey::DirInode { dev, ino } => format!(
+                "ANY file under ONE directory — {} — under any name",
+                dev_ino(*dev, *ino)
+            ),
+            // The lifecycle hooks only ever match the four file keys above, so
+            // the rest cannot appear here; fall back to the full sentence rather
+            // than inventing a phrasing for a case that never occurs.
+            other => other.blast_radius(),
         }
     }
 
@@ -209,6 +319,7 @@ impl DenialKey {
             DenialKey::FileInode { dev, ino }
             | DenialKey::DirInode { dev, ino }
             | DenialKey::ExecInode { dev, ino } => Some(InodeKey::new(*dev, *ino)),
+            DenialKey::Lifecycle { key, .. } => key.inode(),
             _ => None,
         }
     }
@@ -237,14 +348,36 @@ impl InodeKeys {
     }
 }
 
-/// "opening" / "reading" / "writing", for an access mask in a sentence.
-fn opening(mask: u8) -> &'static str {
-    match mask {
-        fmode::MASK_ANY => "opening",
-        m if m == fmode::READ as u8 => "READS of",
-        m if m == fmode::WRITE as u8 => "WRITES to",
-        _ => "reads or writes of",
+/// What a stored mask denies, as a verb phrase for a sentence.
+///
+/// The two axes are listed separately and joined rather than collapsed into one
+/// word, because a mask can carry both and "access to" would hide the single
+/// thing an operator most needs to check: whether a rule that says `block`
+/// actually stops an `rm`.
+pub fn mask_verbs(mask: u8) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let rw = mask & (fmode::READ as u8 | fmode::WRITE as u8);
+    if mask == fmode::MASK_ANY || mask & fmode::OPEN_ANY != 0 {
+        parts.push("opening");
+    } else if rw == fmode::READ as u8 {
+        parts.push("READS of");
+    } else if rw == fmode::WRITE as u8 {
+        parts.push("WRITES to");
+    } else if rw != 0 {
+        parts.push("reads or writes of");
     }
+    if fmode::covers(mask, fmode::CREATE) {
+        parts.push("CREATING");
+    }
+    if fmode::covers(mask, fmode::DELETE) {
+        parts.push("DELETING");
+    }
+    // A mask with no bit at all is never compiled, but one that denies nothing
+    // must not read as if it denied everything.
+    if parts.is_empty() {
+        return "nothing about".to_string();
+    }
+    parts.join(" / ")
 }
 
 /// Name → fixed-width kernel key, carrying the access mask.
@@ -273,6 +406,7 @@ impl fmt::Display for DenialKey {
             DenialKey::FileInode { dev, ino } => write!(f, "ino={}", dev_ino(*dev, *ino)),
             DenialKey::DirInode { dev, ino } => write!(f, "dir-ino={}", dev_ino(*dev, *ino)),
             DenialKey::ExecInode { dev, ino } => write!(f, "exec-ino={}", dev_ino(*dev, *ino)),
+            DenialKey::Lifecycle { op, key } => write!(f, "{}:{key}", op.as_str()),
         }
     }
 }
@@ -809,6 +943,17 @@ impl Policy {
         &self.anchors
     }
 
+    /// Does any block rule name a `create`/`delete` access?
+    ///
+    /// Drives `CFG_LIFECYCLE_ON`. False leaves the five lifecycle hooks inert,
+    /// which is both a hot-path saving and the compatibility guarantee: a policy
+    /// that never mentions the axis cannot begin refusing an `rm` because of it.
+    pub fn has_lifecycle_rules(&self) -> bool {
+        self.files
+            .iter()
+            .any(|r| r.action == Action::Block && r.access.is_lifecycle())
+    }
+
     /// Does any block rule narrow itself to reads or writes?
     ///
     /// Narrowing needs the kernel to read `file->f_mode`, which needs an offset
@@ -1052,14 +1197,14 @@ impl Policy {
             let _ = writeln!(
                 s,
                 "  file  name={n:<24} denies {} ANY file named `{n}`",
-                opening(mask)
+                mask_verbs(mask)
             );
         }
         for (d, &mask) in &self.kern_dirs {
             let _ = writeln!(
                 s,
                 "  file  dir={d:<25} denies {} ANY file under a directory named `{d}` (any depth)",
-                opening(mask)
+                mask_verbs(mask)
             );
         }
         for e in self.kern_execs.keys() {
@@ -1391,6 +1536,21 @@ fn compile_rules(
 ) -> Result<Vec<PathRule>> {
     let mut out = Vec::with_capacity(rules.len());
     for r in rules {
+        // An `exec:` rule compiles into `BLOCK_EXEC` / `BLOCK_EXEC_INODES`, and
+        // the lifecycle hooks do not consult either — they match the *file*
+        // maps. A `delete` here would therefore enforce nothing at all while
+        // reading exactly like a rule that does, which is the failure this
+        // codebase refuses to ship. Say so at load, and point at the axis that
+        // works: a program is a file, so `files:` can protect it from `rm`.
+        if is_exec && r.access.is_lifecycle() {
+            let named = r.pattern.as_deref().or(r.path.as_deref()).unwrap_or("?");
+            anyhow::bail!(
+                "`exec:` rule `{named}` has `access: {}` — exec rules are matched when a program \
+                 is RUN, and nothing about creating or deleting it. Move it to `files:`, where \
+                 that axis is enforced",
+                r.access.as_str()
+            );
+        }
         let compiled = match (r.pattern, r.path) {
             (Some(p), Some(q)) => anyhow::bail!(
                 "rule has both `match: {p}` and `path: {q}` — a glob describes names, a path \
@@ -1489,20 +1649,13 @@ fn compile_rules(
 /// Fold a rule's access mask into a kernel key set.
 ///
 /// One key, one value: if two rules name the same basename with different
-/// access, the kernel map can only hold one mask. [`fmode::MASK_ANY`] is zero
-/// and means "every open", so it absorbs anything else; otherwise the masks are
-/// OR'd, which denies an open asking for either. Both directions widen rather
-/// than narrow — the alternative is a rule that silently stops applying because
-/// an unrelated rule was added next to it.
+/// access, the kernel map can only hold one mask, so the merge has to widen
+/// rather than narrow — the alternative is a rule that silently stops applying
+/// because an unrelated rule was added next to it. [`fmode::widen`] owns that
+/// algebra, because the kernel side needs the same answer.
 fn merge_mask(map: &mut BTreeMap<String, u8>, key: &str, mask: u8) {
     match map.get_mut(key) {
-        Some(existing) => {
-            *existing = if *existing == fmode::MASK_ANY || mask == fmode::MASK_ANY {
-                fmode::MASK_ANY
-            } else {
-                *existing | mask
-            };
-        }
+        Some(existing) => *existing = fmode::widen(*existing, mask),
         None => {
             map.insert(key.to_string(), mask);
         }
@@ -2446,5 +2599,191 @@ files:
                 p.net_coverage_gaps()
             );
         }
+    }
+
+    // ── the create/delete axis (M6) ─────────────────────────────────────────
+
+    /// The compatibility guarantee, stated as a test because it is the one
+    /// thing a new axis can silently break: a rule written before this axis
+    /// existed must not begin refusing an `rm` because wardyn was updated.
+    #[test]
+    fn a_plain_block_rule_says_nothing_about_deleting() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.env", action: block }
+  - { match: "**/logfile", action: block, access: any }
+"#,
+            )
+            .expect("parses");
+
+        // Still blocks opens, exactly as before.
+        assert!(p.kernel_file_denial("/x/.env", fmode::READ).is_some());
+        // And still stores the canonical MASK_ANY, so the map bytes are
+        // identical to a build that predates the axis.
+        let (names, _) = p.file_enforcement();
+        for (_, mask) in &names {
+            assert_eq!(*mask, fmode::MASK_ANY);
+            assert!(!fmode::covers(*mask, fmode::DELETE));
+            assert!(!fmode::covers(*mask, fmode::CREATE));
+        }
+        // And the five lifecycle hooks stay switched off entirely.
+        assert!(!p.has_lifecycle_rules());
+    }
+
+    #[test]
+    fn a_delete_rule_blocks_removal_without_blocking_reads() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/keep.txt", action: block, access: delete }
+"#,
+            )
+            .expect("parses");
+
+        assert!(p.has_lifecycle_rules());
+        let (names, _) = p.file_enforcement();
+        let (_, mask) = names
+            .iter()
+            .find(|(k, _)| *k == key("keep.txt"))
+            .expect("key");
+        assert!(fmode::covers(*mask, fmode::DELETE));
+        assert!(!fmode::covers(*mask, fmode::CREATE));
+
+        // The whole point: the agent may still read and write the file.
+        assert!(p.kernel_file_denial("/x/keep.txt", fmode::READ).is_none());
+        assert!(p.kernel_file_denial("/x/keep.txt", fmode::WRITE).is_none());
+        // Including an `O_PATH` open, which asks for neither bit — the case a
+        // `READ | WRITE` mask would have got wrong.
+        assert!(p.kernel_file_denial("/x/keep.txt", 0).is_none());
+    }
+
+    #[test]
+    fn access_all_covers_every_open_and_both_lifecycle_operations() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.env", action: block, access: all }
+"#,
+            )
+            .expect("parses");
+
+        let (names, _) = p.file_enforcement();
+        let (_, mask) = names.iter().find(|(k, _)| *k == key(".env")).expect("key");
+        assert!(fmode::covers(*mask, fmode::DELETE));
+        assert!(fmode::covers(*mask, fmode::CREATE));
+        // `all` must keep covering an `O_PATH` open, which sets neither
+        // FMODE_READ nor FMODE_WRITE — the reason it is not spelled READ|WRITE.
+        assert!(p.kernel_file_denial("/x/.env", 0).is_some());
+        assert!(p.kernel_file_denial("/x/.env", fmode::READ).is_some());
+    }
+
+    /// Two rules, one kernel key, one stored value. Neither rule may be lost.
+    #[test]
+    fn an_open_rule_and_a_delete_rule_on_one_key_keep_both_axes() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.env", action: block, access: read }
+  - { match: "**/.env", action: block, access: delete }
+"#,
+            )
+            .expect("parses");
+
+        let (names, _) = p.file_enforcement();
+        let (_, mask) = names.iter().find(|(k, _)| *k == key(".env")).expect("key");
+        assert!(fmode::covers(*mask, fmode::DELETE), "delete rule was lost");
+        assert!(p.kernel_file_denial("/x/.env", fmode::READ).is_some());
+        // The read rule is still a READ rule: widening must not turn it into
+        // "every open" just because a delete rule sat next to it.
+        assert!(p.kernel_file_denial("/x/.env", fmode::WRITE).is_none());
+    }
+
+    /// `any` and `delete` together mean "every open, and no removal" — the
+    /// case that forced `OPEN_ANY` to exist, because MASK_ANY is zero and zero
+    /// cannot carry a second bit.
+    #[test]
+    fn merging_any_with_delete_keeps_every_open_covered() {
+        let merged = fmode::widen(fmode::MASK_ANY, fmode::DELETE);
+        assert!(fmode::matches(merged, 0), "O_PATH open stopped matching");
+        assert!(fmode::matches(merged, fmode::READ));
+        assert!(fmode::matches(merged, fmode::WRITE));
+        assert!(fmode::covers(merged, fmode::DELETE));
+        assert!(!fmode::covers(merged, fmode::CREATE));
+    }
+
+    /// An approve-once exception lifts one operation, not the whole rule.
+    #[test]
+    fn lifting_a_lifecycle_bit_leaves_the_rest_of_the_rule_standing() {
+        let both = Access::All.mask();
+        let after = fmode::without(both, fmode::DELETE).expect("something is left");
+        assert!(!fmode::covers(after, fmode::DELETE));
+        assert!(fmode::covers(after, fmode::CREATE));
+        assert!(fmode::matches(after, fmode::READ), "reads were unblocked");
+
+        // A delete-only key has nothing left, and must be REMOVED rather than
+        // written back as zero — zero is MASK_ANY, i.e. "block every open",
+        // which would be the opposite of the exception that was granted.
+        assert_eq!(fmode::without(Access::Delete.mask(), fmode::DELETE), None);
+    }
+
+    /// The kernel matches a removal against the same key as an open, so an
+    /// exception has to name the operation alongside it.
+    #[test]
+    fn a_lifecycle_exception_is_narrower_than_the_key_it_wraps() {
+        let inner = DenialKey::FileName(".env".into());
+        let wrapped = DenialKey::Lifecycle {
+            op: LifecycleOp::Delete,
+            key: Box::new(inner.clone()),
+        };
+        assert_eq!(wrapped.inode(), None);
+        let radius = wrapped.blast_radius();
+        assert!(radius.contains("delete"), "{radius}");
+        assert!(radius.contains(".env"), "{radius}");
+        // Distinct keys: granting the removal must not also grant the open.
+        assert_ne!(wrapped, inner);
+    }
+
+    /// `exec:` rules compile into maps the lifecycle hooks never read, so a
+    /// `delete` there would enforce nothing while reading as if it did.
+    #[test]
+    fn an_exec_rule_cannot_carry_a_lifecycle_access() {
+        let err = Loader::offline()
+            .from_str(
+                r#"
+exec:
+  - { match: "**/nc", action: block, access: delete }
+"#,
+            )
+            .err()
+            .expect("must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("files:"), "{msg}");
+    }
+
+    /// A `path:` rule carries the axis into the identity maps, and `--dry-run`
+    /// has to say which operations it really covers — a rule that pins the
+    /// right object and the wrong axis looks identical otherwise.
+    #[test]
+    fn a_path_rule_reports_the_lifecycle_axis_it_enforces() {
+        let p = identity_loader()
+            .from_str(
+                r#"
+files:
+  - { path: "/home/a/.ssh", action: block, access: delete }
+"#,
+            )
+            .expect("parses");
+
+        let keys = p.inode_enforcement();
+        assert_eq!(keys.dirs.len(), 1);
+        assert!(fmode::covers(keys.dirs[0].1, fmode::DELETE));
+
+        let text = p.explain();
+        assert!(text.contains("DELETING"), "{text}");
     }
 }

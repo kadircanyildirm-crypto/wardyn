@@ -18,6 +18,17 @@ default_action: allow
 #
 # They complement each other, so use both for anything that matters. See
 # policies/strict.yaml for a fuller identity-pinned set.
+#
+# `access:` picks WHICH operation a rule covers, across two axes:
+#
+#   any (default) / read / write   — matched when the file is OPENED
+#   create / delete                — matched when a name appears or is removed
+#   all                            — every one of the above
+#
+# The default is `any`, and `any` covers only opens. That is not an oversight:
+# `rm` is not an open, so a plain `block` says nothing about deleting — and it
+# has to keep saying nothing, or every policy written before this axis existed
+# would change meaning. Ask for `delete` (or `all`) where you mean it.
 files:
   - { match: "**/.env", action: block }
   - { match: "**/.env.*", action: block }
@@ -25,9 +36,11 @@ files:
   - { match: "**/.aws/credentials", action: block }
   - { match: "**/.config/gcloud/**", action: block }
   - { match: "/etc/shadow", action: block }
-  # The same secrets, pinned by identity rather than by name.
-  - { path: "~/.ssh", action: block }
-  - { path: "/etc/shadow", action: block }
+  # The same secrets, pinned by identity rather than by name — and, with
+  # `access: all`, protected from `rm` and from having new files dropped into
+  # them, not only from being read.
+  - { path: "~/.ssh", action: block, access: all }
+  - { path: "/etc/shadow", action: block, access: all }
   - { match: "**/.npmrc", action: warn }
   - { match: "**/.git/config", action: warn }
   - { match: "**", action: allow } # everything else: reading is fine

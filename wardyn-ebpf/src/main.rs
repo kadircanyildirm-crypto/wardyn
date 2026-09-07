@@ -177,6 +177,11 @@ const CFG_IDENTITY_ON: u32 = 19;
 /// Set when the policy has at least one port-qualified rule. Skips a trie
 /// lookup per connect for the policies that do not use them.
 const CFG_PORT_RULES_ON: u32 = 20;
+/// Set when the policy has at least one `create`/`delete` rule. The five
+/// lifecycle hooks return immediately when it is clear, so a policy that says
+/// nothing about removing or creating files pays nothing for them - and, more
+/// importantly, cannot start refusing an `rm` it never mentioned.
+const CFG_LIFECYCLE_ON: u32 = 21;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
 // personality(persona) — persona is the 1st arg, same slot as execve's filename.
@@ -967,6 +972,321 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     if unsafe { BLOCK_EXEC.get(&NameKey(name)).is_some() } {
         bump(stat::DENIED_EXEC);
         emit_deny_name(kind::DENY_EXEC, &name, meta::KEY_NAME);
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+// ── lifecycle enforcement: deny removing (and creating) blocked objects ─────
+//
+// `rm` is not an open. Every rule above this point is matched at `file_open` or
+// `bprm_check_security`, and neither hook fires for `unlink(2)` — so a policy
+// that guarded a secret's *contents* said nothing at all about destroying it,
+// and `rm -rf` was never a read. These five hooks are that axis.
+//
+// They match on the same four maps as `file_open` (names, dirs, and the two
+// inode maps), differing only in which bit of the stored mask they consult:
+// `fmode::DELETE` / `fmode::CREATE` instead of the `f_mode` the open asked for.
+// Sharing the maps is what keeps `path: ~/.ssh` one rule rather than two, and
+// what makes an approve-once exception land on a key the operator recognises.
+//
+// `fmode::covers` has no `MASK_ANY` escape hatch, and that is the whole
+// compatibility story: a mask of zero — which is every `block` rule written
+// before this axis existed — covers no lifecycle operation, so no policy starts
+// refusing an `rm` on the strength of a rule that never mentioned one.
+
+/// Consult the map holding the object's own key as a *file*.
+const SELF_FILE: u8 = 1;
+/// Consult the map holding it as a *directory*. A rename passes both, because
+/// its source can be either and the hook has no way to ask.
+const SELF_DIR: u8 = 2;
+
+/// Does a lifecycle rule refuse `op` on `dentry`? Emits the denial event and
+/// bumps the counters as a side effect, so the caller only picks the verdict.
+///
+/// The shape deliberately mirrors `try_file_open` — identity first (it is the
+/// more specific statement), then the object's own name, then the bounded
+/// ancestor walk — so a `path:` rule naming a directory covers what is *under*
+/// it here exactly as it does there.
+#[inline(always)]
+fn lifecycle_denied(dentry: *const u8, op: u8, ev_kind: u32, counter: u32, self_maps: u8) -> bool {
+    let name_off = off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF);
+    let parent_off = off(CFG_DENTRY_PARENT_OFF, DENTRY_PARENT_OFF);
+    let identity = cfg(CFG_EXT_OFFSETS) != 0 && cfg(CFG_IDENTITY_ON) != 0;
+
+    // The object's own identity. A negative dentry — the destination of a
+    // create, which does not exist yet — has no inode, so `inode_key_of_dentry`
+    // fails and this is skipped with no special case: there is nothing to match,
+    // which is exactly the truth about a file that has not been made.
+    if identity {
+        if let Ok(key) = inode_key_of_dentry(dentry) {
+            let dir_hit = if self_maps & SELF_DIR != 0 {
+                unsafe { BLOCK_DIR_INODES.get(&key) }
+            } else {
+                None
+            };
+            let hit = match dir_hit {
+                Some(m) => Some(m),
+                None if self_maps & SELF_FILE != 0 => unsafe { BLOCK_INODES.get(&key) },
+                None => None,
+            };
+            if let Some(&mask) = hit {
+                if fmode::covers(mask, op) {
+                    bump(counter);
+                    bump(stat::DENIED_IDENTITY);
+                    emit_deny_ident(ev_kind, dentry, name_off, &key, meta::KEY_INO);
+                    return true;
+                }
+            }
+        }
+    }
+
+    // The object's own name.
+    let mut name = [0u8; NAME_LEN];
+    if read_name(dentry, name_off, &mut name).is_ok() {
+        let dir_hit = if self_maps & SELF_DIR != 0 {
+            unsafe { BLOCK_DIRS.get(&NameKey(name)) }
+        } else {
+            None
+        };
+        let hit = match dir_hit {
+            Some(m) => Some(m),
+            None if self_maps & SELF_FILE != 0 => unsafe { BLOCK_NAMES.get(&NameKey(name)) },
+            None => None,
+        };
+        if let Some(&mask) = hit {
+            if fmode::covers(mask, op) {
+                bump(counter);
+                emit_deny_name(ev_kind, &name, meta::KEY_NAME);
+                return true;
+            }
+        }
+    }
+
+    // Ancestors. This is the rule an operator actually writes — "nothing under
+    // `~/.ssh` may be deleted" — and it is why the walk is here and not only in
+    // `file_open`.
+    let mut cur = dentry;
+    for _ in 0..MAX_DIR_WALK {
+        let Ok(parent) = read_ptr(cur, parent_off) else {
+            break;
+        };
+        if parent.is_null() || parent == cur {
+            break;
+        }
+        if identity {
+            if let Ok(key) = inode_key_of_dentry(parent) {
+                if let Some(&mask) = unsafe { BLOCK_DIR_INODES.get(&key) } {
+                    if fmode::covers(mask, op) {
+                        bump(counter);
+                        bump(stat::DENIED_IDENTITY);
+                        emit_deny_ident(ev_kind, parent, name_off, &key, meta::KEY_DIR_INO);
+                        return true;
+                    }
+                }
+            }
+        }
+        let mut dir = [0u8; NAME_LEN];
+        if read_name(parent, name_off, &mut dir).is_err() {
+            break;
+        }
+        if let Some(&mask) = unsafe { BLOCK_DIRS.get(&NameKey(dir)) } {
+            if fmode::covers(mask, op) {
+                bump(counter);
+                emit_deny_name(ev_kind, &dir, meta::KEY_DIR);
+                return true;
+            }
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// The gate every lifecycle hook opens with: enforcing, watched, and the policy
+/// actually has this axis to enforce.
+#[inline(always)]
+fn lifecycle_off() -> bool {
+    if cfg(CFG_ENFORCE) == 0 || cfg(CFG_LIFECYCLE_ON) == 0 {
+        return true;
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    !is_watched(pid)
+}
+
+/// `security_inode_unlink(struct inode *dir, struct dentry *dentry)`.
+#[lsm(hook = "inode_unlink")]
+pub fn inode_unlink(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_unlink(&ctx, SELF_FILE))
+}
+
+/// `security_inode_rmdir(struct inode *dir, struct dentry *dentry)` — the same
+/// shape, but the victim is a directory, so it is its *directory* key that has
+/// to match.
+#[lsm(hook = "inode_rmdir")]
+pub fn inode_rmdir(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_unlink(&ctx, SELF_DIR))
+}
+
+fn try_unlink(ctx: &LsmContext, self_maps: u8) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    let dentry: *const u8 = unsafe { ctx.arg(1) };
+    if lifecycle_denied(
+        dentry,
+        fmode::DELETE,
+        kind::DENY_DELETE,
+        stat::DENIED_DELETE,
+        self_maps,
+    ) {
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+/// `security_inode_create(struct inode *dir, struct dentry *dentry, umode_t)`.
+#[lsm(hook = "inode_create")]
+pub fn inode_create(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_create(&ctx, SELF_FILE))
+}
+
+/// `security_inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t)`.
+#[lsm(hook = "inode_mkdir")]
+pub fn inode_mkdir(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_create(&ctx, SELF_DIR))
+}
+
+fn try_create(ctx: &LsmContext, self_maps: u8) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    let dentry: *const u8 = unsafe { ctx.arg(1) };
+    if lifecycle_denied(
+        dentry,
+        fmode::CREATE,
+        kind::DENY_CREATE,
+        stat::DENIED_CREATE,
+        self_maps,
+    ) {
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+/// `security_inode_link(struct dentry *old_dentry, struct inode *dir,
+/// struct dentry *new_dentry)`.
+///
+/// A hard link is a name coming into existence, so it belongs to the `create`
+/// axis as much as `touch` does — and leaving it out would be a hole with a
+/// one-word bypass: `ln x ~/.ssh/authorized_keys`.
+///
+/// Only the *destination* is checked. The source is already covered wherever it
+/// matters: an identity rule denies reads through every name the object has, so
+/// a second name buys nothing (the e2e suite asserts exactly that).
+#[lsm(hook = "inode_link")]
+pub fn inode_link(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_link(&ctx))
+}
+
+fn try_link(ctx: &LsmContext) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    // The argument index is a LITERAL here, and in every other hook, because
+    // `ctx.arg(n)` compiles to `*(ctx as *const usize).add(n)` and the verifier
+    // rejects a context pointer offset by anything it cannot fold to a constant:
+    //
+    //     dereference of modified ctx ptr R8 off=16 disallowed
+    //
+    // Passing `n` as a parameter to a shared helper looks like tidier code and
+    // is not: it compiles, clippy is happy, and the program is refused at load —
+    // where wardyn fails open, so the axis is silently unenforced. Share the
+    // *matcher* (`new_name_denied`), never the argument read.
+    let dentry: *const u8 = unsafe { ctx.arg(2) };
+    if new_name_denied(dentry) {
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+/// `security_inode_symlink(struct inode *dir, struct dentry *dentry,
+/// const char *old_name)`.
+///
+/// The symlink's *target* is not the point — the name is. A `create` rule says
+/// which names may appear in a directory, and a dangling symlink occupies the
+/// name just as firmly as a file does.
+#[lsm(hook = "inode_symlink")]
+pub fn inode_symlink(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_symlink(&ctx))
+}
+
+fn try_symlink(ctx: &LsmContext) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    let dentry: *const u8 = unsafe { ctx.arg(1) };
+    if new_name_denied(dentry) {
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+/// Shared by the two hooks above: a dentry that is about to become a name.
+/// Always negative, so identity never matches — which is the truth about an
+/// object that does not exist yet.
+#[inline(always)]
+fn new_name_denied(dentry: *const u8) -> bool {
+    lifecycle_denied(
+        dentry,
+        fmode::CREATE,
+        kind::DENY_CREATE,
+        stat::DENIED_CREATE,
+        SELF_FILE,
+    )
+}
+
+/// `security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+/// struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)`.
+///
+/// A rename is both operations at once, and has to be checked from the two ends
+/// it touches:
+///
+/// - the **source** disappears from where it was, which is a delete;
+/// - the **destination** is a name coming into existence, which is a create —
+///   and if a file is already there the rename destroys it, so the destination
+///   is checked for `DELETE` as well. Both are reported as a refused create,
+///   because from the destination's side that is what was attempted.
+///
+/// Without the source check, `mv secret /tmp/x` empties a protected directory
+/// one file at a time. Without the destination check, `mv evil
+/// ~/.ssh/authorized_keys` writes into one.
+#[lsm(hook = "inode_rename")]
+pub fn inode_rename(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_rename(&ctx))
+}
+
+fn try_rename(ctx: &LsmContext) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    let old_dentry: *const u8 = unsafe { ctx.arg(1) };
+    if lifecycle_denied(
+        old_dentry,
+        fmode::DELETE,
+        kind::DENY_DELETE,
+        stat::DENIED_DELETE,
+        SELF_FILE | SELF_DIR,
+    ) {
+        return Ok(EPERM);
+    }
+    let new_dentry: *const u8 = unsafe { ctx.arg(3) };
+    if lifecycle_denied(
+        new_dentry,
+        fmode::CREATE | fmode::DELETE,
+        kind::DENY_CREATE,
+        stat::DENIED_CREATE,
+        SELF_FILE | SELF_DIR,
+    ) {
         return Ok(EPERM);
     }
     Ok(OK)

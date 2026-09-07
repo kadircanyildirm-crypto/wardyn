@@ -68,22 +68,35 @@ pub mod kind {
     pub const DENY_EXEC: u32 = 5;
     /// A cgroup `connect*`/`sendmsg*` hook refused an address.
     pub const DENY_NET: u32 = 6;
+    /// An LSM `inode_unlink`/`inode_rmdir`/`inode_rename` hook refused to let the
+    /// object be removed. `path` holds the matched key, `meta` says which map it
+    /// came from, exactly as for [`DENY_FILE`].
+    pub const DENY_DELETE: u32 = 7;
+    /// An LSM `inode_create`/`inode_mkdir`/`inode_rename` hook refused to let a
+    /// new name appear. The object does not exist yet, so this can only ever
+    /// match on the *name* being created or on an ancestor directory — never on
+    /// the new object's own identity, which does not exist to be matched.
+    pub const DENY_CREATE: u32 = 8;
 }
 
 /// Values of [`Event::meta`], interpreted per `kind`.
 pub mod meta {
-    /// `DENY_FILE`: the file's own basename matched `BLOCK_NAMES`.
+    /// `DENY_FILE`/`DENY_DELETE`/`DENY_CREATE`: the object's own basename
+    /// matched `BLOCK_NAMES` (or `BLOCK_DIRS`, when the object is itself a
+    /// directory being made or removed).
     pub const KEY_NAME: u32 = 0;
-    /// `DENY_FILE`: an ancestor directory matched `BLOCK_DIRS`.
+    /// `DENY_FILE`/`DENY_DELETE`/`DENY_CREATE`: an ancestor directory matched
+    /// `BLOCK_DIRS`.
     pub const KEY_DIR: u32 = 1;
-    /// `DENY_FILE`/`DENY_EXEC`: the object's own `(dev, ino)` matched
-    /// `BLOCK_INODES`. `Event::dev`/`ino` carry the key; `path` still carries
+    /// `DENY_FILE`/`DENY_EXEC`/`DENY_DELETE`: the object's own `(dev, ino)`
+    /// matched `BLOCK_INODES` (or `BLOCK_DIR_INODES`, for a directory being
+    /// removed). `Event::dev`/`ino` carry the key; `path` still carries
     /// the basename the file has *right now*, which is the interesting part —
     /// it is how the operator sees that a rename did not help.
     pub const KEY_INO: u32 = 2;
-    /// `DENY_FILE`: an ancestor directory's `(dev, ino)` matched
-    /// `BLOCK_DIR_INODES` — the directory rule survived the directory being
-    /// renamed.
+    /// `DENY_FILE`/`DENY_DELETE`/`DENY_CREATE`: an ancestor directory's
+    /// `(dev, ino)` matched `BLOCK_DIR_INODES` — the directory rule survived
+    /// the directory being renamed.
     pub const KEY_DIR_INO: u32 = 3;
     /// `DENY_NET`: the destination matched a **port-qualified** rule, i.e. the
     /// decision came from `NET_PORT_RULES`, not the address-only trie.
@@ -94,19 +107,52 @@ pub mod meta {
     pub const KEY_PORT: u32 = 4;
 }
 
-/// Bits of [`Event::fmode`], mirroring the kernel's `FMODE_*`. Only the two that
-/// a policy can express are carried across.
+/// The access mask stored beside every file/exec block key, and the `f_mode`
+/// bits it is matched against.
 ///
-/// The distinction matters because `block` on a secret used to mean "cannot be
-/// opened at all", which also forbids *writing* it — so a policy could not say
-/// "the agent may create `.env`, it just may not read one".
+/// Two axes live in one byte, and they are **not** symmetric:
+///
+/// - The **open** axis ([`READ`]/[`WRITE`]/[`OPEN_ANY`]) is matched against the
+///   kernel's `FMODE_*` at `file_open`. It exists because `block` on a secret
+///   used to mean "cannot be opened at all", which also forbids *writing* it —
+///   so a policy could not say "the agent may create `.env`, it just may not
+///   read one".
+/// - The **lifecycle** axis ([`CREATE`]/[`DELETE`]) is matched at the
+///   `inode_create`/`inode_unlink`/… hooks, where there is no `f_mode` at all.
+///   It exists because an `rm` is not an open: a policy that guards a secret's
+///   *contents* said nothing about deleting it, and `rm -rf` was never a read.
+///
+/// The asymmetry is deliberate. [`MASK_ANY`] is **zero** and means "every open,
+/// no lifecycle operation" — exactly what a rule written before either axis
+/// existed did. If zero also covered delete, every `block` rule in every policy
+/// already written would silently start refusing `rm`, which is a behaviour
+/// change nobody asked for. So lifecycle coverage is only ever explicit, and
+/// [`OPEN_ANY`] is the bit that says "every open" out loud, for the masks that
+/// need to combine the two.
 pub mod fmode {
     /// The open requested read access (kernel `FMODE_READ`).
     pub const READ: u32 = 0x1;
     /// The open requested write access (kernel `FMODE_WRITE`).
     pub const WRITE: u32 = 0x2;
+    /// Every open, whatever it asked for — the explicit form of [`MASK_ANY`].
+    ///
+    /// Needed because `MASK_ANY` is zero, and zero cannot carry a lifecycle bit
+    /// alongside it. A rule covering both axes stores `OPEN_ANY | DELETE`.
+    pub const OPEN_ANY: u8 = 0x4;
+    /// A new name for this object may not be created (`inode_create`,
+    /// `inode_mkdir`, and the destination side of `inode_rename`).
+    pub const CREATE: u8 = 0x8;
+    /// This object may not be removed (`inode_unlink`, `inode_rmdir`, and the
+    /// source side of `inode_rename`).
+    pub const DELETE: u8 = 0x10;
+
+    /// Every bit the open axis uses.
+    pub const OPEN_BITS: u8 = READ as u8 | WRITE as u8 | OPEN_ANY;
+    /// Every bit the lifecycle axis uses.
+    pub const LIFECYCLE_BITS: u8 = CREATE | DELETE;
+
     /// The mask stored with a block key that does not care which access was
-    /// requested: **zero**, meaning "every open matches".
+    /// requested: **zero**, meaning "every open".
     ///
     /// Not `READ | WRITE`, which looks equivalent and is not: an `O_PATH` open
     /// sets neither bit, so a `READ|WRITE` mask would silently stop covering it
@@ -115,8 +161,63 @@ pub mod fmode {
     pub const MASK_ANY: u8 = 0;
 
     /// Does an open requesting `requested` match a key stored with `mask`?
+    ///
+    /// A lifecycle-only mask (`access: delete`) matches **no** open: it has no
+    /// open bits, and the `MASK_ANY` escape hatch is spelled as "the whole mask
+    /// is zero", not "the open bits are zero", precisely so that a delete rule
+    /// does not accidentally read as "block every open".
     pub const fn matches(mask: u8, requested: u32) -> bool {
-        mask == MASK_ANY || (requested & mask as u32) != 0
+        if mask == MASK_ANY || mask & OPEN_ANY != 0 {
+            return true;
+        }
+        requested & (mask & (READ as u8 | WRITE as u8)) as u32 != 0
+    }
+
+    /// Does a key stored with `mask` cover the lifecycle operation `op`
+    /// ([`CREATE`] or [`DELETE`])?
+    ///
+    /// No `MASK_ANY` escape hatch, by design — see the module docs.
+    pub const fn covers(mask: u8, op: u8) -> bool {
+        mask & op != 0
+    }
+
+    /// The mask that covers everything either input covers.
+    ///
+    /// Used when two rules name the same kernel key: the map holds one value, so
+    /// the merge must widen rather than narrow — the alternative is a rule that
+    /// silently stops applying because an unrelated rule was added next to it.
+    /// Returns the canonical [`MASK_ANY`] when the result is "every open and
+    /// nothing else", so a policy that never mentions the new axes produces
+    /// byte-identical map values to one built before they existed.
+    pub const fn widen(a: u8, b: u8) -> u8 {
+        let lifecycle = (a | b) & LIFECYCLE_BITS;
+        let any_open = a == MASK_ANY || b == MASK_ANY || (a | b) & OPEN_ANY != 0;
+        let open = if any_open {
+            OPEN_ANY
+        } else {
+            (a | b) & (READ as u8 | WRITE as u8)
+        };
+        if lifecycle == 0 && open == OPEN_ANY {
+            MASK_ANY
+        } else {
+            open | lifecycle
+        }
+    }
+
+    /// The mask left after an approve-once exception lifts `op` from it, or
+    /// `None` when nothing is left to enforce and the key should be dropped.
+    ///
+    /// Clearing a bit cannot go through [`MASK_ANY`]: a `delete`-only mask minus
+    /// `DELETE` is zero, and writing zero back would turn an exception for one
+    /// `rm` into a block on every open of the file. `None` says "remove the key"
+    /// instead.
+    pub const fn without(mask: u8, op: u8) -> Option<u8> {
+        let next = mask & !op;
+        if next == 0 {
+            None
+        } else {
+            Some(next)
+        }
     }
 }
 
@@ -141,8 +242,12 @@ pub mod stat {
     /// is the one claim identity matching makes, and a counter is the only way
     /// to show it fired rather than assume it did.
     pub const DENIED_IDENTITY: u32 = 5;
+    /// Removals refused by the `inode_unlink`/`inode_rmdir`/`inode_rename` hooks.
+    pub const DENIED_DELETE: u32 = 6;
+    /// New names refused by the `inode_create`/`inode_mkdir`/`inode_rename` hooks.
+    pub const DENIED_CREATE: u32 = 7;
     /// Number of slots (the map's `max_entries`).
-    pub const COUNT: u32 = 6;
+    pub const COUNT: u32 = 8;
 }
 
 /// How many ancestor directories the LSM `file_open` hook walks when matching

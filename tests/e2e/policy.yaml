@@ -20,6 +20,18 @@ files:
   # Access axis: this file may be appended to, but not read back. `block` used to
   # mean "cannot be opened at all", which forbade both.
   - { match: "**/writable.log", action: block, access: read }
+  # Lifecycle axis (M6). `rm` is not an open, and `file_open` never fires for
+  # unlink(2) — so none of the rules above say anything about destroying the
+  # thing they protect. These do. Note what is NOT here: no `access: delete` on
+  # `.env` or `.ssh`, so the agent below can still rename them, which is what
+  # the identity assertions need — and what proves a rule written without this
+  # axis did not silently grow one.
+  - { match: "**/precious.txt", action: block, access: delete }
+  - { match: "**/forbidden.new", action: block, access: create }
+  - { match: "**/forbidden.dir/**", action: block, access: create }
+  # Identity + lifecycle together: the directory is pinned by (dev, ino), and
+  # what is pinned is the right to remove anything under it.
+  - { path: "vault", action: block, access: delete }
   - { match: "**", action: allow }
 
 network:

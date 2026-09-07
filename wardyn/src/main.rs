@@ -37,11 +37,14 @@ use aya::Btf;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 use wardyn_common::{
-    action, kind, meta, stat, Event, InodeKey, PortKey4, PortKey6, NAME_LEN, PATH_LEN, PORT_BITS,
+    action, fmode, kind, meta, stat, Event, InodeKey, PortKey4, PortKey6, NAME_LEN, PATH_LEN,
+    PORT_BITS,
 };
 use wardyn_policy::cli::{self, Mode, Opts, ParseOutcome};
 use wardyn_policy::identity::AnchorBase;
-use wardyn_policy::policy::{self, Action, DenialKey, Exceptions, Loader, Policy, Verdict};
+use wardyn_policy::policy::{
+    self, Action, DenialKey, Exceptions, LifecycleOp, Loader, Policy, Verdict,
+};
 
 use crate::audit::Audit;
 use crate::receipt::Receipt;
@@ -150,6 +153,7 @@ const CFG_DENTRY_INODE_OFF: u32 = 17;
 const CFG_EXT_OFFSETS: u32 = 18;
 const CFG_IDENTITY_ON: u32 = 19;
 const CFG_PORT_RULES_ON: u32 = 20;
+const CFG_LIFECYCLE_ON: u32 = 21;
 
 /// Feed rows that carry an operator/diagnostic message rather than a syscall.
 const KIND_NOTICE: u32 = u32::MAX;
@@ -290,6 +294,40 @@ impl KernelMaps {
             map.remove(&InoKey::from(InodeKey::new(dev, ino)))
                 .context("removing identity block key")
         }
+        // A lifecycle exception narrows the stored mask instead of removing the
+        // key: the operator approved one `rm`, not every read of the file. The
+        // key only goes away when clearing the bit leaves nothing to enforce —
+        // writing a zero back would mean `MASK_ANY`, i.e. "block every open",
+        // which is the opposite of what was granted.
+        fn lift_name(
+            map: &mut BpfHashMap<MapData, NameKey, u8>,
+            name: &str,
+            op: u8,
+        ) -> anyhow::Result<()> {
+            let bytes = policy::name_key(name).context("name not kernel-mappable")?;
+            let cur = map.get(&NameKey(bytes), 0).context("reading block key")?;
+            match fmode::without(cur, op) {
+                Some(next) => map
+                    .insert(NameKey(bytes), next, 0)
+                    .context("narrowing block key"),
+                None => map.remove(&NameKey(bytes)).context("removing block key"),
+            }
+        }
+        fn lift_ino(
+            map: &mut BpfHashMap<MapData, InoKey, u8>,
+            dev: u32,
+            ino: u64,
+            op: u8,
+        ) -> anyhow::Result<()> {
+            let k = InoKey::from(InodeKey::new(dev, ino));
+            let cur = map.get(&k, 0).context("reading identity block key")?;
+            match fmode::without(cur, op) {
+                Some(next) => map
+                    .insert(k, next, 0)
+                    .context("narrowing identity block key"),
+                None => map.remove(&k).context("removing identity block key"),
+            }
+        }
         match key {
             DenialKey::FileName(n) => drop_name(&mut self.names, n),
             DenialKey::FileDir(d) => drop_name(&mut self.dirs, d),
@@ -297,6 +335,24 @@ impl KernelMaps {
             DenialKey::FileInode { dev, ino } => drop_ino(&mut self.inodes, *dev, *ino),
             DenialKey::DirInode { dev, ino } => drop_ino(&mut self.dir_inodes, *dev, *ino),
             DenialKey::ExecInode { dev, ino } => drop_ino(&mut self.exec_inodes, *dev, *ino),
+            DenialKey::Lifecycle { op, key } => {
+                let bit = op.bit();
+                match key.as_ref() {
+                    DenialKey::FileName(n) => lift_name(&mut self.names, n, bit),
+                    DenialKey::FileDir(d) => lift_name(&mut self.dirs, d, bit),
+                    DenialKey::FileInode { dev, ino } => {
+                        lift_ino(&mut self.inodes, *dev, *ino, bit)
+                    }
+                    DenialKey::DirInode { dev, ino } => {
+                        lift_ino(&mut self.dir_inodes, *dev, *ino, bit)
+                    }
+                    // The lifecycle hooks consult only the four file maps, so
+                    // nothing else can be wrapped. Refuse rather than silently
+                    // do nothing: an exception that quietly failed is worse than
+                    // one that never appeared.
+                    other => anyhow::bail!("`{other}` cannot carry a lifecycle exception"),
+                }
+            }
             // `from_ne_bytes`, not `from_le_bytes`: the LPM trie compares key
             // bytes from the most significant end, so the octets must sit in
             // network order in memory on either endianness.
@@ -357,14 +413,22 @@ pub(crate) struct StatSnapshot {
     pub denied_exec: u64,
     pub denied_net: u64,
     /// How many of the above matched on `(dev, ino)` rather than a name. A
-    /// SUBSET of `denied_file + denied_exec`, never an addition — see
+    /// SUBSET of the denial counters above, never an addition — see
     /// [`stat::DENIED_IDENTITY`].
     pub denied_identity: u64,
+    /// Removals refused by the lifecycle hooks.
+    pub denied_delete: u64,
+    /// New names refused by the lifecycle hooks.
+    pub denied_create: u64,
 }
 
 impl StatSnapshot {
     pub fn denials(&self) -> u64 {
-        self.denied_file + self.denied_exec + self.denied_net
+        self.denied_file
+            + self.denied_exec
+            + self.denied_net
+            + self.denied_delete
+            + self.denied_create
     }
 }
 
@@ -388,6 +452,8 @@ impl KernelStats {
             denied_exec: self.slot(stat::DENIED_EXEC),
             denied_net: self.slot(stat::DENIED_NET),
             denied_identity: self.slot(stat::DENIED_IDENTITY),
+            denied_delete: self.slot(stat::DENIED_DELETE),
+            denied_create: self.slot(stat::DENIED_CREATE),
         }
     }
 }
@@ -623,14 +689,31 @@ fn home_for_uid(uid: u32) -> Option<PathBuf> {
     None
 }
 
+/// The LSM hooks that carry the `create`/`delete` axis. Attached only when a
+/// policy asks for it, and separately from the two core hooks, because they are
+/// not equally load-bearing: `file_open` failing to attach means wardyn cannot
+/// do its main job, while `inode_mkdir` failing means one axis of one rule is
+/// unenforced. Aborting the whole LSM for the second would trade the tool for a
+/// feature.
+const LIFECYCLE_HOOKS: &[&str] = &[
+    "inode_unlink",
+    "inode_rmdir",
+    "inode_create",
+    "inode_mkdir",
+    "inode_rename",
+    "inode_link",
+    "inode_symlink",
+];
+
 /// Load + attach the BPF-LSM file/exec deniers. Kept separate so a kernel without
 /// BPF LSM degrades gracefully to network-only enforcement instead of aborting.
-fn attach_lsm(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+///
+/// `lifecycle` adds the create/delete hooks. Returns the hooks that could NOT be
+/// attached, so the caller can name them instead of leaving a policy claiming an
+/// axis the kernel is not enforcing.
+fn attach_lsm(ebpf: &mut aya::Ebpf, lifecycle: bool) -> anyhow::Result<Vec<String>> {
     let btf = Btf::from_sys_fs().context("loading kernel BTF")?;
-    for (name, hook) in [
-        ("file_open", "file_open"),
-        ("bprm_check", "bprm_check_security"),
-    ] {
+    let mut attach = |name: &str, hook: &str| -> anyhow::Result<()> {
         let prog: &mut Lsm = ebpf
             .program_mut(name)
             .with_context(|| format!("{name} program not found"))?
@@ -639,8 +722,21 @@ fn attach_lsm(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
             .with_context(|| format!("loading lsm/{hook}"))?;
         prog.attach()
             .with_context(|| format!("attaching lsm/{hook}"))?;
+        Ok(())
+    };
+    // The two that wardyn is not wardyn without.
+    attach("file_open", "file_open")?;
+    attach("bprm_check", "bprm_check_security")?;
+
+    let mut missing = Vec::new();
+    if lifecycle {
+        for hook in LIFECYCLE_HOOKS {
+            if let Err(e) = attach(hook, hook) {
+                missing.push(format!("{hook} ({e:#})"));
+            }
+        }
     }
-    Ok(())
+    Ok(missing)
 }
 
 /// Await the child's exit if there is one; otherwise never resolve.
@@ -932,13 +1028,25 @@ async fn run() -> anyhow::Result<i32> {
 
         // Files/exec: BPF-LSM deniers. Non-fatal — if the kernel lacks BPF LSM,
         // keep the (already-attached) network enforcement rather than aborting.
-        match attach_lsm(&mut ebpf) {
-            Ok(()) => {
+        match attach_lsm(&mut ebpf, policy.has_lifecycle_rules()) {
+            Ok(missing) => {
                 lsm_active = true;
-                notices.push(
+                let axes = if policy.has_lifecycle_rules() {
+                    "enforcement ON — egress (cgroup) + secret-file reads + blocked execs + \
+                     create/delete (LSM)"
+                } else {
                     "enforcement ON — egress (cgroup) + secret-file reads + blocked execs (LSM)"
-                        .into(),
-                );
+                };
+                notices.push(axes.into());
+                // A create/delete rule that silently did not attach is a rule
+                // the policy claims and the kernel does not hold. Name it.
+                if !missing.is_empty() {
+                    notices.push(format!(
+                        "create/delete rules are only PARTLY enforced — this kernel would not \
+                         take: {}. Operations reaching the missing hook are ALLOWED.",
+                        missing.join(", ")
+                    ));
+                }
             }
             Err(e) => notices.push(format!(
                 "BPF LSM enforcement unavailable ({e:#}) — file/exec blocking is OFF (network \
@@ -970,6 +1078,10 @@ async fn run() -> anyhow::Result<i32> {
     config.set(CFG_FORK_CHILD_OFF, child_off, 0)?;
     // Skip the port-trie lookup per connect for policies that name no ports.
     config.set(CFG_PORT_RULES_ON, u32::from(policy.has_port_rules()), 0)?;
+    // The five lifecycle hooks stay inert unless a rule asked for them. This is
+    // not only a hot-path saving: it is what guarantees a policy written before
+    // the axis existed cannot start refusing an `rm` because wardyn was updated.
+    config.set(CFG_LIFECYCLE_ON, u32::from(policy.has_lifecycle_rules()), 0)?;
 
     // LSM dentry offsets: resolve them from the running kernel's own BTF so the
     // file/exec matcher adapts to the kernel instead of being pinned to 6.8. On
@@ -1232,6 +1344,15 @@ fn report_kernel_stats(s: &StatSnapshot, enforce: bool, claimed: u64) {
             "wardyn: kernel denials — {} file, {} exec, {} network",
             s.denied_file, s.denied_exec, s.denied_net
         );
+        // Listed on their own line rather than folded into "file": these came
+        // from a different set of hooks, and an operator checking whether the
+        // `delete` axis actually fired should not have to subtract.
+        if s.denied_delete > 0 || s.denied_create > 0 {
+            eprintln!(
+                "wardyn: kernel denials — {} delete, {} create (lifecycle hooks)",
+                s.denied_delete, s.denied_create
+            );
+        }
         // Identity denials are the ones a name rule alone would have missed —
         // the renamed secret, the hard link, the moved directory. Reported
         // separately because "the rename didn't help" is a claim, and a counter
@@ -1541,6 +1662,11 @@ fn prediction_key(k: &DenialKey) -> String {
         DenialKey::FileInode { dev, ino }
         | DenialKey::DirInode { dev, ino }
         | DenialKey::ExecInode { dev, ino } => format!("{dev}:{ino}"),
+        // Also never predicted, and for a sharper reason: there is no
+        // observation tracepoint for `unlink`/`rename`/`mkdir` at all, so a
+        // lifecycle denial has nothing to confirm — the kernel event IS the
+        // first time userspace hears about the operation.
+        DenialKey::Lifecycle { op, key } => format!("{}:{}", op.as_str(), prediction_key(key)),
     }
 }
 
@@ -1575,7 +1701,7 @@ pub(crate) fn describe(
     // Kernel-reported denials first: these are decisions, not observations, and
     // they are reported exactly as made.
     match ev.kind {
-        kind::DENY_FILE | kind::DENY_EXEC => {
+        kind::DENY_FILE | kind::DENY_EXEC | kind::DENY_DELETE | kind::DENY_CREATE => {
             let name = event_key_name(ev);
             let identity = matches!(ev.meta, meta::KEY_INO | meta::KEY_DIR_INO);
             let key = match (ev.kind, ev.meta) {
@@ -1595,10 +1721,25 @@ pub(crate) fn describe(
                 (_, meta::KEY_DIR) => DenialKey::FileDir(name.clone()),
                 _ => DenialKey::FileName(name.clone()),
             };
-            let label = if ev.kind == kind::DENY_EXEC {
-                "exec"
-            } else {
-                "open"
+            // A lifecycle denial matched one of the same four file keys, but on
+            // a different bit of its mask. Wrapping it keeps the exception
+            // honest: approving one `rm` must not also unblock every read.
+            let key = match ev.kind {
+                kind::DENY_DELETE => DenialKey::Lifecycle {
+                    op: LifecycleOp::Delete,
+                    key: Box::new(key),
+                },
+                kind::DENY_CREATE => DenialKey::Lifecycle {
+                    op: LifecycleOp::Create,
+                    key: Box::new(key),
+                },
+                _ => key,
+            };
+            let label = match ev.kind {
+                kind::DENY_EXEC => "exec",
+                kind::DENY_DELETE => "delete",
+                kind::DENY_CREATE => "create",
+                _ => "open",
             };
             // An identity denial is the one case where the object's *current*
             // name is the interesting part: the kernel matched the inode, so
@@ -1606,13 +1747,23 @@ pub(crate) fn describe(
             // rename did not work. Fall back to the bare key if the policy has
             // no anchor for it (an exception was granted, or the map outlived
             // a reload).
+            // There is no `sys_enter` tracepoint for unlink/rename/mkdir, so a
+            // lifecycle row is not a *confirmation* of anything the feed already
+            // showed — it is the first and only time the operation is reported.
+            // Say which, so a reader does not go looking for the missing
+            // observation row.
+            let why = if matches!(ev.kind, kind::DENY_DELETE | kind::DENY_CREATE) {
+                "refused in-kernel; the attempt itself is not observed, only its refusal"
+            } else {
+                "denied in-kernel; path not observed"
+            };
             let detail = if identity {
                 match policy.anchor_for(&InodeKey::new(ev.dev, ev.ino)) {
                     Some(a) => format!("{name}  (same object as {})", a.path.display()),
-                    None => format!("{key} (denied in-kernel by identity)"),
+                    None => format!("{key} ({why})"),
                 }
             } else {
-                format!("{key} (denied in-kernel; path not observed)")
+                format!("{key} ({why})")
             };
             let rule = match (identity, policy.anchor_for(&InodeKey::new(ev.dev, ev.ino))) {
                 (true, Some(a)) => a.rule.clone(),

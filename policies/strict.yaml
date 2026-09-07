@@ -33,13 +33,23 @@ files:
   # `--dry-run`, and pins nothing — the `match:` rule above still covers it if
   # it appears later. Run `wardyn --dry-run` from your project to see exactly
   # which objects these landed on.
-  - { path: "~/.ssh", action: block }
-  - { path: "~/.aws", action: block }
-  - { path: "~/.kube", action: block }
-  - { path: "~/.docker", action: block }
-  - { path: "~/.netrc", action: block }
-  - { path: ".env", action: block }
-  - { path: "/etc/shadow", action: block }
+  # `access: all` is the second half of the same idea. A `block` rule is matched
+  # at `file_open`, which does not fire for `unlink(2)` at all — so without this
+  # the agent cannot READ `~/.ssh/id_ed25519` and can still `rm -rf ~/.ssh`.
+  # `all` adds both lifecycle operations: nothing under these may be removed,
+  # and nothing new may be created in them either (which is what an
+  # `authorized_keys` written by an agent would be).
+  #
+  # It is spelled out rather than implied because `block` on its own deliberately
+  # still means only "opens": widening the default would change what every
+  # policy already written does, silently, on the rules people re-read least.
+  - { path: "~/.ssh", action: block, access: all }
+  - { path: "~/.aws", action: block, access: all }
+  - { path: "~/.kube", action: block, access: all }
+  - { path: "~/.docker", action: block, access: all }
+  - { path: "~/.netrc", action: block, access: all }
+  - { path: ".env", action: block, access: all }
+  - { path: "/etc/shadow", action: block, access: all }
 
   - { match: "**", action: allow }
 

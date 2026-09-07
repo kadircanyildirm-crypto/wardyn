@@ -54,6 +54,7 @@ For the process subtree you launch (`wardyn run -- <cmd>`, followed across `fork
 |---|---|---|---|
 | **exec** — programs run | ✅ path + comm | ⛔ deny blocked binaries, by name **or identity** | `tracepoint/execve` + LSM `bprm_check_security` |
 | **file** — files opened | ✅ path + access | ⛔ deny secret reads (`.env`, `.ssh/*`), by name **or identity**, and per read/write | `tracepoint/openat` + LSM `file_open` |
+| **file** — files created or deleted | ⛔ only when refused (no tracepoint) | ⛔ deny `rm`, `rmdir`, `mv` and file creation, by name **or identity** | LSM `inode_unlink` / `inode_rmdir` / `inode_rename` / `inode_create` / `inode_mkdir` |
 | **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs (TCP + UDP, IPv4/IPv6) | `tracepoint/connect` + `cgroup/connect4·6` + `sendmsg4·6` |
 
 **Rules match names or identities.** A `match:` rule is a glob over the path —
@@ -158,8 +159,23 @@ families — a v4-only reading would leave the same port open over IPv6.
 
 A file or exec rule is written with **either** `match:` (a glob over names) or
 `path:` (one concrete object, pinned by identity) — never both. File rules also
-take `access: read | write | any` (default `any`), so a policy can protect a
-secret from being *read* without forbidding the tools that write it.
+take an **`access:`**, which picks the operation the rule covers across two axes:
+
+| `access:` | matched when | hook |
+| --- | --- | --- |
+| `any` (default), `read`, `write` | the file is **opened** | `file_open` |
+| `create` | a name **comes into existence** | `inode_create`, `inode_mkdir`, and a rename's destination |
+| `delete` | a name is **removed** | `inode_unlink`, `inode_rmdir`, and a rename's source |
+| `all` | every one of the above | all of them |
+
+The split exists because `rm` is not an open: `file_open` never fires for
+`unlink(2)`, so a rule that protects a secret's *contents* said nothing at all
+about destroying it. `rm -rf` was never a read.
+
+The default stays `any`, and **`any` covers only opens**. Widening it would mean
+every `block` rule ever written silently started refusing `rm` the day wardyn was
+updated — a change of meaning on the rules people re-read least. Ask for `delete`
+(or `all`) where you mean it; `policies/strict.yaml` does.
 
 `wardyn --dry-run` prints exactly which keys the kernel will hold, which rules are
 flagged but never denied, which enforce more broadly than written, and which
@@ -178,10 +194,11 @@ files:
   # `path:` — one object, pinned by (dev, ino) at load. `mv` and `ln` do not
   # shake it off. `~` is the AGENT's home; a bare name is relative to where
   # wardyn was launched. `wardyn --dry-run` prints what each one resolved to.
-  - { path:  "~/.ssh",       action: block }
+  - { path:  "~/.ssh",       action: block, access: all }   # ...and no rm, no new files in it
   - { path:  ".env",         action: block }
-  # `access:` narrows a rule to reads or writes (default: any).
+  # `access:` picks which operation the rule covers (default: any = opens only).
   - { match: "**/id_rsa",    action: block, access: read }
+  - { match: "**/*.sqlite",  action: block, access: delete }
   - { match: "**",           action: allow }
 
 network:                                 # cidr, or domain (resolved at load)
@@ -325,10 +342,11 @@ Full design, hook map, and the eBPF-verifier war stories are in
   from the TUI ✓, kernel-reported denials ✓)_ Next: persistent overrides kept
   outside the watched tree's reach.
 - [ ] **M6 — Match on identity, not names:** _(`(dev, ino)` keying for files,
-  directories and executables ✓, read/write axis ✓, `port:` in network rules ✓,
-  offsets resolved from the running kernel's BTF ✓, e2e proof that
-  rename/hard-link/copy no longer defeat a rule — including a control run showing
-  they still do without it ✓)_ Next: a create/unlink axis, and protocol
+  directories and executables ✓, read/write axis ✓, create/delete axis ✓,
+  `port:` in network rules ✓, offsets resolved from the running kernel's BTF ✓,
+  e2e proof that rename/hard-link/copy no longer defeat a rule — including a
+  control run showing they still do without it ✓, and that a plain `block` rule
+  still permits `rm`, so no existing policy changed meaning ✓)_ Next: protocol
   (`tcp`/`udp`) alongside `port:`. Copying a *blocked binary* to a new name still
   runs it — a copy is a different object with a different name, and unlike a
   secret there is no read to deny; see [`SECURITY.md`](./SECURITY.md).
