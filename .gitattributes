@@ -8,3 +8,8 @@ BPF_LINKER_VERSION text eol=lf
 
 # VHS tapes are executed by vhs on Linux; keep them LF for the same reason.
 *.tape text eol=lf
+
+# The demo artifacts. Marked binary so a Windows checkout cannot line-ending
+# convert them into a corrupt file that still has the right name.
+*.gif binary
+*.mp4 binary

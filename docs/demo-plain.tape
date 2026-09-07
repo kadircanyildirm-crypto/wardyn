@@ -11,7 +11,9 @@ Output docs/wardyn-demo.gif
 Output docs/wardyn-demo.mp4
 
 Set Shell        "bash"
-Set FontSize     20
+# 18, not 20: at 20 the terminal is ~96 columns and the header's block
+# counter — the number the GIF exists to show — falls off the right edge.
+Set FontSize     18
 Set FontFamily   "JetBrains Mono"
 Set Width        1280
 Set Height       720
@@ -21,9 +23,19 @@ Set MarginFill   "#1e1e2e"
 Set BorderRadius 10
 Set WindowBar    Colorful
 Set Theme        "Catppuccin Mocha"
-Set TypingSpeed  50ms
+Set TypingSpeed  25ms
 
-Type "# Wardyn: --enforce blocks .env / .ssh reads and unknown-IP egress in real time, at the syscall boundary"
+# Fixtures, off-camera: the policy blocks creating files under ~/.ssh, so a
+# demo that made its own would be denied by the rule it exists to show.
+Hide
+Type "bash scripts/demo-setup.sh"
+Enter
+Sleep 2s
+Type "clear"
+Enter
+Show
+
+Type "# --enforce blocks .env / .ssh reads, rm, and unknown egress — in real time, at the syscall boundary"
 Sleep 800ms
 Enter
 Sleep 700ms
@@ -32,4 +44,4 @@ Sleep 700ms
 Type "sudo ./target/release/wardyn --enforce --plain run -- bash scripts/demo.sh"
 Sleep 500ms
 Enter
-Sleep 12s
+Sleep 20s

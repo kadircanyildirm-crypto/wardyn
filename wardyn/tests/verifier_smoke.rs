@@ -5,9 +5,9 @@
 //! Loading and attaching are separate steps, and they need different things:
 //! loading needs `CAP_BPF` and nothing else, while attaching needs cgroup v2 for
 //! the network hooks and an active BPF LSM for the file/exec ones. That gap is
-//! what this test lives in — it can put all fourteen programs through the
-//! verifier on a stock CI runner, on a kernel that could never attach some of
-//! them.
+//! what this test lives in — it can put every program in the object through
+//! the verifier on a stock CI runner, on a kernel that could never attach
+//! some of them.
 //!
 //! It exists because the alternative already failed. Every `cgroup_sock_addr`
 //! program was rejected at load with
@@ -43,9 +43,21 @@ const TRACEPOINTS: &[&str] = &[
 const CGROUP_PROGS: &[&str] = &["connect4", "connect6", "sendmsg4", "sendmsg6"];
 
 /// `(program name, LSM hook)`. Must exit with `R0` in `[-4095, 0]`.
+///
+/// The five lifecycle hooks are here for a specific reason: they are the only
+/// programs that walk a dentry chain *twice* in one program (`inode_rename`
+/// checks both ends of the rename), and the verifier's complexity limit is the
+/// thing that would catch that — at load, on a kernel, and nowhere else.
 const LSM_PROGS: &[(&str, &str)] = &[
     ("file_open", "file_open"),
     ("bprm_check", "bprm_check_security"),
+    ("inode_unlink", "inode_unlink"),
+    ("inode_rmdir", "inode_rmdir"),
+    ("inode_create", "inode_create"),
+    ("inode_mkdir", "inode_mkdir"),
+    ("inode_rename", "inode_rename"),
+    ("inode_link", "inode_link"),
+    ("inode_symlink", "inode_symlink"),
 ];
 
 /// aya's own wording when `BPF_PROG_LOAD` comes back with a verifier log. It is
@@ -60,8 +72,16 @@ fn skip(reason: &str) {
 }
 
 /// Fail on a verifier rejection; report anything else as an environment skip.
+///
+/// The marker is looked for in the **Display** form as well as the Debug one.
+/// aya renders the verifier log through `Display`; `{err:?}` alone printed a
+/// struct that did not contain it, so a genuinely rejected program was reported
+/// as an environment skip and this test passed — which is precisely the outcome
+/// it exists to make impossible. Two real rejections (`inode_link`,
+/// `inode_symlink`, both dereferencing a non-constant context offset) went by
+/// that way before it was noticed.
 fn judge<E: std::fmt::Debug + std::fmt::Display>(what: &str, err: E, skipped: &mut Vec<String>) {
-    let msg = format!("{err:?}");
+    let msg = format!("{err:?} {err}");
     assert!(
         !msg.contains(VERIFIER_MARKER),
         "{what}: the verifier REJECTED this program — it would silently not be \

@@ -5,6 +5,10 @@
 version: 1
 default_action: allow
 
+# No `access:` anywhere below, because nothing here is `block`: the create/delete
+# axis is enforced by LSM hooks that only ever consult block keys, so a `warn`
+# rule cannot carry it. Deletions are therefore not flagged by this preset —
+# see policies/strict.yaml for the axis in use.
 files:
   - { match: "**/.env", action: warn }
   - { match: "**/.env.*", action: warn }

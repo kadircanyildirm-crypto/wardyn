@@ -7,7 +7,281 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-09-07
+
+The first release. Wardyn watches one process subtree — an agent and everything
+it spawns — and, under `--enforce`, denies what the policy forbids *at the
+syscall boundary*, before the action completes.
+
+What it can deny, in the kernel:
+
+| axis | rule | hooks |
+| --- | --- | --- |
+| **network egress** | `cidr:` / `domain:`, narrowed by `port:` and `proto:` | `cgroup/connect4·6`, `cgroup/sendmsg4·6` |
+| **secret reads** | `match:` (a glob over names) or `path:` (one object, by `(dev, ino)`), narrowed by `access: read \| write` | LSM `file_open` |
+| **blocked programs** | the same two forms | LSM `bprm_check_security` |
+| **deletion and creation** | `access: create \| delete \| all` | LSM `inode_unlink` / `rmdir` / `rename` / `create` / `mkdir` / `link` / `symlink` |
+
+Three properties are worth stating plainly, because they are what the design
+spends itself on:
+
+- **The hook that decides is the hook that reports.** An observed `sys_enter`
+  path can be relative, symlinked, or reached through a dirfd — so every denial
+  is reported by the enforcement hook itself, naming the key it matched, and
+  userspace renders that rather than re-deriving it. At exit the kernel's own
+  counters are compared against everything the agent was told.
+- **Wardyn fails open, and says so.** A verifier rejection, a failed attach, an
+  unresolvable struct offset — each degrades to allowing the operation, names the
+  reason at startup, and stops predicting `BLOCK` for the rows it can no longer
+  promise. A security tool that silently enforces nothing is worse than one that
+  admits it.
+- **A rule means one thing before and after an upgrade.** `access:` defaults to
+  covering opens only, and the create/delete axis is opt-in, so no policy written
+  against an earlier build changed meaning when this one shipped. The end-to-end
+  suite asserts that in the kernel rather than in a comment.
+
+Requires a Linux kernel with BTF and cgroup v2; file, exec and lifecycle
+enforcement additionally require the BPF LSM (`lsm=...,bpf`). Without it, network
+egress blocking still works and startup says the rest is off.
+
+Known limits are documented in [SECURITY.md](SECURITY.md) and pinned by the e2e
+suite so they cannot quietly start being claimed as fixed — most notably that
+copying a *blocked binary* to a new name still runs it.
+
+### Fixed
+
+- **A rejected eBPF program could pass the verifier smoke test as an environment
+  skip.** The test tells "this kernel cannot host the program" from "the kernel
+  read the program and refused it" by looking for aya's `Verifier output` marker
+  — but it looked in `{err:?}` only, and aya renders the log through `Display`.
+  So a real rejection was filed as a skip and the test went green, which is
+  exactly the outcome it exists to make impossible. It now searches both forms.
+  Two genuinely rejected programs went by that way before it was noticed (both
+  dereferencing a context pointer at a non-constant offset — legal Rust, and
+  `dereference of modified ctx ptr` at load).
+
+- **File and exec enforcement was silently off on every kernel newer than 6.12.**
+  The LSM matcher reads `struct file` / `dentry` fields by byte offset, resolved
+  at runtime from the kernel's BTF. Linux 6.13 reorganised `struct file` and moved
+  `f_path` inside an **anonymous union**; the BTF walker only inspected direct
+  members, so it reported "no such member", resolution failed, wardyn fell back to
+  offsets baked in for 6.8, the hook read the wrong words, every read returned
+  `EFAULT`, and the hook failed open. Nothing looked wrong from the outside: the
+  feed still rendered, egress was still enforced, and file/exec rows were quietly
+  demoted to `block~`. The walker now descends into anonymous members, and
+  `resolve_offsets` returns the *reason* it failed instead of a bare `None`.
+
+  Two tests exist so this cannot come back quietly: one reconstructs the 6.13
+  shape from a synthetic BTF blob, and one resolves against
+  `/sys/kernel/btf/vmlinux` on whatever kernel the tests are running on — the
+  check that was missing, since every previous test used a blob the test itself
+  had written.
+
+- **The pinned nightly did not pin the eBPF bytecode.** `rust-toolchain.toml`
+  governs the userspace build, but `build.rs` passed `Toolchain::default()` to
+  aya-build, which is the *floating* `nightly` — so the one artifact the pin
+  exists to protect, the bytecode that goes into the kernel and gets verified, was
+  built by whatever `rustup` had that day. `build.rs` now reads the channel out of
+  `rust-toolchain.toml`, keeping one source of truth.
+
 ### Added
+
+- **`proto: tcp | udp` on network rules (M6).** A rule can now name the transport,
+  and rules are consulted in four tiers, most specific first — protocol+port,
+  port, protocol, address:
+
+  ```yaml
+  network:
+    - { port: 53, proto: udp, action: allow }   # the resolver works...
+    - { port: 53,             action: block }   # ...but 53/tcp is a tunnel
+    - { proto: udp,           action: block }   # no other UDP, anywhere
+  ```
+
+  Each tier is its own LPM trie, keyed with the protocol leading and the port
+  behind it, so a rule that names a dimension beats one that does not whatever
+  their address prefixes — the same guarantee `port:` already made, extended one
+  dimension. Letting prefix length decide *across* dimensions instead would make
+  `{ proto: udp, action: block }` a `/0` rule that any `/8` allow outranks, and
+  "no UDP at all" would quietly not mean that.
+
+  The protocol comes from `bpf_sock_addr->protocol`, not from which hook fired:
+  `connect(2)` runs on UDP sockets too, so "connect means TCP" would file every
+  connected datagram under the wrong rule — including the DNS a program is most
+  likely to send.
+
+  ## The feed cannot see a protocol, and now says so
+
+  The `sys_enter_connect` tracepoint sees a `sockaddr`, not a socket. Where a
+  policy makes the outcome depend on the transport, the userspace mirror reports
+  the *lenient* of the two verdicts and marks it unenforceable, rather than
+  asserting a denial the kernel may not make. `--dry-run` says the same thing in
+  words.
+
+  The first attempt simply skipped the protocol tiers when the protocol was
+  unknown, which looks like the safe direction and is not: a proto-qualified
+  *allow* outranks a lower-tier block, so ignoring it made the audit record
+  `block, enforced: true` for a connection the kernel had just permitted. The
+  e2e suite caught it, and a unit test now pins the behaviour that replaced it.
+
+- **A create/delete axis — `access: create` / `delete` / `all` (M6).** `rm` is not
+  an open. Every file rule wardyn had was matched at `file_open`, and that hook
+  does not fire for `unlink(2)` at all — so a policy could guard a secret's
+  contents and still watch the agent delete it, and `rm -rf` was never a read.
+
+  ```yaml
+  files:
+    - { match: "**/*.sqlite", action: block, access: delete }  # may edit, may not remove
+    - { path:  "~/.ssh",      action: block, access: all }     # no reads, no rm, no new files
+  ```
+
+  Seven LSM hooks carry it — `inode_unlink`, `inode_rmdir`, `inode_rename`,
+  `inode_create`, `inode_mkdir`, `inode_link`, `inode_symlink` — running the same
+  three-step match as `file_open` (identity, own name, bounded ancestor walk)
+  against the same four maps. Only the test differs: a bit of the stored mask
+  instead of the `f_mode` an open requested. Sharing the maps is what keeps
+  `{ path: "~/.ssh", access: all }` one rule rather than two, and what lets an
+  approve-once exception land on a key the operator already recognises.
+
+  ## `any` still means opens only, and always will
+
+  The default is `access: any`, and it covers **no** lifecycle operation. That is
+  not an oversight to be tidied up later: `MASK_ANY` is the mask every `block`
+  rule ever written already carries, so widening it would mean every deployed
+  policy silently started refusing `rm` the day wardyn was updated — a change of
+  meaning on the rules people re-read least. `fmode::covers` therefore has no
+  zero escape hatch, and the e2e suite asserts the guarantee *in the kernel*:
+  a plain `block` on `.env`, and the agent deletes it.
+
+  Making the two axes coexist in one byte is why `OPEN_ANY` exists. `MASK_ANY` is
+  zero and zero cannot also carry a `DELETE` bit, so a mask that covers both
+  spells "every open" explicitly — and `fmode::widen` returns the canonical zero
+  whenever the result is opens-and-nothing-else, keeping map bytes identical to a
+  build that predates the axis.
+
+  ## A rename is two operations, and both ends are checked
+
+  `inode_rename` checks its **source** for `DELETE` — without it, `mv secret
+  /tmp/x` empties a protected directory one file at a time — and its
+  **destination** for `CREATE|DELETE`, without which `mv evil
+  ~/.ssh/authorized_keys` writes into one and `mv junk protected` destroys it.
+  `link` and `symlink` are hooked for the same reason: they are the other two
+  one-word ways to make a name exist.
+
+  ## The rest of the honesty budget
+
+  An approve-once exception on a lifecycle denial **narrows the stored mask**
+  rather than dropping the key — approving one `rm` must not also unblock every
+  read of the file — and the key is removed only when clearing the bit leaves
+  nothing, because writing zero back would mean `MASK_ANY`, the opposite of what
+  was granted. The hooks are gated on a `CONFIG` flag and attached only when a
+  policy asks for the axis; they attach individually, and any hook a kernel
+  refuses is named at startup instead of leaving the policy claiming something
+  the kernel is not holding. An `exec:` rule that names `create`/`delete` is
+  refused at load, because exec rules compile into maps these hooks never read.
+
+  There is no observation tracepoint for these syscalls: a removal appears in the
+  feed only when it is refused, and the row says so rather than implying a
+  missing observation.
+
+  Proven end-to-end on a BPF-LSM kernel, not asserted: the agent's `rm`, `rmdir`,
+  `touch`, `mkdir`, `mv`, `ln` and `ln -s` are each refused where a rule covers
+  them, its read of the delete-protected file still succeeds, and its `rm` of a
+  plainly-blocked `.env` still succeeds — that last one being the compatibility
+  guarantee, checked by the kernel rather than by a comment.
+
+- **Identity matching — `path:` rules (M6).** A file or exec rule can now name one
+  concrete object instead of a glob over names:
+
+  ```yaml
+  files:
+    - { match: "**/.env", action: block }   # names: covers files not created yet
+    - { path:  "~/.ssh",  action: block }   # identity: survives rename and hard-link
+  ```
+
+  A `path:` rule is resolved to `(dev, ino)` when the policy loads and enforced by
+  new `BLOCK_INODES` / `BLOCK_DIR_INODES` / `BLOCK_EXEC_INODES` maps, consulted by
+  the same LSM hooks. `mv` does not shake it off, `ln` gives a second name to the
+  same key, and `cp` is not an escape either — copying a secret means reading it,
+  and the read is what gets denied. `~` expands to the *agent's* home (read from
+  `/etc/passwd` for the drop-target uid, not `$HOME`, which under `sudo` is
+  root's); a bare name is relative to the directory wardyn was launched in.
+
+  Identity is **additive**: name maps are unchanged, so no policy loses coverage.
+  A `path:` that resolves to nothing pins nothing, and says so at startup and in
+  `--dry-run` rather than looking like protection.
+
+  Proven end-to-end, not asserted: `tests/e2e/run.sh` renames the secret, hard-links
+  it, copies it, renames the blocked directory and renames the blocked binary — and
+  then re-runs the *same agent* against the *same policy with the `path:` rules
+  stripped out*, requiring all four bypasses to reopen. Without that control run, an
+  identity assertion that passed because some name rule happened to cover the
+  renamed file would be indistinguishable from a working inode match.
+
+  The suite is now 29 assertions with **0 skips** on a BPF-LSM kernel. It was 10
+  with 1 skip, and that one skip was the entire file/exec axis.
+
+- **`port:` in network rules.** A network rule may name a destination port:
+
+  ```yaml
+  network:
+    - { cidr: "10.0.0.0/8", action: allow }              # the whole LAN
+    - { port: 25,           action: block }              # ...but never SMTP
+    - { cidr: "10.0.0.5/32", port: 25, action: allow }   # except this relay
+  ```
+
+  Port-qualified rules live in their own LPM trie (`NET_PORT_RULES`), keyed
+  `[port, address]` and consulted **before** the address-only one. So a rule that
+  names a port beats one that does not, whatever their address prefixes — which
+  is both what the kernel does and what people mean by "never SMTP". Within the
+  port trie it is longest-prefix as usual, so a specific host can be allowed back.
+  A bare `port:` with no `cidr:` covers **both** address families; a v4-only
+  reading would leave the same port open over IPv6, which is the exact shape of
+  the hole the `::/0` rule had to be added for.
+
+  Port before address in the key is forced, not stylistic: an LPM trie compares
+  from the most significant end, so address-first would put the port bits out of
+  reach of any rule that did not also fix all 32 address bits — making "port 25,
+  anywhere" inexpressible.
+
+  Protocol is deliberately not a third dimension. Behind the port it would make
+  "this protocol to this address, any port" inexpressible, and that restriction
+  is harder to explain than the expressiveness is worth. `port:` alone covers the
+  policies people actually write.
+
+  The kernel now reports **which trie decided** (`meta = KEY_PORT`), because an
+  approve-once exception must be written into the trie that denied — an allow in
+  the address trie would be overruled by the port rule on the very next connect,
+  and the operator would watch their approval do nothing. The confirm prompt is
+  also narrower for a port denial: "egress to 1.1.1.1 on port 25 only" rather
+  than "ALL egress to 1.1.1.1".
+
+- **A read/write axis for file rules.** `access: read | write | any` (default
+  `any`). `block` used to mean "cannot be opened at all", which also forbade
+  *writing* the file, so a policy could not say "the agent may create a `.env`, it
+  just may not read one". The kernel always knew the difference (`f_mode` at
+  `file_open`); the policy had no way to ask. The access mask is stored beside each
+  key in the kernel maps, and the `openat` tracepoint now carries the requested
+  access so the feed's own prediction agrees with what the hook will decide.
+
+  `any` is stored as a zero mask, not `READ|WRITE`: an `O_PATH` open requests
+  neither, and the obvious encoding would have quietly narrowed every existing rule.
+
+- **`DENIED_IDENTITY` counter.** Denials that matched on `(dev, ino)` rather than a
+  name are counted separately and reported at exit — "the rename didn't help" is a
+  claim, and a counter is the difference between a claim and a measurement. It is a
+  subset of the file/exec totals, never added to them.
+
+- **Identity denials read as a story.** A kernel denial that matched an inode is
+  rendered with the name the object has *now* and the path the policy named:
+  `hidden.txt (same object as /home/me/project/.env)`.
+
+- **`docs/WSL2.md` — Windows is a first-class dev environment.** The WSL2 kernel
+  already ships BTF, cgroup v2 and `CONFIG_BPF_LSM=y`; one `kernelCommandLine` line
+  in `.wslconfig` activates the LSM, and mounting `securityfs` makes it visible.
+  The full e2e suite passes there with **0 skipped** — the README previously told
+  Windows users to provision a VM. The document also explains why a *skip* in that
+  suite is the dangerous result: it looks like success and means the file/exec
+  assertions never ran.
 
 - **The kernel reports its own denials.** Every enforcement hook
   (`lsm/file_open`, `lsm/bprm_check_security`, `cgroup/connect4·6`,
@@ -321,11 +595,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` (`audit.yml`) runs on every branch, so a dependency change is
   reviewed before it lands rather than after.
 
-## [0.1.0] — unreleased (development)
-
-First working milestones (M1–M3):
-
-### Added
+### The three milestones underneath all of the above (M1–M3)
 
 - **M1 — Observe:** live process-tree view of `exec` / `open` / `connect`,
   scoped to a launched subtree and followed across `fork`. Structured
@@ -340,4 +610,5 @@ First working milestones (M1–M3):
   network-only enforcement when BPF LSM is unavailable.
 - Ready-made policy presets (`policies/permissive.yaml`, `policies/strict.yaml`).
 
-[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/main...HEAD
+[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.1.0

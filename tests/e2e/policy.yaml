@@ -11,14 +11,56 @@ files:
   # Directory form: the LSM hook walks every ancestor, so this must cover a file
   # nested several levels below `.ssh`, not just its direct children.
   - { match: "**/.ssh/**", action: block }
+  # Identity rules (M6). `path:` pins the OBJECT — resolved to (dev, ino) when
+  # the policy loads — so renaming or hard-linking it does not shake the rule
+  # off. Written relatively, they resolve against the directory wardyn is
+  # launched in, i.e. the project the agent is working in.
+  - { path: ".env", action: block }
+  - { path: ".ssh", action: block }
+  # Access axis: this file may be appended to, but not read back. `block` used to
+  # mean "cannot be opened at all", which forbade both.
+  - { match: "**/writable.log", action: block, access: read }
+  # Lifecycle axis (M6). `rm` is not an open, and `file_open` never fires for
+  # unlink(2) — so none of the rules above say anything about destroying the
+  # thing they protect. These do. Note what is NOT here: no `access: delete` on
+  # `.env` or `.ssh`, so the agent below can still rename them, which is what
+  # the identity assertions need — and what proves a rule written without this
+  # axis did not silently grow one.
+  - { match: "**/precious.txt", action: block, access: delete }
+  - { match: "**/forbidden.new", action: block, access: create }
+  - { match: "**/forbidden.dir/**", action: block, access: create }
+  # Identity + lifecycle together: the directory is pinned by (dev, ino), and
+  # what is pinned is the right to remove anything under it.
+  - { path: "vault", action: block, access: delete }
   - { match: "**", action: allow }
 
 network:
   - { cidr: "127.0.0.0/8", action: allow } # loopback v4
   - { cidr: "::1/128", action: allow } # loopback v6
+  # Port rules. These exercise the ordering that cannot be inferred from the
+  # list: a rule naming a `port:` is consulted BEFORE any rule that does not.
+  - { cidr: "127.0.0.2/32", action: block } # this loopback host is blocked...
+  - { cidr: "127.0.0.2/32", port: 9, action: allow } # ...except on port 9
+  - { port: 7, action: block } # and port 7 is denied everywhere, loopback included
+  # Protocol rules. One dimension further out than `port:`, and consulted before
+  # it, so these exercise the ordering that cannot be inferred from the list:
+  # a rule naming a protocol beats a longer address prefix that does not.
+  - { cidr: "127.0.0.3/32", proto: udp, action: block } # UDP here is denied...
+  #                                                      ...but TCP is still allowed by the /8
+  - { port: 11, action: block } # this port is denied...
+  - { port: 11, proto: udp, action: allow } # ...except over UDP, the most specific rule there is
+  # Protocol rules. One dimension further out than `port:`, and consulted before
+  # it, so these exercise the ordering that cannot be inferred from the list:
+  # a rule naming a protocol beats a longer address prefix that does not.
+  - { cidr: "127.0.0.3/32", proto: udp, action: block } # UDP here is denied...
+  #                                                      ...but TCP is still allowed by the /8
+  - { port: 11, action: block } # this port is denied...
+  - { port: 11, proto: udp, action: allow } # ...except over UDP, the most specific rule there is
   - { cidr: "0.0.0.0/0", action: block } # deny all other v4 egress
   - { cidr: "::/0", action: block } # deny all other v6 egress (regression guard)
 
 exec:
   - { match: "**/nc", action: block }
+  # Same, for the executable: a renamed or hard-linked copy is the same inode.
+  - { path: "nc", action: block }
   - { match: "**", action: allow }

@@ -21,6 +21,7 @@ operation by returning an error to the kernel, not after the fact.
 |---|---|---|---|---|
 | **exec** | `tracepoint/syscalls/sys_enter_execve` + `sys_enter_execveat` | LSM `bprm_check_security` | ✅ (LSM) | deny returns `-EPERM` to `execve`; both syscall variants observed so a denial can't happen off-feed |
 | **file open** (`.env`, `~/.ssh`) | `tracepoint/syscalls/sys_enter_openat` + `sys_enter_openat2` | LSM `file_open` | ✅ (LSM only) | `bpf_override_return` can't deny `openat` — not on the kernel error-injection allowlist, so blocking *requires* BPF LSM. Matches the basename, then **every ancestor directory** (bounded walk) |
+| **file create / delete** | *(none — see note)* | LSM `inode_unlink`, `inode_rmdir`, `inode_rename`, `inode_create`, `inode_mkdir` | ✅ (LSM only) | `file_open` does not fire for `unlink(2)`, so the `delete` axis needed its own hooks. Matches the same four maps as `file_open`, on a different bit of the stored mask. `inode_rename` checks **both** ends: source as a delete, destination as a create |
 | **outbound connect** | `tracepoint/syscalls/sys_enter_connect` + `sys_enter_sendto` | `cgroup/connect4·6` + `cgroup/sendmsg4·6` | ✅ (cgroup v2) | cgroup hook denies `connect()`/`sendmsg()` **without** LSM — works even on stock WSL2. `sendmsg`'s msghdr destination is enforce-only (not observed), but a denial there still reports itself |
 | **fork / child tracking** | `tracepoint/sched/sched_process_fork` (+ `sched_process_exit` to evict) | — | — | maintains the watched PID set; the parent's tgid comes from `bpf_get_current_pid_tgid` (the hook runs in the parent), the child's pid offset from tracefs at runtime |
 
@@ -123,6 +124,34 @@ Matching order is **not** uniform, and the docs used to claim it was:
 are flagged-but-never-denied, which enforce more broadly than written, and which
 allow rules the kernel's unordered set overrides.
 
+### Names vs identity
+
+A file/exec rule is written with **one** of two keys, and they answer different
+questions:
+
+| Form | Kernel key | Covers | Defeated by |
+|---|---|---|---|
+| `match: "**/.env"` | basename / ancestor-dir name | files that do not exist yet, anywhere on the system | `mv`, `ln` |
+| `path: "~/.ssh"` | `(dev, ino)`, resolved at load | *that object*, under any later name | nothing that keeps the object; only replacing it |
+
+The two are complementary and additive — a policy with both loses nothing. The
+resolution happens once, in userspace, when the policy loads: wardyn `stat`s the
+path and converts glibc's 64-bit `st_dev` into the kernel's `s_dev` packing
+(`major << 20 | minor`), which is *not* the same number. Getting that wrong
+produces a key that matches nothing, silently, so the conversion is pinned by
+tests in both directions.
+
+Why identity is worth the machinery, when `cp` still produces a new inode: to
+copy a secret you must read it, and the read is precisely what is denied. The
+loop closes. It does not close for a *binary* — that is world-readable, so there
+is no read to deny — which is why copy-then-exec remains a documented limitation
+rather than a bug.
+
+`access: read | write | any` narrows a rule to what the open asked for. The mask
+lives beside the key in the kernel map; `any` is encoded as **zero**, not
+`READ|WRITE`, because an `O_PATH` open requests neither bit and the obvious
+encoding would have quietly narrowed every pre-existing rule.
+
 ## Crate layout
 
 ```
@@ -154,24 +183,122 @@ launched subtree, and only under `--enforce`. Because `WATCHED` is seeded only i
 (system-wide blocking is out of scope, and would otherwise enforce *nothing* while
 claiming to).
 
-- **Network** — `cgroup/connect4` looks the destination IPv4 up in the `NET_RULES`
-  LPM trie (compiled from `policy.network`) and returns *deny* for a `block` verdict.
-  The trie is **longest-prefix-match**, so the userspace feed evaluates network
+- **Network** — `cgroup/connect4` consults four LPM tries, most specific first —
+  protocol+port, port, protocol, address — because that is the order in which a
+  rule *says more* about the connection in front of it. The leading fields of
+  each key (`proto`, then `port`) are always fully covered by the prefix: a rule
+  reaches one of those tries by naming them, so neither is ever a don't-care, and
+  the address behind them keeps exactly the meaning it has in the plain trie.
+
+  Two consequences worth stating. The protocol comes from
+  `bpf_sock_addr->protocol`, not from which hook fired — `connect(2)` runs on UDP
+  sockets too, so "connect means TCP" would file every connected datagram under
+  the wrong rule. And userspace **cannot** mirror the protocol tiers for an
+  *observed* connect: the `sys_enter` tracepoint sees a `sockaddr`, not a socket.
+  Where the two transports would get different verdicts, the mirror reports the
+  lenient one and marks it unenforceable rather than asserting a denial the
+  kernel may not make — the e2e suite caught an earlier version doing exactly
+  that, recording `block, enforced: true` for a connection the kernel had just
+  permitted.
+
+  Within the address tier, `connect4` consults two LPM tries, in this order:
+  1. `NET_PORT_RULES`, keyed `[port, address]`, holding every rule that named a
+     `port:`. If it hits, that answer is final.
+  2. `NET_RULES`, keyed by address alone, then `default_action` on a miss.
+
+  Both are **longest-prefix-match**, so the userspace feed evaluates network
   rules most-specific-first (not first-match) to report the same verdict the kernel
   enforces — a broad `block` CIDR before a narrow `allow` no longer disagree.
-- **File** — LSM `file_open` reads `file->f_path.dentry->d_name` (basename) and its
-  parent-dir name and returns `-EPERM` if either is in the `BLOCK_NAMES` /
-  `BLOCK_DIRS` set. Matching is **exact basename/dir**, not full-path glob (so it
-  stops accidental/naive access but is bypassable by renaming or hard-linking the
-  target — see `SECURITY.md`). Full-path matching via `bpf_d_path` is on the
-  roadmap. The `dentry`-field offsets are resolved **at runtime from the kernel's
-  BTF** (`/sys/kernel/btf/vmlinux`) and passed via `CONFIG`, falling back to the
-  built-in kernel-6.8 offsets if BTF resolution fails. (Compiler-emitted CO-RE
-  relocations are unavailable for the Rust BPF target — a `rustc`/LLVM limitation —
-  so userspace-side BTF resolution is the portable substitute.) `scripts/kernel-offsets.sh`
-  remains a manual cross-check.
-- **Exec** — LSM `bprm_check_security` applies the same basename match to
-  `linux_binprm->file` against `BLOCK_EXEC`.
+
+  **Why the port comes first in the key.** An LPM trie compares its key as one
+  bit string from the most significant end, so whatever leads is what a prefix
+  can pin *without* pinning the rest. Port-then-address is the only order that
+  can express "port 25, anywhere" — the most useful port rule there is. Address
+  first would put the port bits out of reach of any rule that did not also fix
+  all 32 address bits.
+
+  **Why a second trie rather than a wider key.** The two answer different
+  questions and the hook has to prefer one. A rule that names a port describes
+  the connection more precisely than one that does not, so the port trie wins
+  outright — `{ port: 25, action: block }` denies SMTP even inside a `/8` the
+  policy allows. Protocol is deliberately *not* a third dimension: adding it
+  would make "this protocol to this address, any port" inexpressible (its bits
+  would sit behind the port's), and a restriction that arbitrary is worse than
+  the small amount of expressiveness it buys.
+
+  Which trie decided is reported in the event (`meta = KEY_PORT`), because an
+  approve-once exception has to be written into the trie that denied — an allow
+  in the address trie would be overruled by the port rule on the next connect,
+  and the operator would watch their approval do nothing.
+- **File** — LSM `file_open` checks, in this order:
+  1. **Identity.** `file->f_inode` → `(i_ino, i_sb->s_dev)` against `BLOCK_INODES`.
+     Checked first because it is the more specific statement: a file matched by
+     inode matches whatever it is currently called, and reporting the *name* rule
+     for it would tell the operator the wrong story.
+  2. **Basename.** `file->f_path.dentry->d_name` against `BLOCK_NAMES`.
+  3. **Ancestors.** Walking `d_parent` up to `MAX_DIR_WALK` levels, checking each
+     ancestor's inode against `BLOCK_DIR_INODES` and its name against `BLOCK_DIRS`
+     — so `mv .ssh dotssh` does not expose the subtree.
+
+  Each hit is gated on the access the open requested (`file->f_mode`) matching the
+  mask stored with the key. Every offset — `f_path.dentry`, `d_name.name`,
+  `d_parent`, `f_inode`, `f_mode`, `i_ino`, `i_sb`, `s_dev`, `d_inode` — is
+  resolved **at runtime from the kernel's BTF** (`/sys/kernel/btf/vmlinux`) and
+  passed via `CONFIG`, falling back to the built-in kernel-6.8 offsets (and saying
+  why) if resolution fails. The identity reads are additionally gated on
+  `CONFIG[identity_on]`, so an unresolved offset can never become a wild kernel
+  probe. (Compiler-emitted CO-RE relocations are unavailable for the Rust BPF
+  target — a `rustc`/LLVM limitation — so userspace-side BTF resolution is the
+  portable substitute.) `scripts/kernel-offsets.sh` remains a manual cross-check.
+
+  > The BTF walker must descend into **anonymous** members. Linux 6.13 moved
+  > `f_path` into an anonymous union inside `struct file`; a walker that only
+  > inspects direct members finds nothing, falls back to the 6.8 offsets, reads
+  > the wrong words, and fails open — with the feed still looking healthy. That
+  > was live on every kernel from 6.13 until it was fixed, and is now covered by
+  > a test that resolves against the kernel the tests are running on.
+
+- **Exec** — LSM `bprm_check_security` applies the same two-step to
+  `linux_binprm->file`: `BLOCK_EXEC_INODES` by identity, then `BLOCK_EXEC` by
+  basename.
+
+- **Create / delete** — five LSM hooks (`inode_unlink`, `inode_rmdir`,
+  `inode_create`, `inode_mkdir`, `inode_rename`) run the *same* three-step match
+  as `file_open` — identity, own name, ancestor walk — against the *same* four
+  maps. Only the test differs: `fmode::covers(mask, CREATE|DELETE)` instead of
+  the `f_mode` the open requested. Sharing the maps is what keeps
+  `{ path: "~/.ssh", access: all }` one rule rather than two, and what lets an
+  approve-once exception land on a key the operator already recognises.
+
+  Three things are worth stating plainly:
+
+  1. **`MASK_ANY` does not cover this axis.** `fmode::covers` has no zero escape
+     hatch, so a mask of zero — every `block` rule written before the axis
+     existed — matches no lifecycle operation. Without that, updating wardyn
+     would have made every deployed policy start refusing `rm`. The e2e test
+     asserts it in the kernel, not in a comment.
+  2. **A negative dentry has no identity.** At `inode_create` the object does not
+     exist yet, so `inode_key_of_dentry` fails and identity matching is skipped
+     with no special case — a `create` rule can only ever pin the *name* being
+     made, or an ancestor directory. That is not a gap; it is what "this file
+     does not exist" means.
+  3. **A rename is two operations.** `inode_rename` checks the source for
+     `DELETE` (or `mv secret /tmp/x` empties a protected directory one file at a
+     time) and the destination for `CREATE|DELETE` (or `mv evil
+     ~/.ssh/authorized_keys` writes into one, and `mv junk protected` destroys
+     it). Both destination cases are reported as a refused *create*, because
+     from the destination's side that is what was attempted.
+
+  The five hooks are gated on `CONFIG[lifecycle_on]` and are only *attached* when
+  a policy asks for the axis. They attach best-effort, separately from the two
+  core hooks: `file_open` failing means wardyn cannot do its job, while
+  `inode_mkdir` failing means one axis of one rule is unenforced — and startup
+  names any hook that did not take rather than leaving the policy claiming
+  something the kernel is not holding.
+
+  There is **no observation tracepoint** for these syscalls. A removal appears in
+  the feed only when it is refused, and the row says so. Adding `sys_enter_unlink`
+  and friends would make the feed symmetric; it would not change what is enforced.
 
 **Feed/kernel reconciliation.** The basename/dir reduction is coarser than the glob
 a rule was written as (`/etc/shadow` → deny any file named `shadow`; `**/.ssh/**`

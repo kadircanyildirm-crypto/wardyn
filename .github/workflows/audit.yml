@@ -11,12 +11,13 @@ on:
       - "**/Cargo.lock"
       - "deny.toml"
       - ".github/workflows/audit.yml"
+  # No `paths:` filter here, unlike the push trigger above. `cargo-deny` is a
+  # REQUIRED status check on `main`, and a required check that is path-filtered
+  # never reports on a pull request that does not touch those paths — GitHub
+  # then waits for a status that will never arrive, and the branch cannot be
+  # merged at all. The filter saved under a minute per run and cost every
+  # dependency-free pull request its merge button.
   pull_request:
-    paths:
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - "deny.toml"
-      - ".github/workflows/audit.yml"
   schedule:
     # Weekly, so newly-disclosed advisories are caught even without a code change.
     - cron: "27 6 * * 1"

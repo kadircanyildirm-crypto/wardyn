@@ -28,7 +28,9 @@ use aya_ebpf::{
     programs::{LsmContext, SockAddrContext, TracePointContext},
 };
 use wardyn_common::{
-    action, kind, meta, stat, Event, Ip6Key, NameKey, COMM_LEN, MAX_DIR_WALK, NAME_LEN, PATH_LEN,
+    action, fmode, kind, meta, stat, Event, InodeKey, Ip6Key, NameKey, PortKey4, PortKey6,
+    ProtoKey4, ProtoKey6, ProtoPortKey4, ProtoPortKey6, COMM_LEN, MAX_DIR_WALK, NAME_LEN, PATH_LEN,
+    PORT_BITS, PROTO_BITS,
 };
 
 /// The kernel refuses GPL-only helpers (`bpf_probe_read_kernel`, which every
@@ -65,9 +67,12 @@ static WATCHED: HashMap<u32, u8> = HashMap::with_max_entries(65536, 0);
 /// instead — avoids the pthread_exit-from-leader escape), [8]/[9]/[10]/[11] LSM
 /// struct offsets (file→dentry, dentry→name, dentry→parent, binprm→file)
 /// resolved at runtime from BTF; 0 means "fall back to the built-in kernel-6.8
-/// constants".
+/// constants". [12]..[17] the identity offsets (file→inode, file→f_mode,
+/// inode→i_ino, inode→i_sb, super_block→s_dev, dentry→d_inode), and [18] the
+/// flag that says they are all trustworthy — no identity read happens unless it
+/// is set, so an unresolved offset can never turn into a wild kernel probe.
 #[map]
-static CONFIG: Array<u32> = Array::with_max_entries(16, 0);
+static CONFIG: Array<u32> = Array::with_max_entries(32, 0);
 
 /// Per-CPU counters; see [`stat`]. Per-CPU because a shared `Array` counter
 /// incremented from several CPUs loses exactly the events it is meant to count.
@@ -82,6 +87,51 @@ static NET_RULES: LpmTrie<u32, u32> = LpmTrie::with_max_entries(1024, 0);
 #[map]
 static NET_RULES6: LpmTrie<Ip6Key, u32> = LpmTrie::with_max_entries(1024, 0);
 
+/// Port-qualified rules, keyed by `[port, address]` — port first, so a prefix
+/// can pin a port without pinning an address ("never SMTP, anywhere"), which is
+/// the most useful port rule and would be inexpressible the other way round.
+///
+/// A separate trie rather than a wider key on the existing one, because the two
+/// answer different questions and the hook has to be able to prefer one: a rule
+/// that names a port describes the connection more precisely than one that does
+/// not, so this trie is consulted FIRST and its answer is final. Userspace
+/// mirrors that order exactly, or the feed would disagree with the block that
+/// really fired.
+#[map]
+static NET_PORT_RULES: LpmTrie<PortKey4, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Same, for IPv6.
+#[map]
+static NET_PORT_RULES6: LpmTrie<PortKey6, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Rules naming BOTH a protocol and a port, keyed `[proto, port, address]`.
+///
+/// Four tries now answer the same question at four specificities, and the hooks
+/// consult them in that order — proto+port, port, proto, address — because that
+/// is the order in which a rule says *more* about the connection in front of it.
+/// Letting prefix length decide across dimensions instead would make
+/// `{ proto: udp, action: block }` a `/0` rule that any `/8` allow outranks, so
+/// "no UDP at all" would quietly not mean that.
+#[map]
+static NET_PROTO_PORT_RULES: LpmTrie<ProtoPortKey4, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Same, for IPv6.
+#[map]
+static NET_PROTO_PORT_RULES6: LpmTrie<ProtoPortKey6, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Rules naming a protocol but no port, keyed `[proto, address]`.
+#[map]
+static NET_PROTO_RULES: LpmTrie<ProtoKey4, u32> = LpmTrie::with_max_entries(1024, 0);
+
+/// Same, for IPv6.
+#[map]
+static NET_PROTO_RULES6: LpmTrie<ProtoKey6, u32> = LpmTrie::with_max_entries(1024, 0);
+
+// The three name maps and the three identity maps below all store an **access
+// mask** as their value (see `wardyn_common::fmode`), not a presence flag: 0
+// means "every open", and READ/WRITE narrow the key to opens that asked for
+// that access. A rule protecting a secret should not also forbid writing it.
+
 /// Blocked file basenames (e.g. `.env`, `shadow`) — exact match, NUL-padded.
 #[map]
 static BLOCK_NAMES: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
@@ -95,6 +145,31 @@ static BLOCK_DIRS: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 #[map]
 static BLOCK_EXEC: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 
+// ── identity maps (M6) ──────────────────────────────────────────────────────
+//
+// Keyed by `(dev, ino)` — the object, not its label. A name key is shaken off by
+// a single `mv`; an inode key is not, because nothing about the object changed.
+// Nor does a hard link help: two names, one inode, one key. And a copy is not an
+// escape either, because copying a file means reading it, and the read is what
+// gets denied.
+//
+// Only `path:` rules land here, and only when userspace could `stat` them at
+// load; the hooks consult these maps in addition to the name maps, never
+// instead, so a policy that gains identity rules loses no name coverage.
+
+/// Blocked file identities.
+#[map]
+static BLOCK_INODES: HashMap<InodeKey, u8> = HashMap::with_max_entries(1024, 0);
+
+/// Blocked directory identities — matched against every ancestor of the opened
+/// file, in the same bounded walk as `BLOCK_DIRS`.
+#[map]
+static BLOCK_DIR_INODES: HashMap<InodeKey, u8> = HashMap::with_max_entries(1024, 0);
+
+/// Blocked executable identities, consulted by `bprm_check_security`.
+#[map]
+static BLOCK_EXEC_INODES: HashMap<InodeKey, u8> = HashMap::with_max_entries(1024, 0);
+
 const CFG_WATCH_ALL: u32 = 0;
 const CFG_ENFORCE: u32 = 1;
 const CFG_NET_DEFAULT: u32 = 2;
@@ -106,6 +181,34 @@ const CFG_FILE_DENTRY_OFF: u32 = 8;
 const CFG_DENTRY_NAME_OFF: u32 = 9;
 const CFG_DENTRY_PARENT_OFF: u32 = 10;
 const CFG_BPRM_FILE_OFF: u32 = 11;
+const CFG_FILE_INODE_OFF: u32 = 12;
+const CFG_FILE_MODE_OFF: u32 = 13;
+const CFG_INODE_INO_OFF: u32 = 14;
+const CFG_INODE_SB_OFF: u32 = 15;
+const CFG_SB_DEV_OFF: u32 = 16;
+const CFG_DENTRY_INODE_OFF: u32 = 17;
+/// Set when userspace resolved the extended offsets (`f_mode`, `f_inode`,
+/// `i_ino`, `i_sb`, `s_dev`, `d_inode`) from BTF. Nothing below dereferences one
+/// unless it is set, so a kernel whose layout we could not read degrades to name
+/// matching instead of probing arbitrary addresses.
+const CFG_EXT_OFFSETS: u32 = 18;
+/// Set when the extended offsets are usable **and** the policy actually has
+/// identity keys. Separate from [`CFG_EXT_OFFSETS`] so a policy with no `path:`
+/// rules skips the inode reads entirely — three per open plus four per ancestor
+/// level is not free on the hot path — while `access:` narrowing, which only
+/// needs `f_mode`, keeps working.
+const CFG_IDENTITY_ON: u32 = 19;
+/// Set when the policy has at least one port-qualified rule. Skips a trie
+/// lookup per connect for the policies that do not use them.
+const CFG_PORT_RULES_ON: u32 = 20;
+/// Set when the policy has at least one `create`/`delete` rule. The five
+/// lifecycle hooks return immediately when it is clear, so a policy that says
+/// nothing about removing or creating files pays nothing for them - and, more
+/// importantly, cannot start refusing an `rm` it never mentioned.
+const CFG_LIFECYCLE_ON: u32 = 21;
+/// Set when the policy has at least one rule naming a `proto:`. Skips two trie
+/// lookups per connect for the policies that do not use them.
+const CFG_PROTO_RULES_ON: u32 = 22;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
 // personality(persona) — persona is the 1st arg, same slot as execve's filename.
@@ -113,6 +216,9 @@ const PERSONALITY_ARG_OFFSET: usize = 16;
 // execveat(fd, filename, ...) — filename is the 2nd arg, so one slot further in.
 const EXECVEAT_FILENAME_OFFSET: usize = 24;
 const OPENAT_FILENAME_OFFSET: usize = 24;
+// openat(dfd, filename, flags, mode) — flags is the 3rd arg, one slot past the
+// filename. Same ABI-stable 16 + 8·n layout as every other syscall tracepoint.
+const OPENAT_FLAGS_OFFSET: usize = 32;
 const CONNECT_USERVADDR_OFFSET: usize = 24;
 // sendto(fd, buf, len, flags, dest_addr, addrlen) — dest_addr is the 5th arg.
 const SENDTO_UADDR_OFFSET: usize = 48;
@@ -200,13 +306,18 @@ fn in_scope(pid: u32) -> bool {
 
 #[tracepoint]
 pub fn wardyn_execve(ctx: TracePointContext) -> u32 {
-    let _ = emit_path_event(&ctx, kind::EXEC, EXECVE_FILENAME_OFFSET);
+    let _ = emit_path_event(&ctx, kind::EXEC, EXECVE_FILENAME_OFFSET, NO_FLAGS);
     0
 }
 
 #[tracepoint]
 pub fn wardyn_openat(ctx: TracePointContext) -> u32 {
-    let _ = emit_path_event(&ctx, kind::OPEN, OPENAT_FILENAME_OFFSET);
+    let _ = emit_path_event(
+        &ctx,
+        kind::OPEN,
+        OPENAT_FILENAME_OFFSET,
+        OPENAT_FLAGS_OFFSET,
+    );
     0
 }
 
@@ -215,22 +326,58 @@ pub fn wardyn_openat(ctx: TracePointContext) -> u32 {
 // never showed up in the feed. Same filename slot as openat (2nd syscall arg).
 #[tracepoint]
 pub fn wardyn_openat2(ctx: TracePointContext) -> u32 {
-    let _ = emit_path_event(&ctx, kind::OPEN, OPENAT_FILENAME_OFFSET);
+    // openat2 hides its flags inside a `struct open_how` behind a pointer, so
+    // the access is not readable from the argument slots. Reported as unknown,
+    // which makes userspace predict conservatively rather than guess.
+    let _ = emit_path_event(&ctx, kind::OPEN, OPENAT_FILENAME_OFFSET, NO_FLAGS);
     0
 }
 
 #[tracepoint]
 pub fn wardyn_execveat(ctx: TracePointContext) -> u32 {
-    let _ = emit_path_event(&ctx, kind::EXEC, EXECVEAT_FILENAME_OFFSET);
+    let _ = emit_path_event(&ctx, kind::EXEC, EXECVEAT_FILENAME_OFFSET, NO_FLAGS);
     0
 }
 
-fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -> Result<(), i64> {
+/// `flags_off` value meaning "this syscall's access mode is not readable here".
+const NO_FLAGS: usize = 0;
+
+/// The kernel's `OPEN_FMODE`: `O_RDONLY`/`O_WRONLY`/`O_RDWR` (0/1/2) become
+/// `FMODE_READ`/`FMODE_WRITE`/both, which is literally `(flags + 1) & O_ACCMODE`.
+/// Doing the same arithmetic here is what lets the feed's prediction agree with
+/// the `f_mode` the LSM hook will read.
+#[inline(always)]
+fn open_fmode(flags: u32) -> u32 {
+    (flags + 1) & 0b11
+}
+
+fn emit_path_event(
+    ctx: &TracePointContext,
+    ev_kind: u32,
+    filename_off: usize,
+    flags_off: usize,
+) -> Result<(), i64> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if !in_scope(pid) {
         return Ok(());
     }
     let filename = unsafe { ctx.read_at::<u64>(filename_off) }? as *const u8;
+    // The access the open asked for, so the feed's own verdict can honour a
+    // rule that only covers reads. Unknown (no flags slot, or an unreadable
+    // one) is reported as "both", the conservative direction: userspace then
+    // predicts as it did before rules could name an access.
+    let requested = if flags_off == NO_FLAGS {
+        if ev_kind == kind::OPEN {
+            fmode::READ | fmode::WRITE
+        } else {
+            0
+        }
+    } else {
+        match unsafe { ctx.read_at::<u64>(flags_off) } {
+            Ok(flags) => open_fmode(flags as u32),
+            Err(_) => fmode::READ | fmode::WRITE,
+        }
+    };
 
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
         bump(stat::RING_DROPS);
@@ -248,6 +395,9 @@ fn emit_path_event(ctx: &TracePointContext, ev_kind: u32, filename_off: usize) -
         (*e).daddr6 = [0u8; 16];
         (*e).dport = 0;
         (*e).family = 0;
+        (*e).dev = 0;
+        (*e).ino = 0;
+        (*e).fmode = requested;
         (*e).comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
         let dst = core::slice::from_raw_parts_mut((*e).path.as_mut_ptr(), PATH_LEN);
         (*e).path_len = match bpf_probe_read_user_str_bytes(filename, dst) {
@@ -323,6 +473,14 @@ fn emit_connect(ctx: &TracePointContext, uaddr_off: usize) -> Result<(), i64> {
         (*e).daddr6 = daddr6;
         (*e).dport = dport;
         (*e).family = family;
+        (*e).dev = 0;
+        (*e).ino = 0;
+        (*e).fmode = 0;
+        // A `sys_enter` tracepoint sees the sockaddr, not the socket, so the
+        // protocol is genuinely unknown here. Reported as 0 rather than guessed
+        // from which syscall it was: `connect(2)` is used on UDP sockets too,
+        // and a guess would put those rows under the wrong rule.
+        (*e).proto = 0;
     }
     entry.submit(0);
     Ok(())
@@ -353,6 +511,9 @@ fn emit_deny_name(ev_kind: u32, key: &[u8; NAME_LEN], meta_val: u32) {
         (*e).daddr6 = [0u8; 16];
         (*e).dport = 0;
         (*e).family = 0;
+        (*e).dev = 0;
+        (*e).ino = 0;
+        (*e).fmode = 0;
         // Fixed-width copy, no data-dependent indexing: the key is already
         // NUL-padded and userspace stops at the NUL, and a constant-length
         // memcpy is what the verifier is happiest with.
@@ -363,9 +524,56 @@ fn emit_deny_name(ev_kind: u32, key: &[u8; NAME_LEN], meta_val: u32) {
     entry.submit(0);
 }
 
-/// Emit a `DENY_NET` event for a refused destination.
+/// Emit a `DENY_FILE`/`DENY_EXEC` for an **identity** match.
+///
+/// Carries the key that matched *and* the name the object has right now. Both
+/// halves matter: userspace maps the key back to the path the policy named, and
+/// the current name is what shows the operator that the rename did not work —
+/// `hidden.txt [ino:/home/me/.env]` reads as a story, `ino 4242` does not.
 #[inline(always)]
-fn emit_deny_net(daddr: u32, daddr6: [u8; 16], dport: u16, family: u16) {
+fn emit_deny_ident(
+    ev_kind: u32,
+    dentry: *const u8,
+    name_off: usize,
+    key: &InodeKey,
+    meta_val: u32,
+) {
+    // Read the name BEFORE reserving, so a failed read cannot leak a ring entry.
+    let mut name = [0u8; NAME_LEN];
+    let _ = read_name(dentry, name_off, &mut name);
+
+    let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        bump(stat::RING_DROPS);
+        return;
+    };
+    let e = entry.as_mut_ptr();
+    unsafe {
+        (*e).kind = ev_kind;
+        (*e).action = action::BLOCK;
+        (*e).meta = meta_val;
+        (*e).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).ppid = 0;
+        (*e).uid = bpf_get_current_uid_gid() as u32;
+        (*e).comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
+        (*e).daddr = 0;
+        (*e).daddr6 = [0u8; 16];
+        (*e).dport = 0;
+        (*e).family = 0;
+        (*e).dev = key.dev;
+        (*e).ino = key.ino;
+        (*e).fmode = 0;
+        let dst = core::slice::from_raw_parts_mut((*e).path.as_mut_ptr(), PATH_LEN);
+        dst[..NAME_LEN].copy_from_slice(&name);
+        (*e).path_len = NAME_LEN as u32;
+    }
+    entry.submit(0);
+}
+
+/// Emit a `DENY_NET` event for a refused destination. `meta_val` says which trie
+/// decided ([`meta::KEY_PORT`] for a port-qualified rule, 0 for address-only) —
+/// userspace needs it to apply an exception to the right one.
+#[inline(always)]
+fn emit_deny_net(daddr: u32, daddr6: [u8; 16], dport: u16, family: u16, meta_val: u32, proto: u8) {
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
         bump(stat::RING_DROPS);
         return;
@@ -374,7 +582,7 @@ fn emit_deny_net(daddr: u32, daddr6: [u8; 16], dport: u16, family: u16) {
     unsafe {
         (*e).kind = kind::DENY_NET;
         (*e).action = action::BLOCK;
-        (*e).meta = 0;
+        (*e).meta = meta_val;
         (*e).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*e).ppid = 0;
         (*e).uid = bpf_get_current_uid_gid() as u32;
@@ -384,6 +592,7 @@ fn emit_deny_net(daddr: u32, daddr6: [u8; 16], dport: u16, family: u16) {
         (*e).daddr6 = daddr6;
         (*e).dport = dport;
         (*e).family = family;
+        (*e).proto = proto as u32;
     }
     entry.submit(0);
 }
@@ -427,13 +636,37 @@ pub fn connect4(ctx: SockAddrContext) -> i32 {
 /// Longest-prefix verdict for an IPv4 destination (network byte order, matching
 /// how `user_ip4` and the userspace-compiled `NET_RULES` keys are laid out).
 /// Shared by `connect4` and by `connect6`'s v4-mapped path.
+/// `(is it blocked, which trie decided)`. The second half is reported in the
+/// event so an exception can be applied to the trie that actually denied.
 #[inline(always)]
-fn net4_blocked(ip: u32) -> bool {
+fn net4_blocked(ip: u32, dport: u16, proto: u8) -> (bool, u32) {
+    let addr = ip.to_ne_bytes();
+    let protos_on = cfg(CFG_PROTO_RULES_ON) != 0;
+    // Most specific first, and the first answer is final — that is the whole
+    // ordering decision, and userspace's `net_verdict` makes the same one.
+    if protos_on {
+        let key = ProtoPortKey4::new(proto, dport, addr);
+        if let Some(&a) = NET_PROTO_PORT_RULES.get(&Key::new(PROTO_BITS + PORT_BITS + 32, key)) {
+            return (a == action::BLOCK, meta::KEY_PROTO_PORT);
+        }
+    }
+    if cfg(CFG_PORT_RULES_ON) != 0 {
+        let key = PortKey4::new(dport, addr);
+        if let Some(&a) = NET_PORT_RULES.get(&Key::new(PORT_BITS + 32, key)) {
+            return (a == action::BLOCK, meta::KEY_PORT);
+        }
+    }
+    if protos_on {
+        let key = ProtoKey4::new(proto, addr);
+        if let Some(&a) = NET_PROTO_RULES.get(&Key::new(PROTO_BITS + 32, key)) {
+            return (a == action::BLOCK, meta::KEY_PROTO);
+        }
+    }
     let action = NET_RULES
         .get(&Key::new(32, ip))
         .copied()
         .unwrap_or_else(|| cfg(CFG_NET_DEFAULT));
-    action == action::BLOCK
+    (action == action::BLOCK, 0)
 }
 
 /// The destination port from `bpf_sock_addr::user_port`, which holds a
@@ -442,6 +675,18 @@ fn net4_blocked(ip: u32) -> bool {
 fn dest_port(ctx: &SockAddrContext) -> u16 {
     let raw = unsafe { (*ctx.sock_addr).user_port };
     u16::from_be(raw as u16)
+}
+
+/// The socket's IP protocol (`IPPROTO_TCP` / `IPPROTO_UDP`), read from the
+/// context rather than inferred from which hook is running.
+///
+/// Inferring would be wrong in the ordinary case: `connect(2)` on a UDP socket
+/// runs `connect4`, so "connect means TCP" would file every connected datagram
+/// under the wrong protocol — and a `{ proto: udp }` rule would miss exactly the
+/// sockets a program is most likely to use for DNS.
+#[inline(always)]
+fn sock_proto(ctx: &SockAddrContext) -> u8 {
+    unsafe { (*ctx.sock_addr).protocol as u8 }
 }
 
 fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
@@ -453,9 +698,12 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(ALLOW);
     }
     let ip = unsafe { (*ctx.sock_addr).user_ip4 }; // network byte order
-    if net4_blocked(ip) {
+    let dport = dest_port(ctx);
+    let proto = sock_proto(ctx);
+    let (blocked, by) = net4_blocked(ip, dport, proto);
+    if blocked {
         bump(stat::DENIED_NET);
-        emit_deny_net(ip, [0u8; 16], dest_port(ctx), AF_INET);
+        emit_deny_net(ip, [0u8; 16], dport, AF_INET, by, proto);
         return Ok(DENY);
     }
     Ok(ALLOW)
@@ -505,17 +753,55 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         && ip6[9] == 0
         && ip6[10] == 0xff
         && ip6[11] == 0xff;
+    let dport = dest_port(ctx);
+    let proto = sock_proto(ctx);
     if v4_mapped {
         // ip6[12..16] are the embedded v4 octets in network order — the same
         // representation `net4_blocked` and `user_ip4` use.
         let ip = u32::from_ne_bytes([ip6[12], ip6[13], ip6[14], ip6[15]]);
-        if net4_blocked(ip) {
+        let (blocked, by) = net4_blocked(ip, dport, proto);
+        if blocked {
             bump(stat::DENIED_NET);
             // Report the address the operator will recognise from the feed.
-            emit_deny_net(0, ip6, dest_port(ctx), AF_INET6);
+            emit_deny_net(0, ip6, dport, AF_INET6, by, proto);
             return Ok(DENY);
         }
         return Ok(ALLOW);
+    }
+    // The same four tiers as the v4 path, in the same order.
+    let protos_on = cfg(CFG_PROTO_RULES_ON) != 0;
+    if protos_on {
+        let key = ProtoPortKey6::new(proto, dport, ip6);
+        if let Some(&a) = NET_PROTO_PORT_RULES6.get(&Key::new(PROTO_BITS + PORT_BITS + 128, key)) {
+            if a == action::BLOCK {
+                bump(stat::DENIED_NET);
+                emit_deny_net(0, ip6, dport, AF_INET6, meta::KEY_PROTO_PORT, proto);
+                return Ok(DENY);
+            }
+            return Ok(ALLOW);
+        }
+    }
+    if cfg(CFG_PORT_RULES_ON) != 0 {
+        let key = PortKey6::new(dport, ip6);
+        if let Some(&a) = NET_PORT_RULES6.get(&Key::new(PORT_BITS + 128, key)) {
+            if a == action::BLOCK {
+                bump(stat::DENIED_NET);
+                emit_deny_net(0, ip6, dport, AF_INET6, meta::KEY_PORT, proto);
+                return Ok(DENY);
+            }
+            return Ok(ALLOW);
+        }
+    }
+    if protos_on {
+        let key = ProtoKey6::new(proto, ip6);
+        if let Some(&a) = NET_PROTO_RULES6.get(&Key::new(PROTO_BITS + 128, key)) {
+            if a == action::BLOCK {
+                bump(stat::DENIED_NET);
+                emit_deny_net(0, ip6, dport, AF_INET6, meta::KEY_PROTO, proto);
+                return Ok(DENY);
+            }
+            return Ok(ALLOW);
+        }
     }
     let action = NET_RULES6
         .get(&Key::new(128, Ip6Key(ip6)))
@@ -523,7 +809,7 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         .unwrap_or_else(|| cfg(CFG_NET_DEFAULT));
     if action == action::BLOCK {
         bump(stat::DENIED_NET);
-        emit_deny_net(0, ip6, dest_port(ctx), AF_INET6);
+        emit_deny_net(0, ip6, dport, AF_INET6, 0, proto);
         return Ok(DENY);
     }
     Ok(ALLOW)
@@ -576,18 +862,49 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
 
     let name_off = off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF);
     let parent_off = off(CFG_DENTRY_PARENT_OFF, DENTRY_PARENT_OFF);
+    let ext = cfg(CFG_EXT_OFFSETS) != 0;
+    let identity = ext && cfg(CFG_IDENTITY_ON) != 0;
 
     // struct file* -> f_path.dentry
     let file: *const u8 = unsafe { ctx.arg(0) };
     let dentry = read_ptr(file, off(CFG_FILE_DENTRY_OFF, FILE_DENTRY_OFF))?;
 
+    // What did this open ask for? Only meaningful once `f_mode`'s offset is
+    // known; otherwise every mask matches, which is exactly how rules behaved
+    // before the access axis existed. Gated on `ext`, NOT on `identity`: a policy
+    // can use `access:` without a single `path:` rule, and tying the two would
+    // silently stop narrowing such a rule.
+    let requested = if ext {
+        read_u32(file, cfg(CFG_FILE_MODE_OFF) as usize).unwrap_or(ANY_ACCESS)
+    } else {
+        ANY_ACCESS
+    };
+
+    // Identity first: it is the more specific statement. A file that matches by
+    // inode matches whatever it is currently called, and reporting the *name*
+    // rule for it would tell the operator the wrong story.
+    if identity {
+        if let Ok(key) = inode_key_of_file(file) {
+            if let Some(&mask) = unsafe { BLOCK_INODES.get(&key) } {
+                if access_matches(mask, requested) {
+                    bump(stat::DENIED_FILE);
+                    bump(stat::DENIED_IDENTITY);
+                    emit_deny_ident(kind::DENY_FILE, dentry, name_off, &key, meta::KEY_INO);
+                    return Ok(EPERM);
+                }
+            }
+        }
+    }
+
     // basename: dentry->d_name.name
     let mut name = [0u8; NAME_LEN];
     read_name(dentry, name_off, &mut name)?;
-    if unsafe { BLOCK_NAMES.get(&NameKey(name)).is_some() } {
-        bump(stat::DENIED_FILE);
-        emit_deny_name(kind::DENY_FILE, &name, meta::KEY_NAME);
-        return Ok(EPERM);
+    if let Some(&mask) = unsafe { BLOCK_NAMES.get(&NameKey(name)) } {
+        if access_matches(mask, requested) {
+            bump(stat::DENIED_FILE);
+            emit_deny_name(kind::DENY_FILE, &name, meta::KEY_NAME);
+            return Ok(EPERM);
+        }
     }
 
     // Ancestor directories: dentry->d_parent->...->d_name.name. Walking the whole
@@ -603,19 +920,81 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         if parent.is_null() || parent == cur {
             break;
         }
+        // The ancestor's identity, for a `path:` rule naming a directory: this is
+        // what keeps `mv .ssh dotssh` from exposing the subtree.
+        if identity {
+            if let Ok(key) = inode_key_of_dentry(parent) {
+                if let Some(&mask) = unsafe { BLOCK_DIR_INODES.get(&key) } {
+                    if access_matches(mask, requested) {
+                        bump(stat::DENIED_FILE);
+                        bump(stat::DENIED_IDENTITY);
+                        emit_deny_ident(kind::DENY_FILE, parent, name_off, &key, meta::KEY_DIR_INO);
+                        return Ok(EPERM);
+                    }
+                }
+            }
+        }
         let mut dir = [0u8; NAME_LEN];
         if read_name(parent, name_off, &mut dir).is_err() {
             break;
         }
-        if unsafe { BLOCK_DIRS.get(&NameKey(dir)).is_some() } {
-            bump(stat::DENIED_FILE);
-            emit_deny_name(kind::DENY_FILE, &dir, meta::KEY_DIR);
-            return Ok(EPERM);
+        if let Some(&mask) = unsafe { BLOCK_DIRS.get(&NameKey(dir)) } {
+            if access_matches(mask, requested) {
+                bump(stat::DENIED_FILE);
+                emit_deny_name(kind::DENY_FILE, &dir, meta::KEY_DIR);
+                return Ok(EPERM);
+            }
         }
         cur = parent;
     }
 
     Ok(OK)
+}
+
+/// Every access a rule can name. Used when the hook could not read `f_mode`, so
+/// an unresolved offset never turns a rule OFF — it just stops narrowing it.
+const ANY_ACCESS: u32 = fmode::READ | fmode::WRITE;
+
+/// Does a key stored with `mask` cover an open that asked for `requested`?
+#[inline(always)]
+fn access_matches(mask: u8, requested: u32) -> bool {
+    fmode::matches(mask, requested)
+}
+
+/// `(dev, ino)` of the object a `struct file` refers to.
+#[inline(always)]
+fn inode_key_of_file(file: *const u8) -> Result<InodeKey, i64> {
+    let inode = read_ptr(file, cfg(CFG_FILE_INODE_OFF) as usize)?;
+    inode_key(inode)
+}
+
+/// Same, reached through a dentry (used for ancestor directories).
+#[inline(always)]
+fn inode_key_of_dentry(dentry: *const u8) -> Result<InodeKey, i64> {
+    let inode = read_ptr(dentry, cfg(CFG_DENTRY_INODE_OFF) as usize)?;
+    inode_key(inode)
+}
+
+/// `inode->i_ino` plus `inode->i_sb->s_dev`. The device matters: inode numbers
+/// are only unique within a filesystem, and without it a rule pinning
+/// `/home/agent/.env` would also deny an unrelated file that happens to have the
+/// same inode number on another mount.
+#[inline(always)]
+fn inode_key(inode: *const u8) -> Result<InodeKey, i64> {
+    if inode.is_null() {
+        return Err(0);
+    }
+    let ino: u64 = unsafe {
+        bpf_probe_read_kernel(inode.wrapping_add(cfg(CFG_INODE_INO_OFF) as usize) as *const u64)
+    }?;
+    let sb = read_ptr(inode, cfg(CFG_INODE_SB_OFF) as usize)?;
+    let dev = read_u32(sb, cfg(CFG_SB_DEV_OFF) as usize)?;
+    Ok(InodeKey { dev, _pad: 0, ino })
+}
+
+#[inline(always)]
+fn read_u32(base: *const u8, off: usize) -> Result<u32, i64> {
+    unsafe { bpf_probe_read_kernel(base.wrapping_add(off) as *const u32) }
 }
 
 #[inline(always)]
@@ -658,11 +1037,340 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     let bprm: *const u8 = unsafe { ctx.arg(0) };
     let file = read_ptr(bprm, off(CFG_BPRM_FILE_OFF, BPRM_FILE_OFF))?;
     let dentry = read_ptr(file, off(CFG_FILE_DENTRY_OFF, FILE_DENTRY_OFF))?;
+    let name_off = off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF);
+
+    // Identity first — renaming a blocked binary is the cheapest bypass there is.
+    if cfg(CFG_EXT_OFFSETS) != 0 && cfg(CFG_IDENTITY_ON) != 0 {
+        if let Ok(key) = inode_key_of_file(file) {
+            if unsafe { BLOCK_EXEC_INODES.get(&key).is_some() } {
+                bump(stat::DENIED_EXEC);
+                bump(stat::DENIED_IDENTITY);
+                emit_deny_ident(kind::DENY_EXEC, dentry, name_off, &key, meta::KEY_INO);
+                return Ok(EPERM);
+            }
+        }
+    }
+
     let mut name = [0u8; NAME_LEN];
-    read_name(dentry, off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF), &mut name)?;
+    read_name(dentry, name_off, &mut name)?;
     if unsafe { BLOCK_EXEC.get(&NameKey(name)).is_some() } {
         bump(stat::DENIED_EXEC);
         emit_deny_name(kind::DENY_EXEC, &name, meta::KEY_NAME);
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+// ── lifecycle enforcement: deny removing (and creating) blocked objects ─────
+//
+// `rm` is not an open. Every rule above this point is matched at `file_open` or
+// `bprm_check_security`, and neither hook fires for `unlink(2)` — so a policy
+// that guarded a secret's *contents* said nothing at all about destroying it,
+// and `rm -rf` was never a read. These five hooks are that axis.
+//
+// They match on the same four maps as `file_open` (names, dirs, and the two
+// inode maps), differing only in which bit of the stored mask they consult:
+// `fmode::DELETE` / `fmode::CREATE` instead of the `f_mode` the open asked for.
+// Sharing the maps is what keeps `path: ~/.ssh` one rule rather than two, and
+// what makes an approve-once exception land on a key the operator recognises.
+//
+// `fmode::covers` has no `MASK_ANY` escape hatch, and that is the whole
+// compatibility story: a mask of zero — which is every `block` rule written
+// before this axis existed — covers no lifecycle operation, so no policy starts
+// refusing an `rm` on the strength of a rule that never mentioned one.
+
+/// Consult the map holding the object's own key as a *file*.
+const SELF_FILE: u8 = 1;
+/// Consult the map holding it as a *directory*. A rename passes both, because
+/// its source can be either and the hook has no way to ask.
+const SELF_DIR: u8 = 2;
+
+/// Does a lifecycle rule refuse `op` on `dentry`? Emits the denial event and
+/// bumps the counters as a side effect, so the caller only picks the verdict.
+///
+/// The shape deliberately mirrors `try_file_open` — identity first (it is the
+/// more specific statement), then the object's own name, then the bounded
+/// ancestor walk — so a `path:` rule naming a directory covers what is *under*
+/// it here exactly as it does there.
+#[inline(always)]
+fn lifecycle_denied(dentry: *const u8, op: u8, ev_kind: u32, counter: u32, self_maps: u8) -> bool {
+    let name_off = off(CFG_DENTRY_NAME_OFF, DENTRY_NAME_OFF);
+    let parent_off = off(CFG_DENTRY_PARENT_OFF, DENTRY_PARENT_OFF);
+    let identity = cfg(CFG_EXT_OFFSETS) != 0 && cfg(CFG_IDENTITY_ON) != 0;
+
+    // The object's own identity. A negative dentry — the destination of a
+    // create, which does not exist yet — has no inode, so `inode_key_of_dentry`
+    // fails and this is skipped with no special case: there is nothing to match,
+    // which is exactly the truth about a file that has not been made.
+    if identity {
+        if let Ok(key) = inode_key_of_dentry(dentry) {
+            let dir_hit = if self_maps & SELF_DIR != 0 {
+                unsafe { BLOCK_DIR_INODES.get(&key) }
+            } else {
+                None
+            };
+            let hit = match dir_hit {
+                Some(m) => Some(m),
+                None if self_maps & SELF_FILE != 0 => unsafe { BLOCK_INODES.get(&key) },
+                None => None,
+            };
+            if let Some(&mask) = hit {
+                if fmode::covers(mask, op) {
+                    bump(counter);
+                    bump(stat::DENIED_IDENTITY);
+                    emit_deny_ident(ev_kind, dentry, name_off, &key, meta::KEY_INO);
+                    return true;
+                }
+            }
+        }
+    }
+
+    // The object's own name.
+    let mut name = [0u8; NAME_LEN];
+    if read_name(dentry, name_off, &mut name).is_ok() {
+        let dir_hit = if self_maps & SELF_DIR != 0 {
+            unsafe { BLOCK_DIRS.get(&NameKey(name)) }
+        } else {
+            None
+        };
+        let hit = match dir_hit {
+            Some(m) => Some(m),
+            None if self_maps & SELF_FILE != 0 => unsafe { BLOCK_NAMES.get(&NameKey(name)) },
+            None => None,
+        };
+        if let Some(&mask) = hit {
+            if fmode::covers(mask, op) {
+                bump(counter);
+                emit_deny_name(ev_kind, &name, meta::KEY_NAME);
+                return true;
+            }
+        }
+    }
+
+    // Ancestors. This is the rule an operator actually writes — "nothing under
+    // `~/.ssh` may be deleted" — and it is why the walk is here and not only in
+    // `file_open`.
+    let mut cur = dentry;
+    for _ in 0..MAX_DIR_WALK {
+        let Ok(parent) = read_ptr(cur, parent_off) else {
+            break;
+        };
+        if parent.is_null() || parent == cur {
+            break;
+        }
+        if identity {
+            if let Ok(key) = inode_key_of_dentry(parent) {
+                if let Some(&mask) = unsafe { BLOCK_DIR_INODES.get(&key) } {
+                    if fmode::covers(mask, op) {
+                        bump(counter);
+                        bump(stat::DENIED_IDENTITY);
+                        emit_deny_ident(ev_kind, parent, name_off, &key, meta::KEY_DIR_INO);
+                        return true;
+                    }
+                }
+            }
+        }
+        let mut dir = [0u8; NAME_LEN];
+        if read_name(parent, name_off, &mut dir).is_err() {
+            break;
+        }
+        if let Some(&mask) = unsafe { BLOCK_DIRS.get(&NameKey(dir)) } {
+            if fmode::covers(mask, op) {
+                bump(counter);
+                emit_deny_name(ev_kind, &dir, meta::KEY_DIR);
+                return true;
+            }
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// The gate every lifecycle hook opens with: enforcing, watched, and the policy
+/// actually has this axis to enforce.
+#[inline(always)]
+fn lifecycle_off() -> bool {
+    if cfg(CFG_ENFORCE) == 0 || cfg(CFG_LIFECYCLE_ON) == 0 {
+        return true;
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    !is_watched(pid)
+}
+
+/// `security_inode_unlink(struct inode *dir, struct dentry *dentry)`.
+#[lsm(hook = "inode_unlink")]
+pub fn inode_unlink(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_unlink(&ctx, SELF_FILE))
+}
+
+/// `security_inode_rmdir(struct inode *dir, struct dentry *dentry)` — the same
+/// shape, but the victim is a directory, so it is its *directory* key that has
+/// to match.
+#[lsm(hook = "inode_rmdir")]
+pub fn inode_rmdir(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_unlink(&ctx, SELF_DIR))
+}
+
+fn try_unlink(ctx: &LsmContext, self_maps: u8) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    let dentry: *const u8 = unsafe { ctx.arg(1) };
+    if lifecycle_denied(
+        dentry,
+        fmode::DELETE,
+        kind::DENY_DELETE,
+        stat::DENIED_DELETE,
+        self_maps,
+    ) {
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+/// `security_inode_create(struct inode *dir, struct dentry *dentry, umode_t)`.
+#[lsm(hook = "inode_create")]
+pub fn inode_create(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_create(&ctx, SELF_FILE))
+}
+
+/// `security_inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t)`.
+#[lsm(hook = "inode_mkdir")]
+pub fn inode_mkdir(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_create(&ctx, SELF_DIR))
+}
+
+fn try_create(ctx: &LsmContext, self_maps: u8) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    let dentry: *const u8 = unsafe { ctx.arg(1) };
+    if lifecycle_denied(
+        dentry,
+        fmode::CREATE,
+        kind::DENY_CREATE,
+        stat::DENIED_CREATE,
+        self_maps,
+    ) {
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+/// `security_inode_link(struct dentry *old_dentry, struct inode *dir,
+/// struct dentry *new_dentry)`.
+///
+/// A hard link is a name coming into existence, so it belongs to the `create`
+/// axis as much as `touch` does — and leaving it out would be a hole with a
+/// one-word bypass: `ln x ~/.ssh/authorized_keys`.
+///
+/// Only the *destination* is checked. The source is already covered wherever it
+/// matters: an identity rule denies reads through every name the object has, so
+/// a second name buys nothing (the e2e suite asserts exactly that).
+#[lsm(hook = "inode_link")]
+pub fn inode_link(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_link(&ctx))
+}
+
+fn try_link(ctx: &LsmContext) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    // The argument index is a LITERAL here, and in every other hook, because
+    // `ctx.arg(n)` compiles to `*(ctx as *const usize).add(n)` and the verifier
+    // rejects a context pointer offset by anything it cannot fold to a constant:
+    //
+    //     dereference of modified ctx ptr R8 off=16 disallowed
+    //
+    // Passing `n` as a parameter to a shared helper looks like tidier code and
+    // is not: it compiles, clippy is happy, and the program is refused at load —
+    // where wardyn fails open, so the axis is silently unenforced. Share the
+    // *matcher* (`new_name_denied`), never the argument read.
+    let dentry: *const u8 = unsafe { ctx.arg(2) };
+    if new_name_denied(dentry) {
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+/// `security_inode_symlink(struct inode *dir, struct dentry *dentry,
+/// const char *old_name)`.
+///
+/// The symlink's *target* is not the point — the name is. A `create` rule says
+/// which names may appear in a directory, and a dangling symlink occupies the
+/// name just as firmly as a file does.
+#[lsm(hook = "inode_symlink")]
+pub fn inode_symlink(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_symlink(&ctx))
+}
+
+fn try_symlink(ctx: &LsmContext) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    let dentry: *const u8 = unsafe { ctx.arg(1) };
+    if new_name_denied(dentry) {
+        return Ok(EPERM);
+    }
+    Ok(OK)
+}
+
+/// Shared by the two hooks above: a dentry that is about to become a name.
+/// Always negative, so identity never matches — which is the truth about an
+/// object that does not exist yet.
+#[inline(always)]
+fn new_name_denied(dentry: *const u8) -> bool {
+    lifecycle_denied(
+        dentry,
+        fmode::CREATE,
+        kind::DENY_CREATE,
+        stat::DENIED_CREATE,
+        SELF_FILE,
+    )
+}
+
+/// `security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+/// struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)`.
+///
+/// A rename is both operations at once, and has to be checked from the two ends
+/// it touches:
+///
+/// - the **source** disappears from where it was, which is a delete;
+/// - the **destination** is a name coming into existence, which is a create —
+///   and if a file is already there the rename destroys it, so the destination
+///   is checked for `DELETE` as well. Both are reported as a refused create,
+///   because from the destination's side that is what was attempted.
+///
+/// Without the source check, `mv secret /tmp/x` empties a protected directory
+/// one file at a time. Without the destination check, `mv evil
+/// ~/.ssh/authorized_keys` writes into one.
+#[lsm(hook = "inode_rename")]
+pub fn inode_rename(ctx: LsmContext) -> i32 {
+    lsm_verdict(try_rename(&ctx))
+}
+
+fn try_rename(ctx: &LsmContext) -> Result<i32, i64> {
+    if lifecycle_off() {
+        return Ok(OK);
+    }
+    let old_dentry: *const u8 = unsafe { ctx.arg(1) };
+    if lifecycle_denied(
+        old_dentry,
+        fmode::DELETE,
+        kind::DENY_DELETE,
+        stat::DENIED_DELETE,
+        SELF_FILE | SELF_DIR,
+    ) {
+        return Ok(EPERM);
+    }
+    let new_dentry: *const u8 = unsafe { ctx.arg(3) };
+    if lifecycle_denied(
+        new_dentry,
+        fmode::CREATE | fmode::DELETE,
+        kind::DENY_CREATE,
+        stat::DENIED_CREATE,
+        SELF_FILE | SELF_DIR,
+    ) {
         return Ok(EPERM);
     }
     Ok(OK)

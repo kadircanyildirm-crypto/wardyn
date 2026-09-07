@@ -51,6 +51,8 @@ In scope — issues that let a **watched** process:
 
 - read a file, run a binary, or open a network connection that policy marks
   `block`, while `--enforce` is active and the rule is kernel-enforceable;
+- delete, rename away, or create a file that a rule marks `block` with
+  `access: create`, `delete` or `all`, under the same conditions;
 - escape the watched subtree so its children are no longer followed;
 - crash, hang, or otherwise disable Wardyn from userspace.
 
@@ -63,9 +65,15 @@ Out of scope (known limitations, documented, not vulnerabilities):
   basename or parent-directory name, and default-deny on files/exec, are flagged
   in the feed but **not** kernel-enforced. The feed labels these honestly
   (`block~`).
-- **Kernel-offset drift.** File/exec enforcement reads `dentry` fields at offsets
-  derived for a specific kernel. On a mismatched kernel these reads may silently
-  fail; Wardyn warns at startup. Regenerate with `scripts/kernel-offsets.sh`.
+- **Kernel-offset drift.** File/exec enforcement reads `struct file`, `dentry` and
+  `inode` fields by byte offset. Wardyn resolves them from the running kernel's
+  BTF, including through anonymous members (Linux 6.13 moved `f_path` into an
+  anonymous union — a resolver that missed that failed open on every kernel since,
+  which is why the resolution is now tested against the kernel the tests run on).
+  If resolution fails, Wardyn falls back to built-in kernel-6.8 offsets, names the
+  reason at startup, and stops predicting `BLOCK` for file/exec rows unless the
+  running kernel really is 6.8. `scripts/kernel-offsets.sh` is a manual
+  cross-check.
 - **Requires privilege you already granted.** Wardyn needs root to load eBPF; it
   does not defend against an attacker who is already root outside the watched
   subtree. To keep the watched subtree from being that attacker, `run` now drops
@@ -74,14 +82,80 @@ Out of scope (known limitations, documented, not vulnerabilities):
   choose the target identity. A child kept at root can still reach the enforcement
   maps and disable itself — do not run untrusted agents with `--keep-root`.
 
-- **Name-based file/exec matching is content-blind.** The LSM matcher keys on a
-  file's basename and on the names of its ancestor directories (a bounded walk, so
-  a `**/dir/**` rule does cover the whole subtree). It stops *accidental and naive*
-  access but is **bypassable** by renaming or hard-linking the target before
-  opening it (`mv`/`link()` are not hooked) or by copying a blocked binary to a new
-  name. Treat it as a guard against mistakes, not a defence against deliberate
-  exfiltration. Full-path matching (`bpf_d_path`) and `(dev, ino)` keying are on the
-  roadmap.
+- **`match:` rules are name-based, and a name comes off with one `mv`.** The LSM
+  matcher keys a glob rule on the file's basename and on the names of its ancestor
+  directories (a bounded walk, so a `**/dir/**` rule does cover the whole subtree).
+  That stops *accidental and naive* access, and is **bypassable** by renaming or
+  hard-linking the target before opening it: a rule that does not name
+  `access: delete` permits the `mv`, and `link()` is only consulted for the name
+  it creates, never the object it aliases. Write a `path:` rule alongside it for
+  anything that matters: those are pinned to `(dev, ino)` at load and follow the
+  object through renames and hard links, so the bypass buys nothing.
+
+- **What identity matching still does not cover.**
+  - **Objects that do not exist when the policy loads** cannot be pinned. A `path:`
+    rule for a file created later resolves to nothing and says so at startup and
+    in `--dry-run`; only the `match:` rule covers it. Keep both.
+  - **Copying a blocked *binary*** to a new name still runs it: the copy is a
+    different inode with a different name, and — unlike a secret — a binary is
+    world-readable, so there is no read to deny. Closing this needs content or
+    provenance matching, not identity. The e2e suite pins this as a known limit,
+    so it cannot quietly start being claimed as fixed.
+  - **Copying a blocked *secret*** is not a bypass: `cp` has to read the source,
+    and that read is denied. This is asserted end-to-end.
+  - **Filesystems that report a different `(dev, ino)` to userspace than the
+    inode carries** — overlayfs without `xino`, most visibly inside containers —
+    can make an anchor fail to match. It fails *open*, degrading to the name rule,
+    and never denies the wrong object: the key simply matches nothing.
+
+- **A `proto:` rule is enforced but not predicted.** The kernel reads the
+  socket's protocol; the connect tracepoint cannot, because it sees a `sockaddr`
+  and not a socket. Where a policy makes a destination's verdict depend on the
+  transport, the observed feed row reports the lenient verdict and does **not**
+  claim enforcement — the kernel's own `DENY_NET` row is what reports a denial.
+  A row that says `ok` followed by a kernel `⛔BLOCK` for the same destination is
+  this, working as intended.
+
+- **`proto:` names a transport, not a payload.** `{ proto: udp, action: block }`
+  refuses UDP sockets; it says nothing about what is tunnelled over the transports
+  that remain, and DNS-over-HTTPS or a shell over 443/tcp are not protocol-level
+  events. Rules are matched at `connect`/`sendmsg`, so a raw socket
+  (`SOCK_RAW`, `AF_PACKET`) or an already-established connection is outside what
+  these hooks see at all.
+
+- **Rules are matched, not the intent behind them.** `access: read` narrows a rule
+  to opens requesting `FMODE_READ`. An `O_PATH` open requests neither read nor
+  write and is covered only by a rule with no `access:` (the default), or by
+  `access: all`.
+
+- **A `block` rule on its own says nothing about deleting.** `file_open` does not
+  fire for `unlink(2)`, so an ordinary `block` protects a file's *contents* and
+  leaves `rm` untouched. That is deliberate and permanent: making the default
+  cover removals would change the meaning of every policy already written. Use
+  `access: delete` (or `all`), and check `wardyn --dry-run`, which prints
+  `DELETING` beside the keys that really have it.
+
+- **What the `delete` axis does not protect.** It protects the *name*, not the
+  bytes. An agent that may still write the file can empty it (`> secret`,
+  `truncate`, or an in-place rewrite) without ever unlinking anything, and no
+  lifecycle hook fires. If the contents matter, deny the write as well —
+  `access: all` does both. Similarly, `create` governs which names may appear
+  (`open(O_CREAT)`, `mkdir`, `link`, `symlink`, and a rename's destination); it
+  cannot govern what is written into a name that already exists.
+
+- **`create` rules can only match names and ancestors, never identity.** At
+  `inode_create` the object does not exist, so there is no `(dev, ino)` to pin.
+  A `path:` rule therefore contributes nothing to the create axis for the file
+  itself — only for the directory it would appear in, which is the useful case
+  (`{ path: "~/.ssh", access: all }` refuses a new `authorized_keys` however it
+  is spelled).
+
+- **The lifecycle hooks are attached best-effort.** `file_open` and
+  `bprm_check_security` are load-bearing and a failure to attach either disables
+  LSM enforcement outright. The seven create/delete hooks are attached
+  individually, and any that a kernel refuses are **named at startup** while the
+  rest keep working — a policy is never left quietly claiming an axis the kernel
+  is not holding. They are attached only when a policy asks for the axis.
 
 - **Rule *order* does not survive into the kernel.** Under `--enforce` the LSM hook
   holds an unordered set of block keys, so an `allow` rule listed before a `block`

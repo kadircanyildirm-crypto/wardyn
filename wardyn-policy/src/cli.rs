@@ -46,6 +46,13 @@ pub struct Opts {
     pub policy_path: Option<PathBuf>,
     pub audit_path: PathBuf,
     pub denials_path: Option<PathBuf>,
+    /// Where approvals that outlive the run are stored. `None` means the
+    /// built-in system path; approvals are never kept in the working directory,
+    /// because the agent can write there and would be granting its own.
+    pub overrides_path: Option<PathBuf>,
+    /// How long a newly stored approval lasts, in days. `0` disables storing
+    /// them for this run: the TUI's persist key becomes a no-op and says so.
+    pub override_ttl_days: u32,
     pub keep_root: bool,
     pub as_user: Option<String>,
     pub mode: Mode,
@@ -71,6 +78,8 @@ pub const USAGE: &str = "wardyn — a kernel-level warden for AI coding agents\n
      --policy <path>   policy file (default: ./policy.yaml, else embedded)\n  \
      --audit <path>    JSONL audit log (default: ./wardyn-audit.jsonl)\n  \
      --denials <path>  agent-readable denial receipt, exported as WARDYN_DENIALS (--enforce only)\n  \
+     --overrides <path>  stored approvals (default: /var/lib/wardyn/overrides.yaml)\n  \
+     --override-ttl <days>  how long a stored approval lasts (default: 30, 0 disables storing)\n  \
      --as-user <spec>  run the agent as uid[:gid] instead of root (default: $SUDO_UID)\n  \
      --keep-root       do NOT drop the agent's privileges (unsafe under --enforce)\n  \
      -h, --help        print this help\n  \
@@ -89,6 +98,8 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
     let mut policy_path = None;
     let mut audit_path = PathBuf::from("wardyn-audit.jsonl");
     let mut denials_path = None;
+    let mut overrides_path = None;
+    let mut override_ttl_days = crate::overrides::DEFAULT_TTL_DAYS;
     let mut keep_root = false;
     let mut as_user = None;
 
@@ -137,6 +148,26 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
             Some("--keep-root") => {
                 keep_root = true;
                 it.next();
+            }
+            Some("--overrides") => {
+                it.next();
+                overrides_path = Some(PathBuf::from(value(&mut it, "--overrides", "a path")?));
+            }
+            Some("--override-ttl") => {
+                it.next();
+                let raw = value(&mut it, "--override-ttl", "a number of days")?;
+                let s = raw.to_string_lossy();
+                override_ttl_days = s.parse::<u32>().map_err(|_| {
+                    anyhow::anyhow!("--override-ttl needs a whole number of days, got `{s}`")
+                })?;
+                // An approval that never expires is the thing this feature is
+                // built to avoid, so there is no "forever" value: 0 means "do
+                // not store approvals at all", which is the honest opposite.
+                anyhow::ensure!(
+                    override_ttl_days <= 3650,
+                    "--override-ttl of {override_ttl_days} days is longer than this tool should \
+                     vouch for; use a shorter window and re-approve"
+                );
             }
             Some("--as-user") => {
                 it.next();
@@ -193,6 +224,8 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
         policy_path,
         audit_path,
         denials_path,
+        overrides_path,
+        override_ttl_days,
         keep_root,
         as_user,
         mode,
@@ -282,6 +315,45 @@ mod tests {
         );
         assert!(parse(&["--policy"]).is_err());
         assert!(parse(&["--as-user", "--plain"]).is_err());
+        assert!(parse(&["--overrides"]).is_err());
+        assert!(parse(&["--override-ttl", "--enforce"]).is_err());
+    }
+
+    #[test]
+    fn override_ttl_takes_days_and_refuses_nonsense() {
+        assert_eq!(
+            parse(&["--override-ttl", "7", "run", "--", "x"])
+                .unwrap()
+                .override_ttl_days,
+            7
+        );
+        // 0 is meaningful: store nothing this run.
+        assert_eq!(
+            parse(&["--override-ttl", "0", "run", "--", "x"])
+                .unwrap()
+                .override_ttl_days,
+            0
+        );
+        assert!(parse(&["--override-ttl", "week"]).is_err());
+        assert!(parse(&["--override-ttl", "-3"]).is_err());
+        // There is deliberately no "forever": an approval nobody revisits is
+        // exactly the hole this feature exists to keep from opening.
+        assert!(parse(&["--override-ttl", "99999"]).is_err());
+    }
+
+    #[test]
+    fn overrides_default_to_the_system_path_not_the_working_directory() {
+        let o = parse(&["run", "--", "x"]).unwrap();
+        assert!(
+            o.overrides_path.is_none(),
+            "None means the built-in system path; anything derived from the cwd would let the \
+             agent grant its own approvals"
+        );
+        assert_eq!(o.override_ttl_days, crate::overrides::DEFAULT_TTL_DAYS);
+    }
+
+    #[test]
+    fn a_bare_dash_is_a_value_not_a_flag() {
         // A bare `-` is a legitimate value (stdin convention), not a flag.
         assert_eq!(
             parse(&["--audit", "-", "run", "bash"])
