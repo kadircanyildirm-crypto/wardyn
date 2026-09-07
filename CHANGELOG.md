@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-09-07
+
+The first release. Wardyn watches one process subtree — an agent and everything
+it spawns — and, under `--enforce`, denies what the policy forbids *at the
+syscall boundary*, before the action completes.
+
+What it can deny, in the kernel:
+
+| axis | rule | hooks |
+| --- | --- | --- |
+| **network egress** | `cidr:` / `domain:`, narrowed by `port:` and `proto:` | `cgroup/connect4·6`, `cgroup/sendmsg4·6` |
+| **secret reads** | `match:` (a glob over names) or `path:` (one object, by `(dev, ino)`), narrowed by `access: read \| write` | LSM `file_open` |
+| **blocked programs** | the same two forms | LSM `bprm_check_security` |
+| **deletion and creation** | `access: create \| delete \| all` | LSM `inode_unlink` / `rmdir` / `rename` / `create` / `mkdir` / `link` / `symlink` |
+
+Three properties are worth stating plainly, because they are what the design
+spends itself on:
+
+- **The hook that decides is the hook that reports.** An observed `sys_enter`
+  path can be relative, symlinked, or reached through a dirfd — so every denial
+  is reported by the enforcement hook itself, naming the key it matched, and
+  userspace renders that rather than re-deriving it. At exit the kernel's own
+  counters are compared against everything the agent was told.
+- **Wardyn fails open, and says so.** A verifier rejection, a failed attach, an
+  unresolvable struct offset — each degrades to allowing the operation, names the
+  reason at startup, and stops predicting `BLOCK` for the rows it can no longer
+  promise. A security tool that silently enforces nothing is worse than one that
+  admits it.
+- **A rule means one thing before and after an upgrade.** `access:` defaults to
+  covering opens only, and the create/delete axis is opt-in, so no policy written
+  against an earlier build changed meaning when this one shipped. The end-to-end
+  suite asserts that in the kernel rather than in a comment.
+
+Requires a Linux kernel with BTF and cgroup v2; file, exec and lifecycle
+enforcement additionally require the BPF LSM (`lsm=...,bpf`). Without it, network
+egress blocking still works and startup says the rest is off.
+
+Known limits are documented in [SECURITY.md](SECURITY.md) and pinned by the e2e
+suite so they cannot quietly start being claimed as fixed — most notably that
+copying a *blocked binary* to a new name still runs it.
+
 ### Fixed
 
 - **A rejected eBPF program could pass the verifier smoke test as an environment
@@ -554,11 +595,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` (`audit.yml`) runs on every branch, so a dependency change is
   reviewed before it lands rather than after.
 
-## [0.1.0] — unreleased (development)
-
-First working milestones (M1–M3):
-
-### Added
+### The three milestones underneath all of the above (M1–M3)
 
 - **M1 — Observe:** live process-tree view of `exec` / `open` / `connect`,
   scoped to a launched subtree and followed across `fork`. Structured
@@ -573,4 +610,5 @@ First working milestones (M1–M3):
   network-only enforcement when BPF LSM is unavailable.
 - Ready-made policy presets (`policies/permissive.yaml`, `policies/strict.yaml`).
 
-[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/main...HEAD
+[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.1.0
