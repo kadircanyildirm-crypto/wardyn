@@ -462,6 +462,10 @@ Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) for the d
 setup (nightly + `bpf-linker`, Linux/VM) and the checks CI runs. Please be kind;
 we follow a [Code of Conduct](./CODE_OF_CONDUCT.md).
 
+[GOVERNANCE.md](./GOVERNANCE.md) says who decides, what gets accepted, and —
+more usefully before you depend on this — what the project does *not* promise.
+It is maintained by one person, and says so.
+
 ## Security
 
 Wardyn runs as root and loads eBPF into the kernel. Found a vulnerability? Please

@@ -1128,7 +1128,10 @@ fn apply_containment(
         .collect();
     if !unresolved.is_empty() {
         bail!(
-            "allow_paths: could not resolve {} — `~` needs the agent's home (run via sudo or pass              --as-user) and a relative path needs a working directory. Refusing to start: an              allowlist missing an entry confines the agent out of something it needs, and the              failure would look like a broken agent rather than a policy gap",
+            "allow_paths: could not resolve {} — `~` needs the agent's home (run via sudo or pass \
+             --as-user) and a relative path needs a working directory. Refusing to start: an \
+             allowlist missing an entry confines the agent out of something it needs, and the \
+             failure would look like a broken agent rather than a policy gap",
             unresolved.join(", ")
         );
     }
@@ -1142,7 +1145,8 @@ fn apply_containment(
         .collect();
 
     let ruleset = landlock::Ruleset::build(&built).context(
-        "building the Landlock ruleset for `allow_paths:` — the policy asks for containment this          kernel cannot provide",
+        "building the Landlock ruleset for `allow_paths:` — the policy asks for containment this \
+         kernel cannot provide",
     )?;
 
     if !ruleset.unresolved.is_empty() {
@@ -1152,7 +1156,8 @@ fn apply_containment(
             .map(|(p, why)| format!("{} ({why})", p.display()))
             .collect();
         bail!(
-            "allow_paths: could not grant {} — refusing to start rather than confining the agent              out of a hierarchy the policy says it may use",
+            "allow_paths: could not grant {} — refusing to start rather than confining the agent \
+             out of a hierarchy the policy says it may use",
             detail.join(", ")
         );
     }
@@ -1521,7 +1526,9 @@ async fn run() -> anyhow::Result<i32> {
     if let (Some(pp), Some((uid, _))) = (policy.source().path(), resolve_target_identity(&opts)) {
         if path_is_writable_by(pp, uid) {
             notices.push(format!(
-                "the policy file {} is writable by the agent (uid {uid}) — it could rewrite the                  rules that constrain it before the next run. Keep the policy where the agent                  cannot write if that matters.",
+                "the policy file {} is writable by the agent (uid {uid}) — it could rewrite the \
+                 rules that constrain it before the next run. Keep the policy where the agent \
+                 cannot write if that matters.",
                 pp.display()
             ));
         }
@@ -1555,9 +1562,24 @@ async fn run() -> anyhow::Result<i32> {
         // And the converse: a block glob that reduced to a bare name enforces
         // MORE broadly than written, because the LSM hook matches names.
         for (pat, reach) in policy.overbroad_block_keys() {
+            // A pattern that is already an absolute literal path has an exact
+            // answer available, and saying so turns a warning the operator can
+            // only note into one they can act on. `path:` keys on `(dev, ino)`,
+            // which is anchored where a name is not, and survives `mv` besides.
+            // Offered only for an absolute globless pattern that resolves
+            // today, because that is the only shape `path:` can take over
+            // verbatim.
+            let remedy = if pat.starts_with('/')
+                && !pat.contains(['*', '?', '[', ']'])
+                && std::path::Path::new(&pat).exists()
+            {
+                format!(" Write `{{ path: \"{pat}\", action: block }}` to pin exactly that file.")
+            } else {
+                String::new()
+            };
             notices.push(format!(
                 "policy `{pat}` (block) enforces on {reach} — the kernel matches by name, so it \
-                 will also deny paths the glob wouldn't."
+                 will also deny paths the glob wouldn't.{remedy}"
             ));
         }
         // Rule ORDER does not exist in the kernel: an allow before a block does
@@ -2585,7 +2607,8 @@ pub(crate) fn refresh_domains(ctx: &mut RunCtx<'_>) -> Vec<Desc> {
         // this silent would put the feed and the kernel into exactly the
         // disagreement the mirror exists to prevent.
         rows.push(notice_row(&format!(
-            "domain re-resolution could not be applied to the kernel ({e:#}) — the feed may now              disagree with what is enforced"
+            "domain re-resolution could not be applied to the kernel ({e:#}) — the feed may now \
+             disagree with what is enforced"
         )));
         return rows;
     }
@@ -2608,7 +2631,8 @@ pub(crate) fn refresh_domains(ctx: &mut RunCtx<'_>) -> Vec<Desc> {
     }
     for d in &refresh.failed {
         rows.push(notice_row(&format!(
-            "domain `{d}` resolved to nothing — that rule is enforcing NOTHING until it resolves              again. Use `cidr:` for anything security-critical."
+            "domain `{d}` resolved to nothing — that rule is enforcing NOTHING until it resolves \
+             again. Use `cidr:` for anything security-critical."
         )));
     }
     rows

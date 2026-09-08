@@ -13,11 +13,14 @@ disclosure.
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | ✅ (latest `main`) |
-| < 0.1   | ❌        |
+| 0.3.x   | ✅ (current release, and latest `main`) |
+| < 0.3   | ❌ |
 
 Only the latest commit on `main` and the most recent tagged release receive
-security fixes while the project is pre-1.0.
+security fixes while the project is pre-1.0. There is no backport window, and
+no version has a support end-date to plan around — see
+[GOVERNANCE.md](GOVERNANCE.md), which says what this project does and does not
+promise.
 
 ## Reporting a vulnerability
 
