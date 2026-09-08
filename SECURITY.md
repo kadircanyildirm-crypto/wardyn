@@ -72,7 +72,11 @@ Out of scope (known limitations, documented, not vulnerabilities):
   which is why the resolution is now tested against the kernel the tests run on).
   If resolution fails, Wardyn falls back to built-in kernel-6.8 offsets, names the
   reason at startup, and stops predicting `BLOCK` for file/exec rows unless the
-  running kernel really is 6.8. `scripts/kernel-offsets.sh` is a manual
+  running kernel really is 6.8 **and the machine is x86_64**, which is where
+  those numbers were measured. Field offsets are not guaranteed to agree across
+  architectures on one release — distro configs differ and several members of
+  `struct file` sit behind `#ifdef` — so on arm64 the built-ins are never
+  trusted and BTF resolution is effectively required. `scripts/kernel-offsets.sh` is a manual
   cross-check.
 - **Requires privilege you already granted.** Wardyn needs root to load eBPF; it
   does not defend against an attacker who is already root outside the watched

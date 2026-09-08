@@ -24,16 +24,29 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: x86_64-unknown-linux-musl
 
 jobs:
   build:
-    name: build + verify
-    runs-on: ubuntu-latest
+    name: build + verify (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      # One leg failing must not hide whether the other one works: a release
+      # that ships x86_64 and quietly drops arm64 is worse than one that fails.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    env:
+      TARGET: ${{ matrix.target }}
     outputs:
+      # Both legs compute this from the same Cargo.toml, so whichever finishes
+      # last writes the same string. (Matrix outputs are last-writer-wins; that
+      # is only safe because the value cannot differ between legs.)
       version: ${{ steps.version.outputs.version }}
-      pkg: ${{ steps.package.outputs.pkg }}
     steps:
       - uses: actions/checkout@v7
 
@@ -58,6 +71,12 @@ jobs:
           rustup target add "$TARGET"
           rustup show active-toolchain
 
+      # Each target is built on its OWN architecture rather than cross-compiled.
+      # The verification below runs the binary — `--dry-run` against every
+      # shipped policy — and a cross-built artifact could not be started on the
+      # builder, which would reduce "we ran it" to "it linked". GitHub's arm64
+      # runners are free for public repositories, so the honest option is also
+      # the cheap one.
       - name: Install musl toolchain
         run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends musl-tools
 
@@ -131,6 +150,27 @@ jobs:
           path: dist/*.tar.gz*
           if-no-files-found: error
 
+      # The eBPF object is embedded in the binary by build.rs, so it is built
+      # once per architecture too. Record which programs made it in, because a
+      # silently missing program is a silently unenforced axis — the exact
+      # failure `verifier_smoke` exists for, and it cannot run here (no root).
+      - name: Report the embedded eBPF programs
+        run: |
+          set -euo pipefail
+          obj="$(find target -name wardyn -path '*bpfel*' -type f | head -1)"
+          if [[ -z "$obj" ]]; then
+            echo "::error::no eBPF object was built into the ${TARGET} binary"
+            exit 1
+          fi
+          # -W, or readelf truncates section names to fit a column and the
+          # report says `cgroup/c` — which is unreadable for the one thing it
+          # is here to show. Not asserted against a count: every tracepoint
+          # program shares a single `tracepoint` section, so sections are not
+          # programs. `verifier_smoke` is the check that names them all, and it
+          # needs root, which a release runner does not have.
+          echo "embedded eBPF programs (${TARGET}):"
+          readelf -SW "$obj" | grep -oE '(lsm|cgroup|tracepoint)/[a-z0-9_]+' | sort -u | sed 's/^/  /'
+
   publish:
     name: publish release
     needs: build
@@ -141,9 +181,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Every leg's tarball, not one named artifact: the matrix produces one per
+      # architecture and a release that published only the first would be worse
+      # than one that published none, because nobody would notice.
       - uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.build.outputs.pkg }}
+          pattern: wardyn-v*
+          merge-multiple: true
           path: dist
 
       - name: Write release notes
@@ -151,11 +195,13 @@ jobs:
           cat > /tmp/notes.md <<'NOTES'
           See [CHANGELOG.md](CHANGELOG.md) for what changed.
 
-          **Install** — Linux x86_64, statically linked, no glibc requirement.
-          The eBPF object is embedded; this one file is the whole tool.
+          **Install** — Linux, statically linked, no glibc requirement. Two
+          builds: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`,
+          each built and started on its own architecture. The eBPF object is
+          embedded; this one file is the whole tool.
 
           ```bash
-          tar xzf wardyn-*-x86_64-unknown-linux-musl.tar.gz
+          tar xzf wardyn-*-$(uname -m)-unknown-linux-musl.tar.gz
           cd wardyn-*/
           ./wardyn --dry-run --policy policy.yaml     # what will this policy do? (no root)
           sudo ./wardyn --enforce run -- bash         # watch and block an agent's subtree
