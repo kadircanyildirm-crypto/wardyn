@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-08
+
+Wardyn gained the shape it was missing, and lost three ways of being wrong about
+itself.
+
+### The shape: containment
+
+Everything in 0.1.0 was a **blocklist** — name what is forbidden, and whatever
+the policy forgot stays reachable. `allow_paths:` is the other half, and it is a
+different kernel mechanism:
+
+```yaml
+allow_paths:
+  - { path: "/usr", rights: [read, exec] }
+  - { path: "/etc", rights: [read] }
+  - { path: ".",    rights: [read, write, exec] }   # the project
+```
+
+The agent reaches those hierarchies and nothing else. Landlock enforces it,
+which means it needs no privilege, is inherited by every descendant, and cannot
+be undone — it holds even where the eBPF half would not. Containment removes
+everything outside; the block rules still deny specific objects inside what is
+left; egress stays eBPF's alone.
+
+### Three ways it had been wrong about itself
+
+A tool that reports on a kernel has one job it cannot fail at: saying what
+actually happened. Three places where it did not, all found and fixed here.
+
+- **The feed said `ok` for opens Landlock had just refused.** Different LSM, its
+  denials never reach wardyn's hooks. Found while recording the demo — the video
+  would have shown the tool lying.
+- **`domain:` rules were frozen at load.** Every name in the default policy is
+  CDN-fronted, so a long session watched allowlisted traffic start hitting the
+  deny-all. Users read that as flakiness, and flakiness is how a security tool
+  gets switched off.
+- **A `match:` glob was reduced to its last segment**, so `/etc/shadow` denied
+  every file called `shadow`. A rule whose kernel key is broader than its text
+  is the failure this project exists to refuse.
+
+### Reach
+
+`--format json` makes wardyn pipeable into anything that reads a log, with a
+schema documented as a versioned interface. arm64 builds ship beside x86_64,
+each built *and started* on its own architecture. And there are finally
+published overhead numbers, measured as a slope so startup cancels out.
+
+### Upgrading from 0.1.0
+
+Policies keep working. Two changes are visible:
+
+- A `match:` glob now keeps its last **two** literal segments, so
+  `**/.aws/credentials` stops denying every file named `credentials`. Rules get
+  narrower, never wider — check `--dry-run` if you were relying on the
+  over-reach.
+- The audit log gained `schema_version` and `matched_key` on every record.
+  Existing fields are unchanged.
+
 ### Added
 
 - **`allow_paths:` — filesystem containment, via Landlock.** Everything wardyn
@@ -829,5 +887,6 @@ copying a *blocked binary* to a new name still runs it.
   network-only enforcement when BPF LSM is unavailable.
 - Ready-made policy presets (`policies/permissive.yaml`, `policies/strict.yaml`).
 
-[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.1.0
