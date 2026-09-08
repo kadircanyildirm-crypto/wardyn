@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An agent could get root to append to any file, through the audit log.** The
+  default `--audit` path is *relative*, so it lands in the directory wardyn was
+  launched in — which for the documented `cd project && sudo wardyn run --
+  agent` is a directory the **watched agent can write**. The log was opened
+  without `O_NOFOLLOW`, so an agent that dropped a symlink named
+  `wardyn-audit.jsonl` before wardyn started got root to append JSON — whose
+  `detail` and `comm` fields it partly controls — to whatever it pointed at.
+
+  Demonstrated before it was fixed, and a regression test now performs the same
+  attack and asserts the target is untouched.
+
+  The log is now opened `O_NOFOLLOW` and, on the resulting **descriptor** rather
+  than the path, checked for being a regular file, owned by wardyn, and not
+  writable by group or others. Any of those failing is a refusal, matching the
+  standard `overrides_file` already held. New logs are created `0600`: the file
+  names every path the agent touched, which is the map of a project an attacker
+  would want.
+
+  The remaining exposure is the *directory*, which cannot be fixed from here —
+  records written during the run are safe, since appends follow the descriptor,
+  but the finished file can be swapped afterwards. Startup now says so when the
+  audit directory is writable by the agent's uid.
+
 ### Changed
 
 - **The kernel-side crates are dual-licensed `GPL-2.0-only OR

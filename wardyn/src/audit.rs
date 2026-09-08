@@ -7,9 +7,10 @@
 //! a noisy run, so the count is reported at exit.
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 
 use wardyn_policy::policy::Action;
 
@@ -70,21 +71,107 @@ pub struct Audit {
 }
 
 impl Audit {
+    /// Open (or create) the audit log, refusing anything that would make it
+    /// something other than a record only wardyn writes.
+    ///
+    /// The default path is *relative*, so it usually lands in the directory
+    /// wardyn was launched in — which for the documented `cd project && sudo
+    /// wardyn run -- agent` is a directory the **watched agent can write**.
+    /// That makes every check below load-bearing rather than ceremonial:
+    ///
+    /// * **`O_NOFOLLOW`.** Without it, an agent that drops a symlink named
+    ///   `wardyn-audit.jsonl` before wardyn starts gets root to append attacker-
+    ///   influenced JSON to whatever it points at. That was live, and is what
+    ///   this function was rewritten for.
+    /// * **Regular file, owned by us, not writable by anyone else.** A
+    ///   pre-existing file failing any of those was put there by someone other
+    ///   than wardyn, and a security record a second party can rewrite is not
+    ///   one. Refused, matching what `overrides_file` already does.
+    /// * **Mode 0600 on creation.** The log names every path the agent touched,
+    ///   which is exactly the map of a project an attacker would want.
+    ///
+    /// Append, never truncate: the record must survive across runs. Use
+    /// `--audit /dev/null`, or a fresh path, if a clean log is wanted.
     pub fn create(path: &Path) -> Result<Audit> {
-        // Append, never truncate: the audit log is a security record and must
-        // survive across runs (JSONL, so appending is well-formed). Use
-        // `--audit /dev/null` or a fresh path if a clean log is wanted.
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
-            .with_context(|| format!("opening audit log {}", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "opening audit log {} (if it exists as a symlink, wardyn refuses to follow \
+                     it — the security record must not be redirected by whoever it is recording)",
+                    path.display()
+                )
+            })?;
+
+        // Checked on the DESCRIPTOR, not the path: anything checked by name can
+        // be swapped between the check and the open.
+        let meta = file
+            .metadata()
+            .with_context(|| format!("stat audit log {}", path.display()))?;
+        if !meta.is_file() {
+            bail!(
+                "audit log {} is not a regular file — refusing to write the security record to it",
+                path.display()
+            );
+        }
+        let us = unsafe { libc::geteuid() };
+        if meta.uid() != us {
+            bail!(
+                "audit log {} is owned by uid {} and wardyn runs as {us} — it was created by \
+                 someone else, and a record a second party can rewrite is not a record. Point \
+                 --audit somewhere only root can write",
+                path.display(),
+                meta.uid()
+            );
+        }
+        if meta.mode() & 0o022 != 0 {
+            bail!(
+                "audit log {} is writable by group or others (mode {:o}) — anyone on this machine \
+                 could edit the security record. Point --audit somewhere only root can write",
+                path.display(),
+                meta.mode() & 0o777
+            );
+        }
+
         Ok(Audit {
             writer: BufWriter::new(file),
             path: path.display().to_string(),
             count: 0,
             write_failures: 0,
         })
+    }
+
+    /// Whether the log's *directory* is writable by `uid` — the identity the
+    /// watched agent will run as.
+    ///
+    /// The open descriptor is safe from this: appends follow the inode, so a
+    /// rename cannot redirect what is already being written. What it cannot
+    /// survive is someone moving the finished log aside and leaving a file of
+    /// their own in its place, which anyone reading it afterwards would have no
+    /// way to notice. A warning rather than a refusal, because the default path
+    /// is a project directory and refusing there would break the documented way
+    /// to run the tool.
+    pub fn directory_is_writable_by(path: &Path, uid: u32) -> bool {
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+        let dir = dir.unwrap_or(Path::new("."));
+        let Ok(meta) = std::fs::metadata(dir) else {
+            return false;
+        };
+        let mode = meta.mode();
+        if mode & 0o002 != 0 {
+            return true; // world-writable
+        }
+        if meta.uid() == uid {
+            return mode & 0o200 != 0;
+        }
+        if meta.gid() == uid {
+            return mode & 0o020 != 0;
+        }
+        false
     }
 
     pub fn path(&self) -> &str {
@@ -281,6 +368,83 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 2, "a new run must not truncate");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The hole this file was rewritten for. An agent that plants a symlink
+    /// named `wardyn-audit.jsonl` before wardyn starts got **root** to append
+    /// attacker-influenced JSON wherever it pointed. It worked: the exploit
+    /// added lines to a file the agent could not otherwise write.
+    ///
+    /// The default `--audit` path is relative, so it lands in the directory the
+    /// agent works in — which is what made this reachable rather than
+    /// theoretical.
+    #[test]
+    fn a_symlinked_audit_path_is_refused_rather_than_followed() {
+        let dir = std::env::temp_dir().join(format!("wardyn-sym-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        let link = dir.join("audit.jsonl");
+        std::fs::write(&victim, "ORIGINAL\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        assert!(
+            Audit::create(&link).is_err(),
+            "wardyn followed a symlink for its own security record"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL\n",
+            "the symlink target was written to"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A record anyone else on the machine can edit is not a record. Matches
+    /// what `overrides_file` already refused, which is where the standard for
+    /// this came from.
+    #[test]
+    fn a_world_writable_audit_log_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = std::env::temp_dir().join(format!("wardyn-perm-{}.jsonl", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let err = Audit::create(&path).err().expect("must refuse");
+        assert!(
+            format!("{err:#}").contains("writable by group or others"),
+            "{err:#}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The log names every path the agent touched — the map of a project an
+    /// attacker would want. It is created private, like the receipt.
+    #[test]
+    fn a_new_audit_log_is_created_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = std::env::temp_dir().join(format!("wardyn-mode-{}.jsonl", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        {
+            let _a = Audit::create(&path).unwrap();
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "audit log created as {mode:o}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The warning that tells an operator their record can be swapped after the
+    /// run. `/tmp` is world-writable, so it stands in for the project directory
+    /// the default path lands in.
+    #[test]
+    fn a_world_writable_directory_is_reported() {
+        let in_tmp = std::env::temp_dir().join("x.jsonl");
+        assert!(Audit::directory_is_writable_by(&in_tmp, 12345));
+        // Nobody but root writes /, so an audit log there is not swappable.
+        assert!(!Audit::directory_is_writable_by(
+            Path::new("/x.jsonl"),
+            12345
+        ));
     }
 
     #[test]
