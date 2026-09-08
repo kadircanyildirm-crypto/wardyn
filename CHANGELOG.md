@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`run` could watch — and enforce against — an unrelated process.** Wardyn
+  identifies the agent to the kernel by tgid *as the kernel sees it*, learned
+  through an in-kernel handshake. When that handshake produced nothing, wardyn
+  fell back to its own pid, which inside a pid namespace names a different
+  init-namespace process or none. The feed then attributed a stranger's syscalls
+  to the agent, `--enforce` denied them, and the agent itself ran unwatched —
+  with only a conditional warning that did not know whether it applied.
+
+  Wardyn now determines whether it is namespaced without eBPF (the initial pid
+  namespace has a fixed inode, so `/proc/self/ns/pid` answers it), and `run`
+  refuses to start unless it can identify the agent honestly. The error names
+  the ways out. This is the Landlock precedent rather than the fail-open one: a
+  watch set pointed at the wrong process is not a weakened watch, it is a false
+  report.
+
+  Reachable wherever a container seccomp profile restricts `personality()` to a
+  fixed argument list, which is what the handshake rides on.
+
+### Fixed
+
 - **The policy's source was never reported, and the default is inside the
   agent's reach.** `--policy`, `./policy.yaml` and the embedded default fell
   back to each other silently, so `policy loaded: 11 file rule(s)` read

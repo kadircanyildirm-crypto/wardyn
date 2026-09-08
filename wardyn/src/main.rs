@@ -1552,8 +1552,8 @@ async fn run() -> anyhow::Result<i32> {
         Ok(()) => true,
         Err(e) => {
             notices.push(format!(
-                "could not attach the pid-ns handshake tracepoint ({e:#}) — if wardyn runs inside \
-                 a container or WSL distro, `run` scoping will silently fail"
+                "could not attach the pid-ns handshake tracepoint ({e:#}) — `run` will refuse to \
+                 start if wardyn turns out to be inside a container or WSL distro"
             ));
             false
         }
@@ -1738,23 +1738,51 @@ async fn run() -> anyhow::Result<i32> {
     let self_pid = std::process::id();
     let mut seed_tgid = self_pid;
     let mut ns_mismatch = false;
-    if matches!(opts.mode, Mode::Run(_)) && handshake_attached {
-        match learn_init_ns_tgid(&mut config) {
-            Some(tgid) => {
+    if matches!(opts.mode, Mode::Run(_)) {
+        // Asked up front, and used both to interpret the handshake and to judge
+        // its absence. See `in_pid_namespace`.
+        let namespaced = in_pid_namespace();
+        let learned = if handshake_attached {
+            learn_init_ns_tgid(&mut config)
+        } else {
+            None
+        };
+        match plan_seed(self_pid, learned, namespaced) {
+            SeedPlan::Seed { tgid, mismatch } => {
                 seed_tgid = tgid;
-                ns_mismatch = tgid != self_pid;
-                if ns_mismatch {
+                ns_mismatch = mismatch;
+                if mismatch {
                     notices.push(format!(
                         "pid namespace detected (self {self_pid}, kernel view {tgid}) — relying on \
                          in-kernel fork adoption; the feed shows init-ns pids"
                     ));
                 }
             }
-            None => notices.push(
-                "pid-ns handshake failed — assuming no pid namespace; if wardyn runs inside a \
-                 container or WSL distro, `run` scoping will silently fail"
-                    .into(),
-            ),
+            // Refusing follows the Landlock precedent rather than the fail-open
+            // one: a watch set aimed at the wrong process is not a weakened
+            // watch, it is a false report.
+            SeedPlan::Refuse(why) => {
+                let and_enforce = if opts.enforce {
+                    ", and --enforce would deny that process's syscalls"
+                } else {
+                    ""
+                };
+                bail!(
+                    "cannot identify the agent to the kernel: the pid-namespace handshake did not \
+                     complete and {why}.\n\n\
+                     Refusing to start rather than seed the watch set with a pid that names a \
+                     different process to the kernel. Carrying on would report that process's \
+                     syscalls as the agent's{and_enforce}, while the agent itself ran unwatched.\n\n\
+                     Ways out, in order of preference:\n  \
+                     * share the host's pid namespace (`docker run --pid=host`, or run wardyn \
+                     outside the container and point it at the agent);\n  \
+                     * allow the handshake syscall — a container seccomp profile that restricts \
+                     `personality()` to a fixed set of arguments blocks it \
+                     (`--security-opt seccomp=unconfined`);\n  \
+                     * use `wardyn watch` / `wardyn --all`, which observe without scoping by pid \
+                     (observe only — `--enforce` needs `run`)."
+                );
+            }
         }
     }
 
@@ -1821,6 +1849,10 @@ async fn run() -> anyhow::Result<i32> {
             // and watch a stranger. The fork hook already adopted the child
             // (spawn returning means the clone completed); the direct insert
             // is belt-and-braces for the namespace-free case only.
+            //
+            // `!ns_mismatch` is now a *proven* absence of a namespace, not an
+            // assumed one: the seeding block above refuses to start when it
+            // could not establish which case this is.
             if !ns_mismatch {
                 let _ = watched.insert(pid, 1u8, 0);
             }
@@ -2792,6 +2824,89 @@ fn parse_format_offset(format: &str, field: &str) -> Option<u32> {
     None
 }
 
+/// The inode the kernel gives the **initial** pid namespace.
+///
+/// `PROC_PID_INIT_INO` in `include/linux/proc_ns.h` — a fixed value, not an
+/// allocated one, which is the whole reason the question below is answerable
+/// from the inside. Every other initial namespace has a sibling constant
+/// (`0xEFFFFFFF` ipc, `0xEFFFFFFE` uts, `0xEFFFFFFD` user …); dynamically
+/// created ones are allocated from `0xF0000000` upward.
+const PROC_PID_INIT_INO: u64 = 0xEFFF_FFFC;
+
+/// Whether wardyn sits in a pid namespace of its own — i.e. whether the pid
+/// numbers it can see mean anything to the kernel.
+///
+/// Answered *without* the eBPF handshake, which is the point: it is what lets
+/// wardyn judge the handshake's **absence** instead of assuming the friendly
+/// case. Assuming wrong is not a fail-open, it is a fail-*sideways* — the seed
+/// tgid then names some unrelated init-ns process, so wardyn reports a
+/// stranger's syscalls as the agent's and, under `--enforce`, denies them.
+///
+/// The obvious signals do not work from the inside, and were tried:
+///
+/// * **`NSpid:` in `/proc/self/status`** lists a pid per namespace *from the
+///   reader's own inward*, so a nested process sees exactly one entry — the
+///   same as a process on the host.
+/// * **`/proc/self/ns/pid` vs `/proc/1/ns/pid`** compares equal too, because
+///   the visible pid 1 *is* the namespace's own init.
+///
+/// The namespace's inode is the signal that survives, because the initial one's
+/// value is fixed ABI rather than allocated. `None` means procfs could not be
+/// read at all: unknown, which is treated as "not established", not as "no".
+fn in_pid_namespace() -> Option<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    // `metadata` follows the nsfs link, which is what carries the inode.
+    let ino = std::fs::metadata("/proc/self/ns/pid").ok()?.ino();
+    Some(ino != PROC_PID_INIT_INO)
+}
+
+/// What `run` should seed WATCHED with, or why it must not start.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedPlan {
+    /// Seed this tgid. `mismatch` says local pid numbers are meaningless to the
+    /// kernel, so the post-spawn direct insert must be skipped and adoption
+    /// left to the in-kernel fork hook.
+    Seed { tgid: u32, mismatch: bool },
+    /// Which pid identifies the agent could not be established.
+    Refuse(&'static str),
+}
+
+/// Decide what `run` scoping can honestly claim, given what the handshake
+/// returned and whether wardyn is in a pid namespace.
+///
+/// Split out from `run` because it is the whole of a security property: WATCHED
+/// is what tells the kernel which process is the agent, and seeding it with a
+/// number that means something else there is worse than seeding nothing. The
+/// feed would attribute an unrelated process's syscalls to the agent, and
+/// `--enforce` would deny them — while the agent itself ran unwatched.
+///
+/// The handshake is authoritative when it answers. When it does not, the
+/// namespace check has to carry the decision alone, and only a *demonstrated*
+/// init namespace justifies falling back to `std::process::id()`.
+fn plan_seed(self_pid: u32, learned: Option<u32>, namespaced: Option<bool>) -> SeedPlan {
+    match (learned, namespaced) {
+        // The kernel's own view of us. Note the mismatch flag does not come
+        // from `tgid != self_pid` alone: an init-ns tgid can coincide with our
+        // in-ns pid by chance, and reading that as "no namespace" would re-open
+        // the hole for one run in many.
+        (Some(tgid), ns) => SeedPlan::Seed {
+            tgid,
+            mismatch: tgid != self_pid || ns == Some(true),
+        },
+        // No kernel view, but demonstrably nothing between us and the kernel:
+        // wardyn's own pid *is* how the kernel sees it.
+        (None, Some(false)) => SeedPlan::Seed {
+            tgid: self_pid,
+            mismatch: false,
+        },
+        (None, Some(true)) => SeedPlan::Refuse("wardyn is inside a pid namespace"),
+        (None, None) => SeedPlan::Refuse(
+            "wardyn could not read /proc/self/ns/pid to find out whether it is inside a pid \
+             namespace",
+        ),
+    }
+}
+
 /// Learn wardyn's tgid as the kernel's init pid namespace sees it.
 ///
 /// Publish a random nonce in CONFIG, call `personality(nonce)` (a per-process
@@ -3408,5 +3523,119 @@ mod tests {
             let on_that_kernel = release.trim().starts_with(&format!("{OFFSETS_KERNEL}."));
             assert_eq!(trusted, on_that_kernel);
         }
+    }
+
+    // ── pid-namespace identity ──────────────────────────────────────────────
+    //
+    // WATCHED is what tells the kernel which process is the agent. Seeding it
+    // with a pid that means something else there is not a weaker watch, it is a
+    // false one: the feed attributes a stranger's syscalls to the agent and
+    // `--enforce` denies them, while the agent runs unwatched. These pin the
+    // decision that keeps that from happening.
+
+    /// The handshake answered, and disagrees with our local pid. Trust it, and
+    /// mark local pids meaningless so the post-spawn direct insert is skipped.
+    #[test]
+    fn a_handshake_answer_overrides_the_local_pid() {
+        assert_eq!(
+            plan_seed(449, Some(31337), Some(true)),
+            SeedPlan::Seed {
+                tgid: 31337,
+                mismatch: true
+            }
+        );
+    }
+
+    /// The numbers coincide, but we are demonstrably namespaced. `tgid ==
+    /// self_pid` must NOT be read as "no namespace" — that would let the
+    /// post-spawn insert put a local child pid into WATCHED, naming a stranger.
+    /// A coincidence, but one that happens on some run eventually.
+    #[test]
+    fn a_coincidental_tgid_does_not_imply_the_init_namespace() {
+        assert_eq!(
+            plan_seed(1234, Some(1234), Some(true)),
+            SeedPlan::Seed {
+                tgid: 1234,
+                mismatch: true
+            },
+            "namespace membership, not pid equality, decides whether local pids mean anything"
+        );
+    }
+
+    /// No handshake, but procfs proves there is nothing between us and the
+    /// kernel. This is the ordinary host case and must stay cheap and quiet.
+    #[test]
+    fn without_a_handshake_a_proven_init_namespace_seeds_the_local_pid() {
+        assert_eq!(
+            plan_seed(4242, None, Some(false)),
+            SeedPlan::Seed {
+                tgid: 4242,
+                mismatch: false
+            }
+        );
+    }
+
+    /// The hole this was written for. Handshake absent (tracepoint missing, or
+    /// the nonce round-trip failed) *and* wardyn is namespaced: the old code
+    /// assumed the friendly case and seeded its own pid.
+    #[test]
+    fn without_a_handshake_a_namespaced_wardyn_refuses_to_start() {
+        assert!(
+            matches!(plan_seed(449, None, Some(true)), SeedPlan::Refuse(_)),
+            "wardyn would have watched whatever init-ns process happens to hold pid 449"
+        );
+    }
+
+    /// Unknown is not "no". If procfs cannot be read the premise is unproven,
+    /// and an unproven premise is exactly what this function exists to refuse.
+    #[test]
+    fn an_unanswerable_namespace_question_also_refuses() {
+        assert!(matches!(plan_seed(449, None, None), SeedPlan::Refuse(_)));
+    }
+
+    /// The detector itself, against the running kernel. It must answer at all
+    /// (procfs is not optional for wardyn), and it must agree with the fixed
+    /// `PROC_PID_INIT_INO` rather than with a guess.
+    #[test]
+    fn the_namespace_detector_answers_and_matches_the_kernel_constant() {
+        use std::os::unix::fs::MetadataExt as _;
+        let answer = in_pid_namespace().expect("/proc/self/ns/pid unreadable");
+        let ino = std::fs::metadata("/proc/self/ns/pid").unwrap().ino();
+        assert_eq!(answer, ino != 0xEFFF_FFFC);
+        // Sanity on the constant scheme: dynamically allocated namespace inodes
+        // start at 0xF0000000, so an initial namespace is always below it.
+        assert!(
+            ino >= 0xEFFF_FFFA,
+            "namespace inode {ino:#x} is below every initial-namespace constant"
+        );
+    }
+
+    /// The detector inside a namespace it can actually observe. `unshare` with
+    /// a user namespace needs no privilege, so this runs under plain `cargo
+    /// test`; the child becomes pid 1 of a fresh pid namespace and must be seen
+    /// as namespaced even though, from in there, `NSpid:` shows one entry and
+    /// `/proc/self/ns/pid` equals `/proc/1/ns/pid`.
+    #[test]
+    fn the_detector_sees_a_namespace_from_the_inside() {
+        let out = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--pid", "--fork", "--"])
+            .args(["stat", "-Lc", "%i", "/proc/self/ns/pid"])
+            .output();
+        let Ok(out) = out else {
+            return; // no `unshare` binary; nothing to prove here
+        };
+        if !out.status.success() {
+            return; // userns creation restricted on this host
+        }
+        let ino: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert_ne!(
+            ino, 0xEFFF_FFFC,
+            "a freshly unshared pid namespace reported the initial namespace's inode"
+        );
+        assert!(
+            plan_seed(1, None, Some(ino != 0xEFFF_FFFC))
+                == SeedPlan::Refuse("wardyn is inside a pid namespace"),
+            "wardyn must refuse to scope by pid in there"
+        );
     }
 }
