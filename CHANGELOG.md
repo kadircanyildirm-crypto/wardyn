@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Published overhead numbers, and `scripts/bench.sh` to reproduce them.** A
+  tool in the path of every `open` in a subtree had never published a figure,
+  which asks users to trust it about the one thing they can measure themselves.
+
+  Two costs, kept apart because they behave differently: **startup** (~0.9 s
+  observing, ~2.2 s enforcing — loading ~21 eBPF programs and parsing BTF) and
+  **marginal** (~+15 µs per file open observing, ~+17 µs enforcing). The startup
+  figure is the one that should change behaviour: wardyn supervises a session,
+  it is not for wrapping individual commands in a loop.
+
+  The marginal cost is measured as a **slope** — the same workload at N and 2N
+  events — so whatever the run costs before the first event cancels out. The
+  first attempt subtracted a separately measured startup instead, and reported
+  `--enforce` as *cheaper* than observing: impossible, and the clue that
+  subtracting a constant which itself varies fivefold amplifies noise rather
+  than removing it. [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) says so, along
+  with what the numbers are not.
+
 - **arm64 builds.** Releases now ship `aarch64-unknown-linux-musl` beside
   x86_64. Each is built **and started** on its own architecture — GitHub's arm64
   runners are free for public repositories — because the release job verifies

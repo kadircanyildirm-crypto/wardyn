@@ -402,6 +402,21 @@ Full design, hook map, and the eBPF-verifier war stories are in
   object with a different name, and unlike a secret there is no read to deny;
   see [`SECURITY.md`](./SECURITY.md).
 
+## What it costs
+
+Startup is **~0.9 s** observing and **~2.2 s** under `--enforce` — loading and
+attaching ~21 eBPF programs and parsing kernel BTF. That is the number that
+should change what you do with it: wardyn is for supervising a *session*, not
+for wrapping individual commands in a loop.
+
+After that it is roughly **+15 µs per file open** observing, **+17 µs**
+enforcing. Enforcing adds little over observing, because the in-kernel matcher
+is a few hash lookups while shipping the event to userspace is the bulk of it.
+
+Measured on kernel 6.18 x86_64 with the shipped policy — see
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) for the method, the caveats, and
+`scripts/bench.sh` to run it on your own kernel.
+
 ## Contributing
 
 Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) for the dev
