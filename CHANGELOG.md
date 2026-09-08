@@ -127,6 +127,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The feed showed `ok` for opens Landlock had just refused.** Containment is a
+  second, independent boundary, and Landlock reports nothing back to wardyn — it
+  is a different LSM and its refusals are invisible to our hooks. So an agent
+  that read outside its `allow_paths:` got `Permission denied` while the feed
+  printed an `ok` row for the same open. Feed and reality disagreeing is the one
+  failure this codebase is built around not having; it arrived with
+  `allow_paths:` in the same release, and is fixed before anything shipped with
+  it.
+
+  The mirror now consults the containment boundary and reports the denial,
+  naming which grant fell short:
+
+      open  BLOCK  /tmp/x/outside.txt  [allow_paths: outside every allow_paths hierarchy]
+      open  BLOCK  /etc/wardyn-probe   [allow_paths: `/etc` is granted without `write`]
+
+  This is a **prediction, and a weaker one than the rest**: every other mirror
+  here can be corrected by the kernel reporting its own decision, and Landlock
+  never will. So it is conservative — a relative path is not judged at all
+  (resolving it would mean guessing the agent's working directory) and a symlink
+  is judged on the name the syscall passed. Both err toward saying nothing,
+  never toward announcing a denial that did not happen.
+
 - **`domain:` rules were resolved once and then frozen for the life of the run.**
   A `{ domain: "registry.npmjs.org", action: allow }` was expanded at load into
   one host rule per address the resolver happened to return, and nothing ever
