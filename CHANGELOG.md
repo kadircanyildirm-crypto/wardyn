@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`allow_ports:` — TCP containment, via Landlock.** The second containment
+  dimension, beside `allow_paths:`:
+
+  ```yaml
+  allow_ports: [443, 53]
+  ```
+
+  The agent may connect to, or bind, exactly those TCP ports and no others.
+  Landlock enforces it, so it needs no privilege, is inherited by every
+  descendant, and cannot be undone — including by a descendant that somehow got
+  its privileges back.
+
+  **By port only.** Landlock has no notion of an address, which is exactly why
+  this sits *beside* the cgroup/connect hooks rather than replacing them: eBPF
+  decides which hosts, with CIDRs and protocols and a `warn` action; Landlock
+  decides which ports, unconditionally. The `network:` rules still apply inside
+  the containment.
+
+  `allow_ports: []` means **no TCP at all**, and is different from omitting the
+  key, which means the policy said nothing. Both bind and connect are confined —
+  restricting only outbound would leave the agent free to listen and be
+  connected to instead, which is the same egress with the arrow reversed.
+
+  Needs Landlock ABI 4 (Linux 6.7+). On an older kernel wardyn **refuses to
+  start** rather than run an agent the policy believes is confined to a set of
+  ports it is not — the same reasoning `allow_paths:` already used.
+
+### Added
+
 - **A differential test between the kernel matcher and its userspace mirror.**
   The two are checked over every path of depth 1–3 across an alphabet chosen to
   sit on the edges that matter, for six single-rule policies, against a faithful

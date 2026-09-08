@@ -46,9 +46,13 @@ use anyhow::{bail, Context as _, Result};
 /// and `scoped` (6), and the kernel validates `size` against the version it
 /// knows — so passing the 8-byte ABI-1 shape is accepted by every kernel that
 /// has Landlock at all, and asks for nothing this code does not implement.
+/// ABI 4's shape. The kernel reads exactly `size` bytes and infers the version
+/// from it, so an ABI-1 kernel is handed the first 8 and never sees the rest.
 #[repr(C)]
 struct RulesetAttr {
     handled_access_fs: u64,
+    /// ABI 4. Sent only when the kernel is new enough to read it.
+    handled_access_net: u64,
 }
 
 /// `struct landlock_path_beneath_attr`. **Packed**: the kernel's definition is,
@@ -60,7 +64,31 @@ struct PathBeneathAttr {
 }
 
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+/// ABI 4.
+const LANDLOCK_RULE_NET_PORT: u32 = 2;
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
+
+// Network access rights, ABI 4. Only TCP, and only by port — Landlock has no
+// notion of an address here. That is why this sits *beside* the cgroup/connect
+// hooks rather than replacing them: eBPF decides by address, port and protocol,
+// and can say `warn`; Landlock says "never leave these ports" in a way no
+// descendant can undo, even one that somehow got its privileges back.
+const NET_BIND_TCP: u64 = 1 << 0;
+const NET_CONNECT_TCP: u64 = 1 << 1;
+
+/// Every network right this kernel's ABI understands, or 0 below ABI 4.
+///
+/// Both are handled together deliberately. Handling only `CONNECT` would leave
+/// a contained agent free to `bind()` a listener on any port and invite the
+/// other side to connect inwards — the same egress, with the arrow drawn the
+/// other way.
+fn handled_net_for_abi(abi: i32) -> u64 {
+    if abi >= 4 {
+        NET_BIND_TCP | NET_CONNECT_TCP
+    } else {
+        0
+    }
+}
 
 // Filesystem access rights, by the ABI that introduced them. Grouped this way
 // because the mask has to be trimmed to the running kernel: asking to handle a
@@ -162,18 +190,19 @@ pub enum Right {
 
 // ── syscalls ────────────────────────────────────────────────────────────────
 
-fn create_ruleset(attr: Option<&RulesetAttr>, flags: u32) -> i64 {
+/// `attr_size` is not `size_of::<RulesetAttr>()` and must not become it. The
+/// kernel infers which version of the struct it was handed from the length, and
+/// rejects a length it does not know — so a pre-ABI-4 kernel has to be told 8,
+/// even though the type is 16 bytes wide here.
+fn create_ruleset(attr: Option<(&RulesetAttr, usize)>, flags: u32) -> i64 {
     let (ptr, size) = match attr {
-        Some(a) => (
-            a as *const RulesetAttr as *const libc::c_void,
-            size_of::<RulesetAttr>(),
-        ),
+        Some((a, n)) => (a as *const RulesetAttr as *const libc::c_void, n),
         None => (std::ptr::null(), 0),
     };
     unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, ptr, size, flags) }
 }
 
-fn add_rule(ruleset: i32, attr: &PathBeneathAttr) -> i64 {
+fn add_path_rule(ruleset: i32, attr: &PathBeneathAttr) -> i64 {
     unsafe {
         libc::syscall(
             libc::SYS_landlock_add_rule,
@@ -185,6 +214,27 @@ fn add_rule(ruleset: i32, attr: &PathBeneathAttr) -> i64 {
     }
 }
 
+fn add_net_rule(ruleset: i32, attr: &NetPortAttr) -> i64 {
+    unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset,
+            LANDLOCK_RULE_NET_PORT,
+            attr as *const NetPortAttr as *const libc::c_void,
+            0u32,
+        )
+    }
+}
+
+/// How many bytes of [`RulesetAttr`] this kernel will accept.
+fn attr_size_for_abi(abi: i32) -> usize {
+    if abi >= 4 {
+        size_of::<RulesetAttr>() // fs + net
+    } else {
+        size_of::<u64>() // fs alone, the ABI-1 shape
+    }
+}
+
 /// Apply a ruleset to the calling thread and every descendant. Irreversible.
 ///
 /// Called from `pre_exec`, so it must be async-signal-safe: it is one syscall
@@ -192,6 +242,14 @@ fn add_rule(ruleset: i32, attr: &PathBeneathAttr) -> i64 {
 ///
 /// # Safety
 /// `ruleset_fd` must be a valid Landlock ruleset descriptor.
+/// `struct landlock_net_port_attr` — ABI 4. Not packed: both fields are `u64`,
+/// so there is no padding to disagree about.
+#[repr(C)]
+struct NetPortAttr {
+    allowed_access: u64,
+    port: u64,
+}
+
 pub unsafe fn restrict_self(ruleset_fd: i32) -> std::io::Result<()> {
     if libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0u32) != 0 {
         return Err(std::io::Error::last_os_error());
@@ -223,6 +281,12 @@ pub struct Ruleset {
     /// allowlist quietly missing an entry is how a contained agent fails to
     /// start with an error nobody can trace back to the policy.
     pub unresolved: Vec<(std::path::PathBuf, String)>,
+    /// Whether TCP is actually confined by this ruleset. False when the policy
+    /// asked for no ports, and false on a kernel below ABI 4 — the caller has
+    /// to tell those apart before it prints anything.
+    pub net_handled: bool,
+    /// The ports the kernel accepted, for the startup line.
+    pub net_ports: Vec<u16>,
 }
 
 impl Ruleset {
@@ -230,22 +294,47 @@ impl Ruleset {
         self.fd.as_raw_fd()
     }
 
-    /// Build a ruleset granting exactly `grants`, handling every right the
-    /// running kernel knows about.
+    /// Build a ruleset granting exactly `grants` and `ports`, handling every
+    /// right the running kernel knows about.
     ///
     /// Must run while wardyn still has the privilege to open the granted paths
     /// — i.e. in the parent, before the child drops to the agent's uid.
-    pub fn build(grants: &[Grant]) -> Result<Ruleset> {
+    ///
+    /// `ports` is TCP only and by number only; Landlock has no notion of an
+    /// address. An empty list with a kernel that supports network rights means
+    /// **no TCP at all**, which is a real thing to ask for and must not be
+    /// confused with "not asked" — the caller passes `None` for that.
+    pub fn build(grants: &[Grant], ports: Option<&[u16]>) -> Result<Ruleset> {
         let Some(abi) = abi_version() else {
             bail!(
                 "this kernel has no Landlock (needs Linux 5.13+ with `landlock` in the active LSM \
                  list); `allow_paths:` cannot be enforced"
             );
         };
-        let attr = RulesetAttr {
-            handled_access_fs: handled_for_abi(abi),
+        // Handling a network right the kernel has never heard of fails the
+        // whole ruleset, taking the filesystem containment with it — so the
+        // mask is trimmed, and a policy that asked for ports on a kernel that
+        // cannot enforce them is refused by the caller rather than silently
+        // dropped here.
+        let handled_net = if ports.is_some() {
+            handled_net_for_abi(abi)
+        } else {
+            0
         };
-        let fd = create_ruleset(Some(&attr), 0);
+        // Handling a dimension with no rules in it denies that dimension
+        // ENTIRELY — Landlock is an allowlist, and an allowlist of nothing
+        // permits nothing. A policy that asked only for `allow_ports:` would
+        // otherwise get a ruleset that also forbids every file, and the agent
+        // would fail to exec with a bare EACCES pointing at nothing.
+        let attr = RulesetAttr {
+            handled_access_fs: if grants.is_empty() {
+                0
+            } else {
+                handled_for_abi(abi)
+            },
+            handled_access_net: handled_net,
+        };
+        let fd = create_ruleset(Some((&attr, attr_size_for_abi(abi))), 0);
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).context("creating the Landlock ruleset");
         }
@@ -277,16 +366,36 @@ impl Ruleset {
                 allowed_access: allowed,
                 parent_fd: pfd,
             };
-            let rc = add_rule(fd.as_raw_fd(), &rule);
+            let rc = add_path_rule(fd.as_raw_fd(), &rule);
             unsafe { libc::close(pfd) };
             if rc != 0 {
                 unresolved.push((g.path.clone(), std::io::Error::last_os_error().to_string()));
             }
         }
+        let mut net_ports = Vec::new();
+        if handled_net != 0 {
+            for &port in ports.unwrap_or(&[]) {
+                let rule = NetPortAttr {
+                    allowed_access: NET_BIND_TCP | NET_CONNECT_TCP,
+                    port: u64::from(port),
+                };
+                if add_net_rule(fd.as_raw_fd(), &rule) != 0 {
+                    unresolved.push((
+                        std::path::PathBuf::from(format!("tcp/{port}")),
+                        std::io::Error::last_os_error().to_string(),
+                    ));
+                } else {
+                    net_ports.push(port);
+                }
+            }
+        }
+
         Ok(Ruleset {
             fd,
             abi,
             unresolved,
+            net_handled: handled_net != 0,
+            net_ports,
         })
     }
 }
@@ -302,7 +411,48 @@ mod tests {
     #[test]
     fn the_path_beneath_struct_is_packed() {
         assert_eq!(size_of::<PathBeneathAttr>(), 12);
-        assert_eq!(size_of::<RulesetAttr>(), 8);
+        assert_eq!(size_of::<NetPortAttr>(), 16);
+        // The type carries both fields now; what a pre-ABI-4 kernel is TOLD is
+        // still 8, and that is the number the syscall validates.
+        assert_eq!(size_of::<RulesetAttr>(), 16);
+        assert_eq!(attr_size_for_abi(1), 8);
+        assert_eq!(attr_size_for_abi(3), 8);
+        assert_eq!(attr_size_for_abi(4), 16);
+        assert_eq!(attr_size_for_abi(7), 16);
+    }
+
+    /// Network rights arrived in ABI 4. Asking an older kernel to handle them
+    /// fails the whole ruleset — taking the filesystem containment down with
+    /// it, which is the opposite of what the operator asked for.
+    #[test]
+    fn network_rights_are_only_handled_from_abi_4() {
+        for abi in 1..=3 {
+            assert_eq!(
+                handled_net_for_abi(abi),
+                0,
+                "ABI {abi} has no network rights"
+            );
+        }
+        for abi in 4..=7 {
+            assert_eq!(
+                handled_net_for_abi(abi),
+                NET_BIND_TCP | NET_CONNECT_TCP,
+                "ABI {abi} must handle both directions"
+            );
+        }
+    }
+
+    /// Bind is handled alongside connect on purpose: confining only outbound
+    /// would leave the agent free to listen and be connected to instead.
+    #[test]
+    fn both_directions_are_handled_not_just_connect() {
+        let m = handled_net_for_abi(4);
+        assert_ne!(m & NET_CONNECT_TCP, 0);
+        assert_ne!(
+            m & NET_BIND_TCP,
+            0,
+            "a listener is egress with the arrow reversed"
+        );
     }
 
     /// The handled mask must grow with the ABI and never include a bit the
@@ -366,6 +516,30 @@ mod tests {
                     "ABI {abi}: {r:?} asks for a right the ruleset does not handle"
                 );
             }
+        }
+    }
+
+    /// Landlock is an allowlist, so HANDLING a dimension with no rules in it
+    /// forbids that dimension entirely. A policy asking only for `allow_ports:`
+    /// must not end up with a ruleset that also denies every file — the first
+    /// version of this did, and the agent failed to exec with a bare EACCES
+    /// pointing at nothing.
+    ///
+    /// What this can assert from userspace is that the ruleset builds and takes
+    /// the port. That it does *not* confine the filesystem is proved in the e2e
+    /// suite, where a ports-only policy runs an agent that reads and writes.
+    #[test]
+    fn a_ports_only_ruleset_builds_and_takes_the_port() {
+        let Some(abi) = abi_version() else {
+            return; // no Landlock on this kernel; nothing to assert
+        };
+        let rs = Ruleset::build(&[], Some(&[443])).expect("ports-only ruleset");
+        if abi >= 4 {
+            assert!(rs.net_handled, "ABI {abi} must confine TCP");
+            assert_eq!(rs.net_ports, vec![443]);
+            assert!(rs.unresolved.is_empty(), "{:?}", rs.unresolved);
+        } else {
+            assert!(!rs.net_handled, "ABI {abi} cannot confine TCP");
         }
     }
 }
