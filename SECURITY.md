@@ -13,8 +13,8 @@ disclosure.
 
 | Version | Supported |
 |---------|-----------|
-| 0.3.x   | ✅ (current release, and latest `main`) |
-| < 0.3   | ❌ |
+| 0.4.x   | ✅ (current release, and latest `main`) |
+| < 0.4   | ❌ |
 
 Only the latest commit on `main` and the most recent tagged release receive
 security fixes while the project is pre-1.0. There is no backport window, and

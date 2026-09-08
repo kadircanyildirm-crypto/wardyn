@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-09
+
+Containment gets its second dimension, and the tool stops calling one of its own
+successes a failure.
+
+### `allow_ports:`
+
+`allow_paths:` confines what the agent can reach on disk. This confines what it
+can reach on the network:
+
+```yaml
+allow_ports: [443, 53]
+```
+
+TCP only, by port only — Landlock has no notion of an address, which is exactly
+why it sits *beside* the cgroup/connect hooks rather than replacing them.
+`network:` still decides which hosts, inside the ports that remain. Both
+directions are confined: restricting only outbound would leave the agent free to
+listen and be connected to instead.
+
+### The failure it was calling a success
+
+The end-of-run cross-check compares the receipt against the kernel's own
+counters — the one check a wrong struct offset cannot fool. Landlock keeps no
+such counter, so a run whose denials were *all* containment ended with
+*"enforcement did NOT fire. Treat this run as observe-only."* It had fired,
+twenty-six times, which was the whole point of the run.
+
+Found by re-recording the demo GIF, where the containment demo showed wardyn
+declaring its own success a failure.
+
+### The audit report is now checked against the code
+
+`docs/AUDIT.md` carried 113 findings and one status marker, so it announced ten
+open critical issues when nearly all had been fixed. Every finding now carries a
+status: **98 closed · 10 deliberately open · 4 open · 1 rejected**. Findings that
+could not be re-verified count as open.
+
+Going through it turned up a live one: a 39-byte rule name denied every longer
+file sharing its prefix, because a truncated dentry read produces the same
+40-byte key. That is a kernel key broader than the rule that made it — the thing
+this project says it will not do. It also produced the differential test that
+should have caught it, which now compares the kernel matcher against its
+userspace mirror over every path of depth 1–3.
+
+### Also
+
+A fuzz target for the policy parser — the one input an attacker may control,
+since the default policy path lands in the agent's own working directory.
+GOVERNANCE.md, which says who maintains this (one person) and what the project
+does not promise. Every GitHub Action pinned to a commit SHA. And six
+operator-facing messages that had been rendering with 18 spaces mid-sentence.
+
+### Upgrading from 0.3.0
+
+Nothing breaks. `allow_ports:` is opt-in, and on a kernel below Landlock ABI 4
+(Linux 6.7) wardyn refuses to start rather than pretend to enforce it — so add
+it only where you know the kernel is new enough. `policies/contained.yaml` ships
+it commented out for that reason.
+
+
 ### Fixed
 
 - **A working containment run reported itself as observe-only.** The end-of-run
@@ -1201,7 +1262,8 @@ copying a *blocked binary* to a new name still runs it.
   network-only enforcement when BPF LSM is unavailable.
 - Ready-made policy presets (`policies/permissive.yaml`, `policies/strict.yaml`).
 
-[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.1.0
