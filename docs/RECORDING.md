@@ -46,6 +46,11 @@ agg --font-size 22 --theme monokai demo.cast docs/wardyn-demo.gif
 checked in:
 
 - [`demo.tape`](./demo.tape) — the live colored **TUI** (the hero GIF).
+- [`demo-contained.tape`](./demo-contained.tape) — `allow_paths:` confining an
+  agent to one project directory. Kept separate rather than appended, because
+  the two show different *shapes*: one is a blocklist denying named objects, the
+  other a boundary, and the interesting frame there is a directory the agent
+  cannot enter for no reason but that nobody listed it.
 - [`demo-plain.tape`](./demo-plain.tape) — `--plain` scrolling table; use it if
   the full-screen TUI capture looks jittery in the GIF.
 

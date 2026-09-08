@@ -261,6 +261,13 @@ The two compose: containment removes everything outside, `files:`/`exec:` deny
 specific objects inside what remains, and egress stays eBPF's alone — Landlock
 can only express TCP by port, never by address.
 
+<p align="center"><img src="docs/wardyn-contained.gif" width="820"
+  alt="An agent confined to one project directory: reads inside it succeed, everything outside is BLOCK"></p>
+
+<p align="center"><sub>Nothing above is denied by a rule — the policy has none for
+those paths. They are denied because they are not in <code>allow_paths:</code>,
+which is the difference between a blocklist and a boundary.</sub></p>
+
 > **It is an allowlist, and that bites.** Anything unlisted is denied, including
 > what nobody thinks about: the agent's loader, `/dev/null`, the script it was
 > asked to run. A missing entry looks like a broken agent, not like a policy

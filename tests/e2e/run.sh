@@ -772,12 +772,12 @@ LPOLICY
   # The feed has to agree with reality. Landlock reports nothing to wardyn, so
   # before this check existed the feed printed `ok` for an open the agent had
   # just been refused.
-  if grep -q 'allow_paths: outside every allow_paths hierarchy' "$LW/out"; then
+  if grep -q 'allow_paths: not listed' "$LW/out"; then
     pass "landlock: the feed reports the containment denial, not an ok row"
   else
     fail "landlock: a Landlock denial was shown as allowed — feed and reality disagree"
   fi
-  if grep -q 'is granted without .write' "$LW/out"; then
+  if grep -q 'has no write' "$LW/out"; then
     pass "landlock: and names the missing right when the path IS in the allowlist"
   else
     fail "landlock: a write into a read-only grant was not reported"

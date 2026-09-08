@@ -38,4 +38,41 @@ if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_UID:-}" ]; then
     "$DEMO_HOME/wardyn-demo" "$DEMO_HOME/.ssh" "$DEMO_HOME/.aws" "$DEMO_HOME/.npmrc"
 fi
 
+# ── containment demo ─────────────────────────────────────────────────────────
+# A project the agent is confined to, and two things outside it to reach for.
+# The policy is generated here rather than checked in because `allow_paths:`
+# needs absolute paths, and the demo's home is whatever machine it runs on.
+PROJ="$DEMO_HOME/wardyn-demo/project"
+mkdir -p "$PROJ" "$DEMO_HOME/other-project"
+printf 'fn main() { println!("hello"); }
+' > "$PROJ/main.rs"
+printf 'notes from a different checkout
+' > "$DEMO_HOME/other-project/notes.md"
+cp "$(dirname "${BASH_SOURCE[0]}")/demo-contained.sh" "$PROJ/demo-contained.sh"
+chmod 755 "$PROJ/demo-contained.sh"
+
+cat > /tmp/wardyn-demo-contained.yaml <<CONTAINED
+version: 1
+default_action: allow
+allow_paths:
+  - { path: "/usr",   rights: [read, exec] }
+  - { path: "/bin",   rights: [read, exec] }
+  - { path: "/lib",   rights: [read, exec] }
+  - { path: "/lib64", rights: [read, exec] }
+  - { path: "/etc",   rights: [read] }
+  - { path: "/dev",   rights: [read, write] }
+  - { path: "$PROJ",  rights: [read, write, exec] }
+files:
+  - { match: "**", action: allow }
+network:
+  - { cidr: "0.0.0.0/0", action: allow }
+exec:
+  - { match: "**", action: allow }
+CONTAINED
+chmod 644 /tmp/wardyn-demo-contained.yaml
+
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_UID:-}" ]; then
+  chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}"     "$DEMO_HOME/wardyn-demo" "$DEMO_HOME/other-project"
+fi
+
 echo "demo fixtures ready in $DEMO_HOME"

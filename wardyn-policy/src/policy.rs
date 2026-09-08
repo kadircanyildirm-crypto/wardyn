@@ -1262,7 +1262,7 @@ impl Policy {
             }
         }
         let Some(a) = best else {
-            return Some("outside every allow_paths hierarchy".to_string());
+            return Some("not listed".to_string());
         };
         // Inside a hierarchy, but perhaps without the right this asked for.
         // `requested` is the access the open wanted; an exec passes `EXEC_ONLY`.
@@ -1271,13 +1271,13 @@ impl Policy {
         let need_exec = requested == EXEC_ONLY;
         let has = |r: Right| a.rights.contains(&r);
         if need_exec && !has(Right::Exec) {
-            return Some(format!("`{}` is granted without `exec`", a.raw));
+            return Some(format!("{} has no exec", a.raw));
         }
         if need_write && !has(Right::Write) {
-            return Some(format!("`{}` is granted without `write`", a.raw));
+            return Some(format!("{} has no write", a.raw));
         }
         if need_read && !need_exec && !has(Right::Read) {
-            return Some(format!("`{}` is granted without `read`", a.raw));
+            return Some(format!("{} has no read", a.raw));
         }
         None
     }
@@ -4478,7 +4478,7 @@ files:
         assert_eq!(
             p.containment_denies("/home/a/.ssh/id_ed25519", fmode::READ)
                 .as_deref(),
-            Some("outside every allow_paths hierarchy")
+            Some("not listed")
         );
         assert!(p
             .containment_denies("/proj/src/main.rs", fmode::READ)
