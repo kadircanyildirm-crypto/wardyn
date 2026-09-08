@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A stress suite: four scenarios that try to break wardyn, each recorded
+  separately** (`just stress`, `docs/stress/`). They run against one sixteen-line
+  policy, so nothing is stopped by a rule the viewer cannot see.
+
+  1. **Every known way around a secret-file rule** — rename, hard link, move the
+     parent directory, symlink, `../` noise. 8 attacks, 8 stopped. The recording
+     then runs the *control*: the same attacks against name rules instead of
+     `(dev, ino)`, where the hard link goes straight through.
+  2. **The agent attacks the warden** — reach the BPF maps, read wardyn's memory,
+     kill it, regain privilege, escape into a user namespace, rewrite the policy,
+     erase the audit log. 15 attempts, 14 refused; the one that worked is the
+     documented policy-in-the-working-directory weakness, and the next line shows
+     it bought nothing for the current run.
+  3. **450 processes and 40,000 opens** — the secret stays denied while ~13,000
+     events are dropped by a full ring buffer, and wardyn says so in numbers.
+     Enforcement lives in the kernel hooks; only observation can be outrun.
+  4. **Real work** — git, gcc, make, python3, 300 files created and deleted under
+     the same enforcing policy. 15 operations, none broken.
+
+  Two rules the suite holds itself to, both learned by getting them wrong first:
+  a failed *setup* step is reported separately from a blocked *read* (a `cat`
+  that fails because the file was never created looks identical to one that was
+  denied), and a missing tool is skipped rather than scored — `bpftool` is not
+  installed everywhere, and "command not found" would otherwise have counted as
+  "the kernel refused you". Scenario 2 issues `bpf(2)` directly for that reason.
+
+### Fixed
+
+- **The agent kept root's `HOME`, `USER` and `LOGNAME` after the privilege
+  drop.** It ran as uid 1000 with `HOME=/root` — a directory it could not even
+  list. Every tool that keeps state there (git, npm, cargo, pip, ssh) looked in
+  the wrong place or failed outright.
+
+  Worse for wardyn specifically: a `path: ~/.ssh` rule anchors to the *agent's*
+  home, deliberately and correctly, so the rule and the agent disagreed about
+  what `~` meant — the operator protected one directory while the agent read
+  another. Now set from `/etc/passwd`, the same source the anchor uses.
+
+  Found by the stress suite failing for the wrong reason on its first run.
+
 ## [0.4.0] — 2026-09-09
 
 Containment gets its second dimension, and the tool stops calling one of its own

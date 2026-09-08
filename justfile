@@ -108,3 +108,40 @@ fuzz-regress:
         exit 0
     fi
     cargo fuzz run policy_parse fuzz/artifacts/policy_parse/*
+
+# The stress suite: four scenarios that try to break wardyn rather than
+# demonstrate it. `just stress` runs all four; `just stress 01-escape` runs one.
+# See docs/stress/README.md for what each one proves.
+#
+# The default is a glob rather than a conditional, so there is no branch here to
+# get wrong — `just stress` expands to `0*`, a name expands to itself.
+stress name="0*":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    bash scripts/stress/setup.sh
+    shopt -s nullglob
+    found=0
+    for s in scripts/stress/{{name}}.sh; do
+        found=1
+        printf '\n\033[1m=== %s ===\033[0m\n' "$(basename "$s" .sh)"
+        # WARDYN_AUDIT is handed to the AGENT, not to sudo: a NOPASSWD rule names
+        # the wardyn binary, and `sudo VAR=x /path/wardyn` does not match it.
+        sudo ./target/release/wardyn --plain --enforce \
+            --policy scripts/stress/policy.yaml --audit /tmp/wardyn-stress.jsonl \
+            run -- env WARDYN_AUDIT=/tmp/wardyn-stress.jsonl bash "$s"
+    done
+    [ "$found" -eq 1 ] || { echo "no scenario matched: {{name}}"; exit 1; }
+
+# The control for scenario 1: the same attacks against name rules instead of
+# (dev, ino). Without it, "8 blocked" says nothing about what did the blocking.
+stress-control:
+    bash scripts/stress/setup.sh
+    sudo ./target/release/wardyn --plain --enforce \
+        --policy scripts/stress/control.yaml --audit /tmp/wardyn-stress-c.jsonl \
+        run -- bash scripts/stress/01-escape.sh
+
+# Re-record all four stress GIFs. Needs vhs + ttyd + ffmpeg (see RECORDING.md).
+stress-record:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for t in docs/stress/0*.tape; do echo "recording $t"; vhs "$t"; done
