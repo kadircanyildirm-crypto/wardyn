@@ -1119,6 +1119,31 @@ fn to_landlock_right(r: &policy::Right) -> landlock::Right {
     }
 }
 
+/// Can `uid` write this path? Used for the two files whose integrity the whole
+/// tool rests on — the policy that decides what is enforced, and the audit log
+/// that records what was.
+///
+/// Best effort and deliberately blunt: it reads the mode bits and ignores ACLs,
+/// so it can miss a grant. It is a warning, not a gate, and a missed warning is
+/// better than a refusal built on a half-answer.
+fn path_is_writable_by(path: &std::path::Path, uid: u32) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    use std::os::unix::fs::MetadataExt as _;
+    let mode = meta.mode();
+    if mode & 0o002 != 0 {
+        return true;
+    }
+    if meta.uid() == uid {
+        return mode & 0o200 != 0;
+    }
+    if meta.gid() == uid {
+        return mode & 0o020 != 0;
+    }
+    false
+}
+
 /// The (uid, gid) to drop the child to: `--as-user uid[:gid]` wins, else
 /// `$SUDO_UID`/`$SUDO_GID`. `None` if neither yields a non-root uid.
 fn resolve_target_identity(opts: &Opts) -> Option<(u32, u32)> {
@@ -1372,7 +1397,30 @@ async fn run() -> anyhow::Result<i32> {
     let policy = Loader::new()
         .base(anchor_base(&opts))
         .load(opts.policy_path.as_deref())?;
-    notices.push(format!("policy loaded: {}", policy.summary()));
+    // Say WHERE, not just what. Three sources fall back to each other, so
+    // "11 file rules" reads identically whether they are the operator's or the
+    // embedded default that applied because `./policy.yaml` was not where they
+    // thought. Running from a different directory used to change the policy
+    // with nothing said.
+    notices.push(format!(
+        "policy loaded from {}: {}",
+        policy.source(),
+        policy.summary()
+    ));
+    // And whether the thing being constrained can edit its own constraints. The
+    // policy is not just evidence like the audit log — it IS the enforcement, so
+    // an agent that can rewrite it between runs decides what wardyn does next
+    // time. A warning, not a refusal: a policy checked into the project it
+    // governs is a legitimate and common setup, and the operator is the one who
+    // gets to weigh it.
+    if let (Some(pp), Some((uid, _))) = (policy.source().path(), resolve_target_identity(&opts)) {
+        if path_is_writable_by(pp, uid) {
+            notices.push(format!(
+                "the policy file {} is writable by the agent (uid {uid}) — it could rewrite the                  rules that constrain it before the next run. Keep the policy where the agent                  cannot write if that matters.",
+                pp.display()
+            ));
+        }
+    }
     if opts.enforce {
         // Identity rules: say which objects they landed on, and which resolved
         // to nothing. A `path:` rule that silently evaporated (wrong working
