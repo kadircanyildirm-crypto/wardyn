@@ -3151,6 +3151,12 @@ fn plan_seed(self_pid: u32, learned: Option<u32>, namespaced: Option<bool>) -> S
     }
 }
 
+/// The `personality(2)` bits the kernel gives no meaning, and so the only ones
+/// the pid-ns handshake nonce is allowed to occupy. Defined bits are `PER_MASK`
+/// (0x0000_00ff) and the flags from `UNAME26` (0x0002_0000) through
+/// `ADDR_LIMIT_3GB` (0x0800_0000).
+const PERSONALITY_FREE_BITS: u32 = 0xf001_ff00;
+
 /// Learn wardyn's tgid as the kernel's init pid namespace sees it.
 ///
 /// Publish a random nonce in CONFIG, call `personality(nonce)` (a per-process
@@ -3164,9 +3170,24 @@ fn learn_init_ns_tgid(config: &mut Array<MapData, u32>) -> Option<u32> {
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut nb))
         .ok()?;
-    let mut nonce = u32::from_ne_bytes(nb);
-    if nonce == 0 || nonce == u32::MAX {
-        nonce ^= 0x5ad0_1e55; // 0 disables the hook; -1 is personality's query value
+    // Confined to bits `personality(2)` gives no meaning.
+    //
+    // The nonce is passed straight to the syscall, and the kernel stores
+    // whatever it is handed without validating it — so a raw 32-bit value set
+    // real persona flags on wardyn's own thread for the instant before the
+    // restore: `READ_IMPLIES_EXEC`, `ADDR_NO_RANDOMIZE`, `MMAP_PAGE_ZERO`,
+    // `UNAME26`, and an arbitrary exec domain in the low byte. Briefly, and on
+    // one thread, but there is no reason to touch them at all.
+    //
+    // Defined bits are `PER_MASK` (0x0000_00ff) and the flags from `UNAME26`
+    // (0x0002_0000) up to `ADDR_LIMIT_3GB` (0x0800_0000). What is left —
+    // 0x0001_ff00 and the top nibble — is inert, and 13 bits is ample for what
+    // this nonce is for: telling our own `personality()` call apart from an
+    // unrelated one landing in the same nanosecond. It is not a secret, and is
+    // not asked to resist anything (reading CONFIG needs CAP_BPF).
+    let mut nonce = u32::from_ne_bytes(nb) & PERSONALITY_FREE_BITS;
+    if nonce == 0 {
+        nonce = 0x1000_0100; // 0 disables the hook; any free bit will do
     }
     config.set(CFG_HS_NONCE, nonce, 0).ok()?;
     // personality() returns the previous persona; the nonce persona lives only
@@ -3989,5 +4010,25 @@ mod tests {
         assert_eq!(first_symlinked_component(&dir.join("direct.jsonl")), None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The nonce goes straight into `personality(2)`, which stores whatever it
+    /// is handed. A raw 32-bit value therefore set real persona flags on
+    /// wardyn's own thread — briefly, but for no reason. It must now touch only
+    /// bits the syscall gives no meaning.
+    #[test]
+    fn the_handshake_nonce_cannot_set_a_real_persona_bit() {
+        // PER_MASK, plus every flag from UNAME26 to ADDR_LIMIT_3GB.
+        const DEFINED: u32 = 0x0000_00ff | 0x0ffe_0000;
+        assert_eq!(
+            PERSONALITY_FREE_BITS & DEFINED,
+            0,
+            "the nonce may set a defined personality bit"
+        );
+        assert_ne!(PERSONALITY_FREE_BITS, 0, "and must still carry a nonce");
+        assert!(
+            PERSONALITY_FREE_BITS.count_ones() >= 12,
+            "too few bits to tell a concurrent personality() call apart"
+        );
     }
 }

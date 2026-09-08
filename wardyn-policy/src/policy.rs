@@ -4712,4 +4712,190 @@ files:
             "a path outside every granted hierarchy must be refused by containment"
         );
     }
+
+    // ── the kernel matcher against its mirror ───────────────────────────────
+    //
+    // Wardyn makes two promises about every `block` rule, and they point in
+    // opposite directions:
+    //
+    //   * the kernel never denies MORE than the rule says, unless
+    //     `overbroad_block_keys` admits it;
+    //   * the kernel never denies LESS than the rule says, unless
+    //     `observe_only_blocks` admits it.
+    //
+    // Both were checked only by hand-written examples, which is how a 39-byte
+    // rule name came to deny every longer file sharing its prefix for two
+    // releases: nothing compared the two matchers over inputs nobody thought
+    // to write down.
+
+    /// The kernel's view of one path segment: `bpf_probe_read_kernel_str` into
+    /// a zeroed `[u8; NAME_LEN]`, which truncates without saying so.
+    fn kern_seg(seg: &str) -> [u8; NAME_LEN] {
+        let mut k = [0u8; NAME_LEN];
+        let b = seg.as_bytes();
+        let n = b.len().min(NAME_LEN - 1);
+        k[..n].copy_from_slice(&b[..n]);
+        k
+    }
+
+    /// A faithful model of `try_file_open`'s name matching in wardyn-ebpf:
+    /// file pair, bare basename, then the ancestor walk with its dir pairs —
+    /// in that order, with the same `MAX_DIR_WALK` bound and the same skip of
+    /// the dir-pair check at level 0.
+    ///
+    /// Identity (`path:`) rules are out of scope here: they key on `(dev, ino)`,
+    /// which a path string cannot model.
+    fn kernel_denies(p: &Policy, path: &str) -> bool {
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let Some((base, dirs)) = segs.split_last() else {
+            return false;
+        };
+        let bk = kern_seg(base);
+        let holds =
+            |m: &BTreeMap<String, u8>, k: [u8; NAME_LEN]| m.keys().any(|s| name_key(s) == Some(k));
+        let holds_pair =
+            |m: &BTreeMap<(String, String), u8>, a: [u8; NAME_LEN], b: [u8; NAME_LEN]| {
+                m.keys()
+                    .any(|(x, y)| name_key(x) == Some(a) && name_key(y) == Some(b))
+            };
+
+        if let Some(parent) = dirs.last() {
+            if holds_pair(&p.kern_pairs, kern_seg(parent), bk) {
+                return true;
+            }
+        }
+        if holds(&p.kern_names, bk) {
+            return true;
+        }
+        let mut prev = bk;
+        for (level, d) in dirs.iter().rev().enumerate().take(MAX_DIR_WALK) {
+            let dk = kern_seg(d);
+            if level > 0 && holds_pair(&p.kern_dir_pairs, dk, prev) {
+                return true;
+            }
+            if holds(&p.kern_dirs, dk) {
+                return true;
+            }
+            prev = dk;
+        }
+        false
+    }
+
+    /// Systematic rather than random: every path of depth 1..=3 over an
+    /// alphabet chosen to sit on the edges that matter — the exact names the
+    /// rules use, names one byte either side of the truncation boundary, and a
+    /// name long enough to be truncated.
+    fn sweep_paths() -> Vec<String> {
+        let long38 = "L".repeat(NAME_LEN - 2);
+        let long39 = "L".repeat(NAME_LEN - 1);
+        let long45 = "L".repeat(NAME_LEN + 5);
+        let alphabet: Vec<String> = [
+            ".env",
+            ".ssh",
+            ".aws",
+            "etc",
+            "shadow",
+            "credentials",
+            "sub",
+            &long38,
+            &long39,
+            &long45,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let mut out = Vec::new();
+        for a in &alphabet {
+            out.push(format!("/{a}"));
+            for b in &alphabet {
+                out.push(format!("/{a}/{b}"));
+                for c in &alphabet {
+                    out.push(format!("/{a}/{b}/{c}"));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_kernel_never_denies_more_than_the_rule_says_without_admitting_it() {
+        let long38 = "L".repeat(NAME_LEN - 2);
+        let long39 = "L".repeat(NAME_LEN - 1);
+        let paths = sweep_paths();
+
+        // One rule per policy, so a disagreement names its own culprit.
+        for pattern in [
+            "**/.env",
+            "**/.ssh/**",
+            "/etc/shadow",
+            "**/.aws/credentials",
+            &format!("**/{long38}"),
+            &format!("**/{long39}"),
+        ] {
+            let text = format!(
+                "version: 1\ndefault_action: allow\nfiles:\n  - {{ match: \"{pattern}\", action: block }}\n"
+            );
+            let p = Policy::from_yaml_str_with(&text, &null_resolver).unwrap();
+            // Whether this rule ADMITS to over-reaching, once, outside the loop.
+            let admits_over = !p.overbroad_block_keys().is_empty();
+            let admits_under = !p.observe_only_blocks().is_empty();
+
+            for path in &paths {
+                let mirror = p.eval_file(path).action == Action::Block;
+                let kernel = kernel_denies(&p, path);
+
+                if kernel && !mirror {
+                    assert!(
+                        admits_over,
+                        "`{pattern}` silently denies {path} in the kernel but not in the mirror — \
+                         a kernel key broader than the rule that made it, unreported"
+                    );
+                }
+                if mirror && !kernel {
+                    assert!(
+                        admits_under,
+                        "`{pattern}` claims {path} is blocked but no kernel key would fire, and \
+                         observe_only_blocks says nothing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The specific shape the sweep above exists to catch, stated on its own so
+    /// a regression reads as itself rather than as a sweep failure.
+    #[test]
+    fn a_truncated_dentry_read_cannot_impersonate_a_rule_name() {
+        let long39 = "L".repeat(NAME_LEN - 1);
+        let long45 = "L".repeat(NAME_LEN + 5);
+        // The 39-byte rule is no longer kernel-mappable at all...
+        let text = format!(
+            "version: 1\ndefault_action: allow\nfiles:\n  - {{ match: \"**/{long39}\", action: block }}\n"
+        );
+        let p = Policy::from_yaml_str_with(&text, &null_resolver).unwrap();
+        assert!(
+            !kernel_denies(&p, &format!("/home/u/{long45}")),
+            "a 45-byte file was denied by a 39-byte rule through a truncated read"
+        );
+        assert!(
+            !p.observe_only_blocks().is_empty(),
+            "the rule lost kernel enforcement and must say so"
+        );
+
+        // ...and the longest rule that IS still mappable cannot be impersonated.
+        let long38 = "L".repeat(NAME_LEN - 2);
+        let text = format!(
+            "version: 1\ndefault_action: allow\nfiles:\n  - {{ match: \"**/{long38}\", action: block }}\n"
+        );
+        let p = Policy::from_yaml_str_with(&text, &null_resolver).unwrap();
+        assert!(
+            kernel_denies(&p, &format!("/home/u/{long38}")),
+            "must still match itself"
+        );
+        assert!(
+            !kernel_denies(&p, &format!("/home/u/{long45}")),
+            "a truncated read still collides with the longest accepted rule"
+        );
+    }
 }
