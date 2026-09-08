@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# The policy the stress suite attacks. Deliberately small: every scenario should
+# fail or succeed because of a rule you can see, not because of a preset you
+# have to go and read.
+#
+# `path:` rules key on (dev, ino) — the object, not its name. That is what the
+# escape scenario is trying to get around, and what the control run (the same
+# attacks with these rules stripped) proves is doing the work.
+version: 1
+default_action: allow
+
+files:
+  # The two secrets, by identity. A rename, a hard link, or a moved parent
+  # directory does not change an inode.
+  - { path: "~/wardyn-stress/vault/.env",         action: block, access: all }
+  - { path: "~/wardyn-stress/vault/id_ed25519",   action: block, access: all }
+  # The whole vault directory, also by identity — so renaming the DIRECTORY
+  # does not expose what is inside it.
+  - { path: "~/wardyn-stress/vault",              action: block, access: all }
+  - { match: "**", action: allow }
+
+exec:
+  # Nothing to do with secrets: this one is here so the self-defence scenario
+  # has a blocked binary to try to run under another name.
+  - { match: "**/nc", action: block }
+  - { match: "**", action: allow }
+
+network:
+  - { cidr: "127.0.0.0/8", action: allow }
+  - { cidr: "::1/128", action: allow }
+  - { cidr: "0.0.0.0/0", action: block }
+  - { cidr: "::/0", action: block }

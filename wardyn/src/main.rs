@@ -1090,9 +1090,40 @@ fn apply_privilege_drop(
             Ok(())
         });
     }
-    notices.push(format!(
-        "the agent runs as uid={uid} gid={gid}, not root (--keep-root to disable)"
-    ));
+    // A uid is not an identity. `sudo` leaves `HOME=/root`, `USER=root` and
+    // `LOGNAME=root` in the environment, and the child inherits them — so the
+    // agent ran as uid 1000 with a HOME it could not even list, and every tool
+    // that keeps state there (git, npm, cargo, pip, ssh) looked in the wrong
+    // place or failed outright.
+    //
+    // Worse for wardyn specifically: a `path: ~/.ssh` rule anchors to the
+    // *agent's* home, deliberately and correctly. With `$HOME` still root's,
+    // the rule and the agent disagreed about what `~` means — the operator
+    // protected one directory while the agent read another.
+    //
+    // Set from `/etc/passwd`, the same source the anchor uses, so the two
+    // cannot drift apart. A uid with no passwd entry gets nothing rather than a
+    // guess; `unresolved_anchors` already reports that case for the policy side.
+    match passwd_entry_for_uid(uid) {
+        Some((name, home)) => {
+            cmd.env("HOME", &home);
+            cmd.env("USER", &name);
+            cmd.env("LOGNAME", &name);
+            notices.push(format!(
+                "the agent runs as uid={uid} gid={gid} ({name}), not root, with HOME={} \
+                 (--keep-root to disable)",
+                home.display()
+            ));
+        }
+        None => {
+            notices.push(format!(
+                "the agent runs as uid={uid} gid={gid}, not root — but that uid has no \
+                 /etc/passwd entry, so HOME and USER are left as they are ({}). Tools that keep \
+                 state in the home directory will look in the wrong place",
+                std::env::var("HOME").unwrap_or_else(|_| "unset".into())
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1339,6 +1370,11 @@ fn home_for_uid(uid: u32) -> Option<PathBuf> {
 /// The scan itself, over the text rather than the file, so the lines that used
 /// to break it can be handed to a test.
 fn passwd_home(passwd: &str, uid: u32) -> Option<PathBuf> {
+    passwd_entry(passwd, uid).map(|(_, home)| home)
+}
+
+/// `(login name, home)` for `uid`, from the text of `/etc/passwd`.
+fn passwd_entry(passwd: &str, uid: u32) -> Option<(String, PathBuf)> {
     for line in passwd.lines() {
         // name:passwd:uid:gid:gecos:home:shell
         //
@@ -1348,16 +1384,22 @@ fn passwd_home(passwd: &str, uid: u32) -> Option<PathBuf> {
         // one of those anywhere above the target user made every `~` rule
         // resolve to root's home instead.
         let mut f = line.split(':');
-        let Some(u) = f.nth(2) else { continue };
+        let Some(name) = f.next() else { continue };
+        let Some(u) = f.nth(1) else { continue }; // skip the password field
         if u.parse::<u32>() != Ok(uid) {
             continue;
         }
         let Some(home) = f.nth(2) else { continue }; // skip gid, gecos
-        if !home.is_empty() {
-            return Some(PathBuf::from(home));
+        if !home.is_empty() && !name.is_empty() {
+            return Some((name.to_string(), PathBuf::from(home)));
         }
     }
     None
+}
+
+/// `(login name, home)` for `uid` on this machine.
+fn passwd_entry_for_uid(uid: u32) -> Option<(String, PathBuf)> {
+    passwd_entry(&std::fs::read_to_string("/etc/passwd").ok()?, uid)
 }
 
 /// The LSM hooks that carry the `create`/`delete` axis. Attached only when a

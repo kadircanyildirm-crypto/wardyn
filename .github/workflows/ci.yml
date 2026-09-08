@@ -111,7 +111,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: ShellCheck
-        run: shellcheck scripts/*.sh tests/e2e/run.sh .devcontainer/*.sh
+        run: shellcheck scripts/*.sh scripts/stress/*.sh tests/e2e/run.sh .devcontainer/*.sh
 
   # A short, SEEDED fuzz run. The seed is fixed on purpose: an unseeded run
   # explores different inputs every time, so a newly-found crash would fail an

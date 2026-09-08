@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# The CONTROL for scenario 1: the same policy with every `path:` (identity) rule
+# replaced by the name rule an operator would naturally write instead.
+#
+# Without this, an attack that was blocked might have been blocked by something
+# else entirely, and "identity matching works" would be a claim rather than a
+# measurement. Run the same script against this and the bypasses reopen.
+version: 1
+default_action: allow
+
+files:
+  - { match: "**/.env",        action: block, access: all }
+  - { match: "**/id_ed25519",  action: block, access: all }
+  - { match: "**/vault/**",    action: block, access: all }
+  - { match: "**", action: allow }
+
+exec:
+  - { match: "**/nc", action: block }
+  - { match: "**", action: allow }
+
+network:
+  - { cidr: "127.0.0.0/8", action: allow }
+  - { cidr: "::1/128", action: allow }
+  - { cidr: "0.0.0.0/0", action: block }
+  - { cidr: "::/0", action: block }
