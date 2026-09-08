@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A `match:` glob keeps its last two literal segments as the kernel key.**
+  `/etc/shadow` used to compile to the bare name `shadow` and deny every file so
+  called, anywhere; `**/.aws/credentials` denied every `credentials`; and
+  `strict.yaml` had to make `**/.git/config` a `warn` because it and
+  `**/.kube/config` both reduced to `config`. `--dry-run` printed all three as
+  warnings on the shipped policies.
+
+  The LSM hook already walks `d_parent` to match directory rules, so the
+  parent's name is one probe away. Two new maps key on `(parent, name)` —
+  `BLOCK_PAIRS` for files, `BLOCK_DIR_PAIRS` for a subtree and *its* parent —
+  and are consulted before the single-name maps, because a key that says more
+  is the more specific one and the exception it offers is the smaller one.
+  `**/.env` still compiles to `.env` alone (the segment before it is `**`), so a
+  policy written without a literal parent is unchanged.
+
+  Two segments, not N: every rule in the shipped policies fits, and a
+  `N × NAME_LEN` key assembled inside a bounded loop is verifier cost for rules
+  nobody has written. It is still a **suffix** match — `/etc/shadow` means
+  `etc/shadow` at any depth, and `/etc/ssl/private/key.pem` drops its first
+  segment — and `overbroad_block_keys` now reports exactly that remainder
+  instead of the old, much larger one.
+
+  The userspace mirror consults the same keys in the same order, so a predicted
+  pair denial and the kernel's confirmation of it agree; an approve-once
+  exception lifts the pair, not the bare name. Proven end-to-end: the fixtures
+  include a `credentials` that is *not* under `.aws` and a `gcloud` that is
+  *not* under `.config`, and both must open. Seven portable tests pin the
+  reduction, the ordering, the `.git`/`.kube` de-collision, and what
+  `--dry-run` reports as still dropped.
+
 ## [0.1.0] — 2026-09-07
 
 The first release. Wardyn watches one process subtree — an agent and everything

@@ -61,8 +61,8 @@ one that is modest and honest.
 - **No filesystem namespace / containment.** No mount namespace, no chroot, no
   overlay. The whole real filesystem is visible.
 - **Name-based rules are still dodgeable by a rename.** The LSM matcher keys a
-  `match:` glob on a file's basename and on its ancestor directory names, which
-  stops *accidental and naive* access and nothing more: `mv .env x` detaches the
+  `match:` glob on its last two literal segments and on its ancestor directory
+  names, which stops *accidental and naive* access and nothing more: `mv .env x` detaches the
   label and the rule stops applying. The fix is to pair it with a `path:` rule,
   which pins `(dev, ino)` and survives rename, hard link and copy — but that is
   something the policy author has to actually do, and a `path:` rule cannot cover
@@ -137,11 +137,13 @@ Being first to say *"use both"* is more credible than claiming to replace either
   policy is allowlist-shaped (a new `allow_paths:` shape with per-hierarchy
   read/write/exec rights); keep eBPF LSM for blocklist-shaped rules and for the
   observability isolators cannot provide; keep eBPF as the **sole** egress engine.
-- **Full-path file matching** (removing the basename limitation) so the file axis
-  is competitive even without Landlock. `path:` identity rules already cover the
-  half of this that matters most — an object the policy can name today — so what
-  is left is glob rules that keep their directory context instead of reducing to
-  a basename, and objects that do not exist when the policy loads.
+- **Anchored file matching.** Globs now keep their last *two* literal segments,
+  which is what every shipped rule needed; `path:` identity rules cover objects
+  the policy can name today. What is left is the difference between a suffix
+  and an anchor — `/etc/shadow` still means `etc/shadow` at any depth — and
+  objects that do not exist when the policy loads. Landlock's resolved-path
+  hierarchies have neither problem, which is one more reason for the hybrid
+  above.
 - **Structured JSON event stream + metrics** so Wardyn plugs into the SIEM/alerting
   layer the node-scoped tools already own.
 

@@ -88,6 +88,17 @@ make_fixtures() {
   chmod -R 755 "$d/.ssh"
   chmod 644 "$d/.ssh/sub/deeper/id_ed25519"
 
+  # Pair-key fixtures: one of each name where the rule applies, and one where
+  # only the old bare-name key would have. The second of each pair is the
+  # assertion — a `credentials` that is not under `.aws` must open.
+  mkdir -p "$d/.aws" "$d/proj" "$d/.config/gcloud/sub" "$d/other/gcloud"
+  printf 'aws_secret_access_key=nope\n' >"$d/.aws/credentials"
+  printf 'just a file called credentials\n' >"$d/proj/credentials"
+  printf 'gcloud key\n' >"$d/.config/gcloud/sub/key"
+  printf 'unrelated gcloud dir\n' >"$d/other/gcloud/key"
+  chmod 755 "$d/.aws" "$d/proj" "$d/.config" "$d/.config/gcloud" "$d/.config/gcloud/sub" "$d/other" "$d/other/gcloud"
+  chmod 644 "$d/.aws/credentials" "$d/proj/credentials" "$d/.config/gcloud/sub/key" "$d/other/gcloud/key"
+
   # Lifecycle fixtures. `precious.txt` is protected from removal but not from
   # reading; `vault/` is pinned by identity and protects what is under it.
   printf 'do not delete me\n' >"$d/precious.txt"
@@ -182,11 +193,20 @@ else
   echo denied >"$WS/log_read.txt"
 fi
 
+say() { if cat "$1" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
+
+# ── two-component keys: the parent is part of the name now ───────────────────
+# `**/.aws/credentials` used to compile to `credentials` and deny every file so
+# called. Two reads per rule: the one it names, and the one it used to catch.
+say "$WS/.aws/credentials"       >"$WS/pair_aws.txt"
+say "$WS/proj/credentials"       >"$WS/pair_bare.txt"
+say "$WS/.config/gcloud/sub/key" >"$WS/pair_gcloud.txt"
+say "$WS/other/gcloud/key"       >"$WS/pair_other.txt"
+
 # ── identity bypasses: the same object reached under a different name ────────
 # Everything below is one question: does the rule follow the OBJECT, or only the
 # label? Name matching answers "only the label", and each of these walks through.
 cd "$WS" || exit 9
-say() { if cat "$1" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
 
 # 1. rename the secret, then read it under its new name
 if mv .env renamed.txt 2>/dev/null; then say renamed.txt >"$WS/rename_read.txt"
@@ -414,6 +434,29 @@ if [[ $LSM_ACTIVE -eq 1 ]]; then
     *)       fail "access-read check produced no verdict" ;;
   esac
 
+  # ── pairs: `/x/y` denies `y` under `x`, not every `y` ─────────────────────
+
+  case "$(verdict pair_aws.txt)" in
+    denied)  pass "pair: .aws/credentials is denied (the file the rule names)" ;;
+    allowed) fail "the agent READ .aws/credentials — the pair key did not take effect" ;;
+    *)       fail "pair check produced no verdict" ;;
+  esac
+  case "$(verdict pair_bare.txt)" in
+    allowed) pass "pair: a credentials file that is NOT under .aws is readable (the old over-reach is gone)" ;;
+    denied)  fail "proj/credentials was denied — the rule still compiles to the bare name" ;;
+    *)       fail "pair over-reach check produced no verdict" ;;
+  esac
+  case "$(verdict pair_gcloud.txt)" in
+    denied)  pass "pair: a file deep under .config/gcloud is denied (dir pair, ancestor walk)" ;;
+    allowed) fail "the agent READ under .config/gcloud — the dir-pair key did not take effect" ;;
+    *)       fail "dir-pair check produced no verdict" ;;
+  esac
+  case "$(verdict pair_other.txt)" in
+    allowed) pass "pair: a gcloud dir that is NOT under .config is untouched" ;;
+    denied)  fail "other/gcloud/key was denied — the dir rule still compiles to the bare name" ;;
+    *)       fail "dir-pair over-reach check produced no verdict" ;;
+  esac
+
   # ── identity: does the rule follow the object, or only the label? ─────────
 
   case "$(verdict rename_read.txt)" in
@@ -566,6 +609,7 @@ fi
 # 9) --dry-run explains the policy without root, eBPF, or a target.
 DRY="$("$WARDYN" --dry-run --policy "$POLICY" 2>&1)"
 if [[ "$DRY" == *"name=.env"* && "$DRY" == *"dir=.ssh"* && "$DRY" == *"cidr:0.0.0.0/0"* \
+   && "$DRY" == *"name=.aws/credentials"* && "$DRY" == *"dir=.config/gcloud"* \
    && "$DRY" == *"DELETING"* && "$DRY" == *"CREATING"* \
    && "$DRY" == *"blocked by protocol"* && "$DRY" == *"MOST SPECIFIC FIRST"* ]]; then
   pass "--dry-run reports every key the kernel will enforce on, and on which axis"

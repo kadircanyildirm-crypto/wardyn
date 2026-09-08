@@ -37,8 +37,8 @@ use aya::Btf;
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 use wardyn_common::{
-    action, fmode, kind, meta, stat, Event, InodeKey, PortKey4, PortKey6, ProtoKey4, ProtoKey6,
-    ProtoPortKey4, ProtoPortKey6, NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS,
+    action, fmode, kind, meta, stat, Event, InodeKey, PairKey, PortKey4, PortKey6, ProtoKey4,
+    ProtoKey6, ProtoPortKey4, ProtoPortKey6, NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS,
 };
 use wardyn_policy::cli::{self, Mode, Opts, ParseOutcome};
 use wardyn_policy::identity::AnchorBase;
@@ -56,6 +56,25 @@ use crate::receipt::Receipt;
 #[derive(Clone, Copy)]
 struct NameKey([u8; NAME_LEN]);
 unsafe impl aya::Pod for NameKey {}
+
+/// Userspace mirror of `wardyn_common::PairKey`, `Pod` for the two-component
+/// maps. Same orphan-rule story as `NameKey`; layout asserted in the tests.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PairKeyPod {
+    parent: [u8; NAME_LEN],
+    name: [u8; NAME_LEN],
+}
+unsafe impl aya::Pod for PairKeyPod {}
+
+impl From<PairKey> for PairKeyPod {
+    fn from(k: PairKey) -> Self {
+        PairKeyPod {
+            parent: k.parent,
+            name: k.name,
+        }
+    }
+}
 
 /// Userspace mirror of `wardyn_common::Ip6Key` (16-byte v6 address), `Pod` so aya
 /// can use it as the v6 LPM-trie key.
@@ -236,6 +255,7 @@ const CFG_IDENTITY_ON: u32 = 19;
 const CFG_PORT_RULES_ON: u32 = 20;
 const CFG_LIFECYCLE_ON: u32 = 21;
 const CFG_PROTO_RULES_ON: u32 = 22;
+const CFG_PAIRS_ON: u32 = 23;
 
 /// Feed rows that carry an operator/diagnostic message rather than a syscall.
 const KIND_NOTICE: u32 = u32::MAX;
@@ -246,6 +266,10 @@ const KIND_NOTICE: u32 = u32::MAX;
 pub(crate) struct KernelMaps {
     names: BpfHashMap<MapData, NameKey, u8>,
     dirs: BpfHashMap<MapData, NameKey, u8>,
+    /// Two-component keys, `(parent, name)`. Held for the same reason as the
+    /// single-name maps: an exception must be able to lift one mid-run.
+    pairs: BpfHashMap<MapData, PairKeyPod, u8>,
+    dir_pairs: BpfHashMap<MapData, PairKeyPod, u8>,
     execs: BpfHashMap<MapData, NameKey, u8>,
     net4: LpmTrie<MapData, u32, u32>,
     net6: LpmTrie<MapData, Ip6Key, u32>,
@@ -352,6 +376,23 @@ impl KernelMaps {
             dirs.insert(NameKey(k), mask, 0)
                 .context("populating BLOCK_DIRS")?;
         }
+        let (pair_keys, dir_pair_keys) = policy.pair_enforcement();
+        let mut pairs: BpfHashMap<_, PairKeyPod, u8> =
+            BpfHashMap::try_from(ebpf.take_map("BLOCK_PAIRS").context("BLOCK_PAIRS")?)?;
+        for (parent, name, mask) in pair_keys {
+            pairs
+                .insert(PairKeyPod { parent, name }, mask, 0)
+                .context("populating BLOCK_PAIRS")?;
+        }
+        let mut dir_pairs: BpfHashMap<_, PairKeyPod, u8> = BpfHashMap::try_from(
+            ebpf.take_map("BLOCK_DIR_PAIRS")
+                .context("BLOCK_DIR_PAIRS")?,
+        )?;
+        for (parent, name, mask) in dir_pair_keys {
+            dir_pairs
+                .insert(PairKeyPod { parent, name }, mask, 0)
+                .context("populating BLOCK_DIR_PAIRS")?;
+        }
         let mut execs: BpfHashMap<_, NameKey, u8> =
             BpfHashMap::try_from(ebpf.take_map("BLOCK_EXEC").context("BLOCK_EXEC")?)?;
         for (k, mask) in policy.exec_enforcement() {
@@ -391,6 +432,8 @@ impl KernelMaps {
         Ok(KernelMaps {
             names,
             dirs,
+            pairs,
+            dir_pairs,
             execs,
             net4,
             net6,
@@ -457,9 +500,36 @@ impl KernelMaps {
                 None => map.remove(&k).context("removing identity block key"),
             }
         }
+        fn pair_key(parent: &str, name: &str) -> anyhow::Result<PairKeyPod> {
+            Ok(PairKeyPod {
+                parent: policy::name_key(parent).context("parent not kernel-mappable")?,
+                name: policy::name_key(name).context("name not kernel-mappable")?,
+            })
+        }
+        fn lift_pair(
+            map: &mut BpfHashMap<MapData, PairKeyPod, u8>,
+            parent: &str,
+            name: &str,
+            op: u8,
+        ) -> anyhow::Result<()> {
+            let k = pair_key(parent, name)?;
+            let cur = map.get(&k, 0).context("reading pair block key")?;
+            match fmode::without(cur, op) {
+                Some(next) => map.insert(k, next, 0).context("narrowing pair block key"),
+                None => map.remove(&k).context("removing pair block key"),
+            }
+        }
         match key {
             DenialKey::FileName(n) => drop_name(&mut self.names, n),
             DenialKey::FileDir(d) => drop_name(&mut self.dirs, d),
+            DenialKey::FilePair { parent, name } => self
+                .pairs
+                .remove(&pair_key(parent, name)?)
+                .context("removing pair block key"),
+            DenialKey::DirPair { parent, name } => self
+                .dir_pairs
+                .remove(&pair_key(parent, name)?)
+                .context("removing dir-pair block key"),
             DenialKey::Exec(n) => drop_name(&mut self.execs, n),
             DenialKey::FileInode { dev, ino } => drop_ino(&mut self.inodes, *dev, *ino),
             DenialKey::DirInode { dev, ino } => drop_ino(&mut self.dir_inodes, *dev, *ino),
@@ -522,6 +592,12 @@ impl KernelMaps {
                 match key.as_ref() {
                     DenialKey::FileName(n) => lift_name(&mut self.names, n, bit),
                     DenialKey::FileDir(d) => lift_name(&mut self.dirs, d, bit),
+                    DenialKey::FilePair { parent, name } => {
+                        lift_pair(&mut self.pairs, parent, name, bit)
+                    }
+                    DenialKey::DirPair { parent, name } => {
+                        lift_pair(&mut self.dir_pairs, parent, name, bit)
+                    }
                     DenialKey::FileInode { dev, ino } => {
                         lift_ino(&mut self.inodes, *dev, *ino, bit)
                     }
@@ -1265,6 +1341,7 @@ async fn run() -> anyhow::Result<i32> {
     // the axis existed cannot start refusing an `rm` because wardyn was updated.
     config.set(CFG_LIFECYCLE_ON, u32::from(policy.has_lifecycle_rules()), 0)?;
     config.set(CFG_PROTO_RULES_ON, u32::from(policy.has_proto_rules()), 0)?;
+    config.set(CFG_PAIRS_ON, u32::from(policy.has_pair_rules()), 0)?;
 
     // LSM dentry offsets: resolve them from the running kernel's own BTF so the
     // file/exec matcher adapts to the kernel instead of being pinned to 6.8. On
@@ -1831,6 +1908,11 @@ fn confirmation_key(ev: &Event) -> Option<(u32, String)> {
 fn prediction_key(k: &DenialKey) -> String {
     match k {
         DenialKey::FileName(n) | DenialKey::FileDir(n) | DenialKey::Exec(n) => n.clone(),
+        // Matches `event_key_name` for a pair-keyed kernel event, so a
+        // predicted pair denial and the kernel's confirmation of it agree.
+        DenialKey::FilePair { parent, name } | DenialKey::DirPair { parent, name } => {
+            format!("{parent}/{name}")
+        }
         DenialKey::Net4(ip) => ip.to_string(),
         DenialKey::Net6(ip) => ip.to_string(),
         // Matches `confirmation_key`, which keys a network confirmation on the
@@ -1906,6 +1988,14 @@ pub(crate) fn describe(
                     ino: ev.ino,
                 },
                 (_, meta::KEY_DIR) => DenialKey::FileDir(name.clone()),
+                (_, meta::KEY_PAIR) => {
+                    let (parent, name) = event_pair_names(ev);
+                    DenialKey::FilePair { parent, name }
+                }
+                (_, meta::KEY_DIR_PAIR) => {
+                    let (parent, name) = event_pair_names(ev);
+                    DenialKey::DirPair { parent, name }
+                }
                 _ => DenialKey::FileName(name.clone()),
             };
             // A lifecycle denial matched one of the same four file keys, but on
@@ -2244,8 +2334,21 @@ fn field_str(b: &[u8]) -> String {
 
 /// The matched key carried by a `DENY_FILE` / `DENY_EXEC` event.
 fn event_key_name(ev: &Event) -> String {
+    if matches!(ev.meta, meta::KEY_PAIR | meta::KEY_DIR_PAIR) {
+        let (parent, name) = event_pair_names(ev);
+        return format!("{parent}/{name}");
+    }
     let len = (ev.path_len as usize).min(PATH_LEN);
     field_str(&ev.path[..len])
+}
+
+/// The two halves of a pair-keyed denial: parent in the first [`NAME_LEN`]
+/// bytes of `path`, name in the next. Fixed widths, so no delimiter parsing.
+fn event_pair_names(ev: &Event) -> (String, String) {
+    (
+        field_str(&ev.path[..NAME_LEN]),
+        field_str(&ev.path[NAME_LEN..2 * NAME_LEN]),
+    )
 }
 
 /// The observed path, or `None` when the kernel could not capture it (a path at
@@ -2423,6 +2526,67 @@ mod tests {
             )
         };
         assert_eq!(a, b, "InoKey and InodeKey do not agree byte-for-byte");
+    }
+
+    /// And for the two-component key. A drifted mirror here is a rule that
+    /// silently matches nothing — the same failure as a drifted `InoKey`.
+    #[test]
+    fn the_pair_key_mirror_has_the_shared_layout() {
+        use core::mem::{align_of, size_of};
+        assert_eq!(size_of::<PairKeyPod>(), size_of::<PairKey>());
+        assert_eq!(align_of::<PairKeyPod>(), align_of::<PairKey>());
+        assert_eq!(
+            size_of::<PairKey>(),
+            2 * NAME_LEN,
+            "two fixed fields, nothing else"
+        );
+
+        let mut parent = [0u8; NAME_LEN];
+        parent[..4].copy_from_slice(b".aws");
+        let mut name = [0u8; NAME_LEN];
+        name[..11].copy_from_slice(b"credentials");
+        let shared = PairKey { parent, name };
+        let mirror = PairKeyPod::from(shared);
+        let a = unsafe {
+            core::slice::from_raw_parts(
+                (&shared as *const PairKey) as *const u8,
+                size_of::<PairKey>(),
+            )
+        };
+        let b = unsafe {
+            core::slice::from_raw_parts(
+                (&mirror as *const PairKeyPod) as *const u8,
+                size_of::<PairKeyPod>(),
+            )
+        };
+        assert_eq!(a, b, "PairKeyPod and PairKey do not agree byte-for-byte");
+        // Parent first: that is the order the kernel writes the two halves into
+        // an event's `path`, and what `event_pair_names` splits on.
+        assert_eq!(&a[..4], b".aws");
+        assert_eq!(&a[NAME_LEN..NAME_LEN + 11], b"credentials");
+    }
+
+    /// A pair-keyed kernel event decodes to the pair, and to the same string
+    /// a prediction of it would have recorded — or the kernel's confirmation
+    /// never matches the row it confirms.
+    #[test]
+    fn a_pair_denial_decodes_to_the_pair_and_confirms_its_own_prediction() {
+        let mut e = Event::zeroed();
+        e.kind = kind::DENY_FILE;
+        e.meta = meta::KEY_PAIR;
+        e.path[..4].copy_from_slice(b".aws");
+        e.path[NAME_LEN..NAME_LEN + 11].copy_from_slice(b"credentials");
+        e.path_len = (2 * NAME_LEN) as u32;
+
+        let (parent, name) = event_pair_names(&e);
+        assert_eq!((parent.as_str(), name.as_str()), (".aws", "credentials"));
+        assert_eq!(event_key_name(&e), ".aws/credentials");
+
+        let predicted = prediction_key(&DenialKey::FilePair {
+            parent: ".aws".into(),
+            name: "credentials".into(),
+        });
+        assert_eq!(confirmation_key(&e), Some((kind::OPEN, predicted)));
     }
 
     /// Same contract for the four protocol keys. A drifted mirror here is a key

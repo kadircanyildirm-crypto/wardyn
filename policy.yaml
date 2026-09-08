@@ -33,6 +33,9 @@ files:
   - { match: "**/.env", action: block }
   - { match: "**/.env.*", action: block }
   - { match: "**/.ssh/**", action: block }
+  # A glob keeps its last two literal segments as the kernel key, so these mean
+  # `credentials` under `.aws`, `gcloud` under `.config`, `shadow` under `etc` —
+  # not every file so named. `wardyn --dry-run` prints the exact key.
   - { match: "**/.aws/credentials", action: block }
   - { match: "**/.config/gcloud/**", action: block }
   - { match: "/etc/shadow", action: block }

@@ -61,9 +61,9 @@ Out of scope (known limitations, documented, not vulnerabilities):
 - **Fail-open by design.** On a kernel read error or a verifier/attach failure,
   Wardyn allows the operation rather than denying it. This is deliberate: Wardyn
   must never brick an otherwise-working system.
-- **Observe-only rules.** File/exec `block` rules that don't reduce to an exact
-  basename or parent-directory name, and default-deny on files/exec, are flagged
-  in the feed but **not** kernel-enforced. The feed labels these honestly
+- **Observe-only rules.** File/exec `block` rules whose last segment is not a
+  literal name (`**/*.key`, `**/.env.*`), and default-deny on files/exec, are
+  flagged in the feed but **not** kernel-enforced. The feed labels these honestly
   (`block~`).
 - **Kernel-offset drift.** File/exec enforcement reads `struct file`, `dentry` and
   `inode` fields by byte offset. Wardyn resolves them from the running kernel's
@@ -83,8 +83,11 @@ Out of scope (known limitations, documented, not vulnerabilities):
   maps and disable itself — do not run untrusted agents with `--keep-root`.
 
 - **`match:` rules are name-based, and a name comes off with one `mv`.** The LSM
-  matcher keys a glob rule on the file's basename and on the names of its ancestor
-  directories (a bounded walk, so a `**/dir/**` rule does cover the whole subtree).
+  matcher keys a glob rule on its last two literal segments — `(parent, name)`
+  when the parent is literal, the bare name when it is not — and on the names of
+  its ancestor directories (a bounded walk, so a `**/dir/**` rule does cover the
+  whole subtree). Two segments is still a suffix match: `/etc/shadow` denies
+  `etc/shadow` at any depth, and `--dry-run` says so.
   That stops *accidental and naive* access, and is **bypassable** by renaming or
   hard-linking the target before opening it: a rule that does not name
   `access: delete` permits the `mv`, and `link()` is only consulted for the name

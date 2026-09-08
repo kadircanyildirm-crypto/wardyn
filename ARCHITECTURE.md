@@ -20,7 +20,7 @@ operation by returning an error to the kernel, not after the fact.
 | Capability | Observe hook | Enforce hook | Can block? | Notes |
 |---|---|---|---|---|
 | **exec** | `tracepoint/syscalls/sys_enter_execve` + `sys_enter_execveat` | LSM `bprm_check_security` | ✅ (LSM) | deny returns `-EPERM` to `execve`; both syscall variants observed so a denial can't happen off-feed |
-| **file open** (`.env`, `~/.ssh`) | `tracepoint/syscalls/sys_enter_openat` + `sys_enter_openat2` | LSM `file_open` | ✅ (LSM only) | `bpf_override_return` can't deny `openat` — not on the kernel error-injection allowlist, so blocking *requires* BPF LSM. Matches the basename, then **every ancestor directory** (bounded walk) |
+| **file open** (`.env`, `~/.ssh`) | `tracepoint/syscalls/sys_enter_openat` + `sys_enter_openat2` | LSM `file_open` | ✅ (LSM only) | `bpf_override_return` can't deny `openat` — not on the kernel error-injection allowlist, so blocking *requires* BPF LSM. Matches `(parent, name)` then the bare name, then **every ancestor directory** with its parent (bounded walk) |
 | **file create / delete** | *(none — see note)* | LSM `inode_unlink`, `inode_rmdir`, `inode_rename`, `inode_create`, `inode_mkdir` | ✅ (LSM only) | `file_open` does not fire for `unlink(2)`, so the `delete` axis needed its own hooks. Matches the same four maps as `file_open`, on a different bit of the stored mask. `inode_rename` checks **both** ends: source as a delete, destination as a create |
 | **outbound connect** | `tracepoint/syscalls/sys_enter_connect` + `sys_enter_sendto` | `cgroup/connect4·6` + `cgroup/sendmsg4·6` | ✅ (cgroup v2) | cgroup hook denies `connect()`/`sendmsg()` **without** LSM — works even on stock WSL2. `sendmsg`'s msghdr destination is enforce-only (not observed), but a denial there still reports itself |
 | **fork / child tracking** | `tracepoint/sched/sched_process_fork` (+ `sched_process_exit` to evict) | — | — | maintains the watched PID set; the parent's tgid comes from `bpf_get_current_pid_tgid` (the hook runs in the parent), the child's pid offset from tracefs at runtime |
@@ -235,10 +235,22 @@ claiming to).
      Checked first because it is the more specific statement: a file matched by
      inode matches whatever it is currently called, and reporting the *name* rule
      for it would tell the operator the wrong story.
-  2. **Basename.** `file->f_path.dentry->d_name` against `BLOCK_NAMES`.
+  2. **Pair, then basename.** `(d_parent->d_name, d_name)` against `BLOCK_PAIRS`,
+     then `d_name` alone against `BLOCK_NAMES`. The pair goes first because it is
+     the more specific key and the exception it offers is the smaller one — "this
+     `credentials`, under `.aws`" rather than "any `credentials`".
   3. **Ancestors.** Walking `d_parent` up to `MAX_DIR_WALK` levels, checking each
-     ancestor's inode against `BLOCK_DIR_INODES` and its name against `BLOCK_DIRS`
-     — so `mv .ssh dotssh` does not expose the subtree.
+     ancestor's inode against `BLOCK_DIR_INODES`, then `(its parent, it)` against
+     `BLOCK_DIR_PAIRS`, then its name alone against `BLOCK_DIRS` — so
+     `mv .ssh dotssh` does not expose the subtree, and `**/.config/gcloud/**`
+     leaves an unrelated `gcloud` alone.
+
+  A glob keeps its **last two literal segments** as the kernel key: `/etc/shadow`
+  → `(etc, shadow)`, `**/.aws/credentials` → `(.aws, credentials)`, `**/.env` →
+  `.env` alone (the segment before it is `**`). Two, not N: every rule in the
+  shipped policies fits, and a key of `N × NAME_LEN` bytes assembled in a bounded
+  loop is verifier cost for rules nobody has written. What a rule said beyond two
+  segments is exactly what `--dry-run` reports as dropped.
 
   Each hit is gated on the access the open requested (`file->f_mode`) matching the
   mask stored with the key. Every offset — `f_path.dentry`, `d_name.name`,
@@ -300,9 +312,9 @@ claiming to).
   the feed only when it is refused, and the row says so. Adding `sys_enter_unlink`
   and friends would make the feed symmetric; it would not change what is enforced.
 
-**Feed/kernel reconciliation.** The basename/dir reduction is coarser than the glob
-a rule was written as (`/etc/shadow` → deny any file named `shadow`; `**/.ssh/**`
-→ only the immediate `.ssh` parent, not deep descendants). Rather than let the feed
+**Feed/kernel reconciliation.** The two-segment reduction is still coarser than the
+glob a rule was written as: `/etc/shadow` → `etc/shadow` at *any* depth, and
+`/etc/ssl/private/key.pem` drops its first segment. Rather than let the feed
 disagree with the syscall's real outcome, under `--enforce` userspace reproduces the
 kernel matcher for each event: a rule that over-blocks is shown (and audited) as an
 enforced `BLOCK`, and an enforceable-looking glob the kernel *won't* actually deny is
