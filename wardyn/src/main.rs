@@ -980,9 +980,16 @@ fn apply_privilege_drop(
     let (uid, gid) = match resolve_target_identity(opts) {
         Some(t) => t,
         None => {
-            let msg = "could not determine a non-root user to drop the agent to (no --as-user and \
-                       no usable $SUDO_UID). Run wardyn via `sudo`, pass --as-user <uid[:gid]>, or \
-                       --keep-root to intentionally run the agent as root";
+            let msg = if requested_target_identity(opts).is_some_and(|(uid, _)| uid == 0) {
+                "the requested target identity is root (uid 0), which is not a privilege drop — \
+                 the agent would keep the privilege it needs to rewrite wardyn's maps and switch \
+                 off its own supervision. Pass a non-root --as-user, or --keep-root to say root \
+                 is what you meant"
+            } else {
+                "could not determine a non-root user to drop the agent to (no --as-user and no \
+                 usable $SUDO_UID). Run wardyn via `sudo`, pass --as-user <uid[:gid]>, or \
+                 --keep-root to intentionally run the agent as root"
+            };
             if opts.enforce {
                 bail!("{msg} (refused under --enforce: a root child can disable enforcement)");
             }
@@ -1006,13 +1013,25 @@ fn apply_privilege_drop(
             }
             // No setuid binary the agent execs can regain privilege. Pass the
             // variadic args as c_ulong so the full 64-bit registers are well-defined.
-            libc::prctl(
+            //
+            // Checked, unlike the usual treatment of this call. It is the last
+            // of the three things the drop actually is — a non-root uid, no
+            // supplementary groups, and no route back — and the only one whose
+            // failure leaves the other two looking successful. Where
+            // `allow_paths:` is set the containment closure would refuse a few
+            // instructions later anyway (Landlock requires NO_NEW_PRIVS), but
+            // most policies do not set it, and silently weaker is the one
+            // outcome this codebase does not allow itself.
+            if libc::prctl(
                 libc::PR_SET_NO_NEW_PRIVS,
                 1 as libc::c_ulong,
                 0 as libc::c_ulong,
                 0 as libc::c_ulong,
                 0 as libc::c_ulong,
-            );
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -1146,7 +1165,7 @@ fn path_is_writable_by(path: &std::path::Path, uid: u32) -> bool {
 
 /// The (uid, gid) to drop the child to: `--as-user uid[:gid]` wins, else
 /// `$SUDO_UID`/`$SUDO_GID`. `None` if neither yields a non-root uid.
-fn resolve_target_identity(opts: &Opts) -> Option<(u32, u32)> {
+fn requested_target_identity(opts: &Opts) -> Option<(u32, u32)> {
     if let Some(spec) = &opts.as_user {
         let mut it = spec.splitn(2, ':');
         let uid: u32 = it.next()?.parse().ok()?;
@@ -1157,14 +1176,25 @@ fn resolve_target_identity(opts: &Opts) -> Option<(u32, u32)> {
         return Some((uid, gid));
     }
     let uid: u32 = std::env::var("SUDO_UID").ok()?.parse().ok()?;
-    if uid == 0 {
-        return None;
-    }
     let gid: u32 = std::env::var("SUDO_GID")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(uid);
     Some((uid, gid))
+}
+
+/// The identity to actually drop to — the requested one, minus root.
+///
+/// Root is filtered here rather than at the two call sites, because "the target
+/// identity" and "an identity worth dropping to" are the same question
+/// everywhere it is asked. `$SUDO_UID=0` (root invoking `sudo`) was already
+/// rejected; `--as-user 0` was not, and it took the privilege drop straight
+/// through `setuid(0)` — a no-op — past the `--enforce` refusal that exists to
+/// stop exactly this, and out the other side printing *"the agent runs as
+/// uid=0 gid=0, not root"*. It was `--keep-root` without the warning, spelled
+/// as its opposite.
+fn resolve_target_identity(opts: &Opts) -> Option<(u32, u32)> {
+    requested_target_identity(opts).filter(|(uid, _)| *uid != 0)
 }
 
 /// Where a `path:` rule's relative path and `~` resolve from.
@@ -1177,9 +1207,18 @@ fn resolve_target_identity(opts: &Opts) -> Option<(u32, u32)> {
 ///   anchored root's keys instead of the user's would protect the wrong thing
 ///   while looking correct.
 fn anchor_base(opts: &Opts) -> AnchorBase {
-    let home = resolve_target_identity(opts)
-        .and_then(|(uid, _)| home_for_uid(uid))
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let home = match resolve_target_identity(opts) {
+        // We know who the agent will be, so `~` is *their* home and nothing
+        // else. Deliberately no `$HOME` fallback here: wardyn runs under
+        // `sudo`, where `$HOME` is root's, and a uid with no `/etc/passwd`
+        // entry would then silently pin `/root/.ssh` for a `~/.ssh` rule —
+        // protecting the wrong directory while reading as correct. Unresolved
+        // is reported by `unresolved_anchors`; wrong is not reported at all.
+        Some((uid, _)) => home_for_uid(uid),
+        // No drop is happening, so the agent inherits this process's identity
+        // and `~` means here what it will mean there.
+        None => std::env::var_os("HOME").map(PathBuf::from),
+    };
     AnchorBase {
         cwd: std::env::current_dir().ok(),
         home,
@@ -1193,15 +1232,26 @@ fn anchor_base(opts: &Opts) -> AnchorBase {
 /// answered would be worse than one that only knows local accounts. A miss is
 /// reported by the caller as an unresolved rule, never guessed.
 fn home_for_uid(uid: u32) -> Option<PathBuf> {
-    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd_home(&std::fs::read_to_string("/etc/passwd").ok()?, uid)
+}
+
+/// The scan itself, over the text rather than the file, so the lines that used
+/// to break it can be handed to a test.
+fn passwd_home(passwd: &str, uid: u32) -> Option<PathBuf> {
     for line in passwd.lines() {
         // name:passwd:uid:gid:gecos:home:shell
+        //
+        // A line that does not parse is skipped, never fatal. `?` here used to
+        // abandon the whole scan on the first odd entry — and `/etc/passwd`
+        // has them: an NIS compat line (`+::::::`) has an empty uid field, so
+        // one of those anywhere above the target user made every `~` rule
+        // resolve to root's home instead.
         let mut f = line.split(':');
-        let (_name, _pw, u) = (f.next()?, f.next()?, f.next()?);
-        if u.parse::<u32>().ok()? != uid {
+        let Some(u) = f.nth(2) else { continue };
+        if u.parse::<u32>() != Ok(uid) {
             continue;
         }
-        let home = f.nth(2)?; // skip gid, gecos
+        let Some(home) = f.nth(2) else { continue }; // skip gid, gecos
         if !home.is_empty() {
             return Some(PathBuf::from(home));
         }
@@ -1472,10 +1522,22 @@ async fn run() -> anyhow::Result<i32> {
     // directory the agent is working in. The open descriptor is safe — appends
     // follow the inode — but the finished log can be moved aside afterwards and
     // replaced, which nobody reading it later could detect.
+    if let Some(link) = first_symlinked_component(&opts.audit_path) {
+        notices.push(format!(
+            "the audit log path goes through a symlink ({}) — records are being written to {}, \
+             not to {}. O_NOFOLLOW refuses a symlinked log file, but not a symlinked directory \
+             above it, so check that this redirection is yours",
+            link.display(),
+            audit.path(),
+            opts.audit_path.display()
+        ));
+    }
     if let Some((uid, _)) = resolve_target_identity(&opts) {
         if audit::Audit::directory_is_writable_by(&opts.audit_path, uid) {
             notices.push(format!(
-                "the audit log's directory is writable by the agent (uid {uid}) — this run's                  records are safe, but the file can be swapped for another after wardyn exits.                  Point --audit somewhere only root can write if the log has to be evidence."
+                "the audit log's directory is writable by the agent (uid {uid}) — this run's \
+                 records are safe, but the file can be swapped for another after wardyn exits. \
+                 Point --audit somewhere only root can write if the log has to be evidence."
             ));
         }
     }
@@ -2824,6 +2886,43 @@ fn parse_format_offset(format: &str, field: &str) -> Option<u32> {
     None
 }
 
+/// The first component of `path` that is a symlink, if any.
+///
+/// `O_NOFOLLOW` refuses to follow the **final** component and nothing else, so a
+/// path wardyn opens as root can still be redirected by a symlinked parent that
+/// the agent planted on an earlier run:
+///
+/// ```text
+/// $ ln -s /elsewhere proj/logs          # the agent, previously
+/// $ wardyn --audit logs/audit.jsonl ...  # root writes /elsewhere/audit.jsonl
+/// ```
+///
+/// Wardyn reported `logged to logs/audit.jsonl` either way, which is the part
+/// that matters: the record went somewhere other than where the operator was
+/// told it went, and nothing said so.
+///
+/// This walks the requested path rather than comparing against a canonical
+/// form, because the two disagree for an innocent reason — a working directory
+/// reached through a symlink — and a warning that fires on those is a warning
+/// operators learn to ignore. Only components the caller actually asked for are
+/// examined, so `wardyn-audit.jsonl` in a symlinked cwd stays quiet.
+fn first_symlinked_component(path: &std::path::Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for part in path.components() {
+        prefix.push(part);
+        // A symlink as the FINAL component is `O_NOFOLLOW`'s job and is already
+        // refused; here we only care about what leads to it.
+        if prefix == path {
+            break;
+        }
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(m) if m.file_type().is_symlink() => return Some(prefix),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The inode the kernel gives the **initial** pid namespace.
 ///
 /// `PROC_PID_INIT_INO` in `include/linux/proc_ns.h` — a fixed value, not an
@@ -3637,5 +3736,113 @@ mod tests {
                 == SeedPlan::Refuse("wardyn is inside a pid namespace"),
             "wardyn must refuse to scope by pid in there"
         );
+    }
+
+    // ── who the agent is dropped to ─────────────────────────────────────────
+
+    fn opts_with_user(spec: &str) -> Opts {
+        let args: Vec<std::ffi::OsString> = ["--as-user", spec, "run", "--", "true"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        match cli::parse_from(args).unwrap() {
+            ParseOutcome::Run(o) => *o,
+            _ => panic!("expected run opts"),
+        }
+    }
+
+    /// `--as-user 0` is not a privilege drop. It used to pass straight through
+    /// `setuid(0)` — a successful no-op — past the `--enforce` refusal that
+    /// exists to stop a root child, and out the other side printing "the agent
+    /// runs as uid=0 gid=0, not root". `$SUDO_UID=0` was already rejected; this
+    /// closes the other door to the same room.
+    #[test]
+    fn root_is_not_a_target_identity_however_it_is_requested() {
+        assert_eq!(resolve_target_identity(&opts_with_user("0")), None);
+        assert_eq!(resolve_target_identity(&opts_with_user("0:0")), None);
+        // ...but the request stays legible, so the refusal can name it instead
+        // of reporting the misleading "no target found".
+        assert_eq!(
+            requested_target_identity(&opts_with_user("0")),
+            Some((0, 0))
+        );
+    }
+
+    /// A non-root `--as-user` is untouched by that filter.
+    #[test]
+    fn a_non_root_target_identity_is_taken_as_given() {
+        assert_eq!(
+            resolve_target_identity(&opts_with_user("1000:2000")),
+            Some((1000, 2000))
+        );
+        assert_eq!(
+            resolve_target_identity(&opts_with_user("1000")),
+            Some((1000, 1000)),
+            "a bare uid supplies the gid"
+        );
+    }
+
+    /// `~` must anchor to the AGENT's home. With a known target uid there is no
+    /// `$HOME` fallback, because under `sudo` that is root's: a `~/.ssh` rule
+    /// would have pinned `/root/.ssh`, protecting the wrong directory while
+    /// reading as correct. Unresolved is honest; wrong is not.
+    #[test]
+    fn an_unknown_target_home_does_not_fall_back_to_roots() {
+        // uid 4242 has no /etc/passwd entry on any machine this runs on.
+        let base = anchor_base(&opts_with_user("4242"));
+        assert_eq!(
+            base.home, None,
+            "`~` resolved to {:?} for a uid with no home — almost certainly root's",
+            base.home
+        );
+    }
+
+    /// One odd line in `/etc/passwd` used to end the scan rather than skip an
+    /// entry. `+::::::` (NIS compat) has an empty uid field, so a single one of
+    /// those above the target user silently unanchored every `~` rule.
+    #[test]
+    fn a_malformed_passwd_line_does_not_abandon_the_scan() {
+        // root is last here, behind three lines that each stopped the old parser.
+        let passwd = "+::::::\n\n#comment\nroot:x:0:0:root:/root:/bin/bash\n";
+        assert_eq!(passwd_home(passwd, 0), Some(PathBuf::from("/root")));
+        assert_eq!(passwd_home(passwd, 4242), None, "a uid that is not there");
+        assert_eq!(
+            passwd_home("nohome:x:7:7:::/bin/sh\n", 7),
+            None,
+            "an empty home field is not a home"
+        );
+    }
+
+    // ── a redirected security record ────────────────────────────────────────
+
+    /// `O_NOFOLLOW` refuses a symlinked log FILE and nothing above it, so an
+    /// agent that plants a symlinked parent on one run redirects root's writes
+    /// on the next — and wardyn used to report the path it was asked for either
+    /// way. The redirection is the operator's call; being told about it is not.
+    #[test]
+    fn a_symlinked_parent_directory_is_spotted() {
+        let dir = std::env::temp_dir().join(format!("wardyn-fsc-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("logs")).unwrap();
+
+        assert_eq!(
+            first_symlinked_component(&dir.join("logs").join("audit.jsonl")),
+            Some(dir.join("logs")),
+            "the planted parent went unnoticed"
+        );
+        assert_eq!(
+            first_symlinked_component(&dir.join("real").join("audit.jsonl")),
+            None,
+            "an ordinary path must stay quiet — a warning that cries wolf is ignored"
+        );
+
+        // A symlink as the FINAL component is `O_NOFOLLOW`'s job, and `Audit`
+        // already refuses it. Reporting it here too would double up on one
+        // event and blur which check did the refusing.
+        std::os::unix::fs::symlink(dir.join("real/x"), dir.join("direct.jsonl")).unwrap();
+        assert_eq!(first_symlinked_component(&dir.join("direct.jsonl")), None);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

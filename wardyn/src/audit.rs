@@ -8,6 +8,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 
 use anyhow::{bail, Context as _, Result};
@@ -137,9 +138,22 @@ impl Audit {
             );
         }
 
+        // Where the bytes ACTUALLY go, read back from the descriptor while we
+        // still hold it.
+        let real = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+
         Ok(Audit {
             writer: BufWriter::new(file),
-            path: path.display().to_string(),
+            // Read back from the descriptor rather than from the string we
+            // were handed: `O_NOFOLLOW` refuses a symlinked log file but not a
+            // symlinked directory above it, so the requested path and the real
+            // one can differ — and a security record that reports the wrong
+            // location is the failure this file exists to avoid. Falls back to
+            // the requested path when procfs is unavailable, which is the only
+            // thing left to say at that point.
+            path: real,
             count: 0,
             write_failures: 0,
         })
@@ -470,5 +484,27 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "one record is one line");
         assert!(!text.contains('\x1b'));
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The log reports where the bytes went, not where they were asked to go.
+    /// A symlinked parent redirects a root-owned write that `O_NOFOLLOW` does
+    /// not cover, and a security record naming the wrong file is worse than one
+    /// naming an inconvenient file.
+    #[test]
+    fn the_reported_path_is_where_the_bytes_actually_went() {
+        let dir = std::env::temp_dir().join(format!("wardyn-realpath-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("logs")).unwrap();
+
+        let asked = dir.join("logs").join("audit.jsonl");
+        let a = Audit::create(&asked).unwrap();
+        assert_eq!(
+            a.path(),
+            dir.join("real").join("audit.jsonl").display().to_string(),
+            "reported {} for a log that landed elsewhere",
+            a.path()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
