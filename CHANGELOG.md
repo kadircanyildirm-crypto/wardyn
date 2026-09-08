@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`allow_paths:` — filesystem containment, via Landlock.** Everything wardyn
+  enforced until now was a blocklist: name what is forbidden, and anything the
+  policy forgot stays reachable. That is the right shape for "this machine,
+  minus these secrets" and the wrong one for "only this project directory".
+
+  ```yaml
+  allow_paths:
+    - { path: "/usr", rights: [read, exec] }
+    - { path: "/etc", rights: [read] }
+    - { path: ".",    rights: [read, write, exec] }
+  ```
+
+  The agent reaches those hierarchies and nothing else. Applied to the child
+  before `exec`, inherited by every descendant, impossible to undo — and it
+  needs no privilege, so it holds even for a root agent, unlike the eBPF half.
+  This closes the "hybrid engine" item `COMPARISON.md` carried as the largest
+  remaining capability gap.
+
+  Three decisions worth the words:
+
+  **The ruleset is built in the parent, while still root.** Adding a hierarchy
+  means opening a descriptor for it, and the child has already dropped
+  privileges by the time it could try. The child inherits the descriptor and
+  makes one syscall, which is what keeps it safe inside `pre_exec`.
+
+  **Every right the kernel knows is *handled*; the policy chooses what is
+  *granted*.** A right left out of `handled_access_fs` is not denied, it is
+  ignored — so handling only the rights that appear in `rights:` would build a
+  ruleset that looks restrictive and silently permits everything nobody
+  mentioned. `REFER` is handled from ABI 2 up for the same reason: without it,
+  containment would have a hole shaped exactly like `mv`.
+
+  **This one refuses instead of degrading.** Everywhere else wardyn fails open
+  and says so, because a broken matcher costs one axis while bricking a working
+  machine would be worse. An allowlist is the whole boundary, so failing open
+  does not weaken it — it removes it. `allow_paths:` present with Landlock
+  unusable, or a granted path that will not resolve, is a startup error.
+
+  Three rights (`read`/`write`/`exec`) rather than Landlock's sixteen bits:
+  policy authors have opinions about reading, changing and running, not about
+  FIFOs versus sockets. `write` covers creating, removing, renaming and
+  truncating — a project directory an agent cannot save a new file into is not
+  one it can work in.
+
+  Proven on a real kernel by eight e2e assertions: the granted hierarchy is
+  readable and writable, a file outside it is neither, a read-only grant refuses
+  writes, and `mv` out of the allowlist is refused.
+  [`policies/contained.yaml`](policies/contained.yaml) is a starting preset, and
+  `--dry-run` lists the boundary before the rules inside it and says in as many
+  words that an unlisted path is denied.
+
 - **Published overhead numbers, and `scripts/bench.sh` to reproduce them.** A
   tool in the path of every `open` in a subtree had never published a figure,
   which asks users to trust it about the one thing they can measure themselves.

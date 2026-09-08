@@ -20,6 +20,7 @@
 //! operation failed instead of flailing against a bare EPERM.
 mod audit;
 mod btf;
+mod landlock;
 mod overrides_file;
 mod receipt;
 mod tui;
@@ -1021,6 +1022,103 @@ fn apply_privilege_drop(
     Ok(())
 }
 
+/// Confine the agent to the policy's `allow_paths:` hierarchies with Landlock.
+///
+/// Returns the ruleset, which the caller must keep alive until `spawn()` — the
+/// child's `pre_exec` uses its descriptor.
+///
+/// ## Why this one refuses instead of degrading
+///
+/// Everywhere else wardyn fails open and says so: an unattachable LSM hook
+/// costs one axis of enforcement, and bricking a working machine over it would
+/// be worse. An allowlist is not like that. It is the whole boundary, so
+/// failing open does not weaken it — it removes it, and hands the operator an
+/// agent running unconfined while their policy says otherwise. `allow_paths:`
+/// present and Landlock unusable is therefore a startup error.
+fn apply_containment(
+    cmd: &mut Command,
+    policy: &Policy,
+    notices: &mut Vec<String>,
+) -> anyhow::Result<Option<landlock::Ruleset>> {
+    let grants = policy.allow_paths();
+    if grants.is_empty() {
+        return Ok(None);
+    }
+
+    // An entry that did not resolve would silently not be granted, and the
+    // agent would fail to start with an error pointing at the wrong thing.
+    let unresolved: Vec<&str> = grants
+        .iter()
+        .filter(|g| g.path.is_none())
+        .map(|g| g.raw.as_str())
+        .collect();
+    if !unresolved.is_empty() {
+        bail!(
+            "allow_paths: could not resolve {} — `~` needs the agent's home (run via sudo or pass              --as-user) and a relative path needs a working directory. Refusing to start: an              allowlist missing an entry confines the agent out of something it needs, and the              failure would look like a broken agent rather than a policy gap",
+            unresolved.join(", ")
+        );
+    }
+
+    let built: Vec<landlock::Grant> = grants
+        .iter()
+        .map(|g| landlock::Grant {
+            path: g.path.clone().expect("checked above"),
+            rights: g.rights.iter().map(to_landlock_right).collect(),
+        })
+        .collect();
+
+    let ruleset = landlock::Ruleset::build(&built).context(
+        "building the Landlock ruleset for `allow_paths:` — the policy asks for containment this          kernel cannot provide",
+    )?;
+
+    if !ruleset.unresolved.is_empty() {
+        let detail: Vec<String> = ruleset
+            .unresolved
+            .iter()
+            .map(|(p, why)| format!("{} ({why})", p.display()))
+            .collect();
+        bail!(
+            "allow_paths: could not grant {} — refusing to start rather than confining the agent              out of a hierarchy the policy says it may use",
+            detail.join(", ")
+        );
+    }
+
+    let fd = ruleset.raw_fd();
+    // SAFETY: one syscall, no allocation — async-signal-safe, which is why the
+    // ruleset was built in the parent. The fd stays open because the caller
+    // holds the `Ruleset` until after `spawn()`.
+    unsafe {
+        cmd.pre_exec(move || landlock::restrict_self(fd));
+    }
+
+    notices.push(format!(
+        "containment ON (Landlock ABI {}) — the agent reaches ONLY: {}",
+        ruleset.abi,
+        grants
+            .iter()
+            .map(|g| format!(
+                "{} ({})",
+                g.path.as_ref().expect("checked").display(),
+                g.rights
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+")
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    Ok(Some(ruleset))
+}
+
+fn to_landlock_right(r: &policy::Right) -> landlock::Right {
+    match r {
+        policy::Right::Read => landlock::Right::Read,
+        policy::Right::Write => landlock::Right::Write,
+        policy::Right::Exec => landlock::Right::Exec,
+    }
+}
+
 /// The (uid, gid) to drop the child to: `--as-user uid[:gid]` wins, else
 /// `$SUDO_UID`/`$SUDO_GID`. `None` if neither yields a non-root uid.
 fn resolve_target_identity(opts: &Opts) -> Option<(u32, u32)> {
@@ -1645,6 +1743,16 @@ async fn run() -> anyhow::Result<i32> {
         // thing being sandboxed must not run with the privilege that could disable
         // its own warden (bpftool the maps, kill wardyn, read the raw disk).
         apply_privilege_drop(&mut cmd, &opts, &mut notices)?;
+        // Containment, registered AFTER the privilege drop so it runs after it:
+        // `pre_exec` closures fire in registration order, and Landlock needs
+        // `NO_NEW_PRIVS`, which the drop sets. Kept separate from
+        // `apply_privilege_drop` because the two are different questions — one
+        // is about who the agent is, the other about what it can reach — and
+        // the allowlist applies whether or not the uid could be changed.
+        //
+        // `_ruleset` is bound for the whole scope: dropping it would close the
+        // descriptor `pre_exec` is about to use.
+        let _ruleset = apply_containment(&mut cmd, &policy, &mut notices)?;
         let spawned = cmd
             .spawn()
             .with_context(|| format!("spawning `{}`", argv[0].to_string_lossy()))?;

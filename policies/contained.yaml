@@ -1,0 +1,74 @@
+# Contained preset — the agent reaches its project directory and the system
+# files it needs to run, and NOTHING else. Filesystem containment comes from
+# Landlock; egress and the block rules come from eBPF, as everywhere else.
+#
+#   sudo wardyn --enforce --policy policies/contained.yaml run -- <agent>
+#
+# ── READ THIS BEFORE USING IT ────────────────────────────────────────────────
+#
+# `allow_paths:` is an ALLOWLIST. Anything not listed is denied — including
+# things nobody thinks about until they are missing: the agent's loader, the
+# script it was asked to run, /dev/null, its own cache directory. A missing
+# entry does not look like a policy gap; it looks like the agent is broken.
+#
+# So: run `wardyn --dry-run --policy policies/contained.yaml` first, and expect
+# to add entries for your toolchain. This preset covers a Debian/Ubuntu-shaped
+# system and a project in the current directory. It is a starting point, not a
+# drop-in.
+#
+# Landlock cannot be undone once applied, is inherited by every child, and needs
+# no privilege — so unlike the eBPF half, it holds even for a root agent.
+version: 1
+default_action: allow
+
+# ── the boundary ─────────────────────────────────────────────────────────────
+allow_paths:
+  # The system, read-only and executable. Splitting these out rather than
+  # granting `/` is the entire point: `/home`, `/root`, `/mnt` and every other
+  # mount stay invisible.
+  - { path: "/usr", rights: [read, exec] }
+  - { path: "/bin", rights: [read, exec] }
+  - { path: "/sbin", rights: [read, exec] }
+  - { path: "/lib", rights: [read, exec] }
+  - { path: "/lib64", rights: [read, exec] }
+  # Configuration the runtime reads: resolv.conf, ssl certs, passwd, locale.
+  # Read-only, so the agent cannot edit its own environment.
+  - { path: "/etc", rights: [read] }
+  # /dev/null, /dev/urandom, /dev/tty. `write` is needed for the redirections
+  # every shell does; it does not grant the agent anything else here.
+  - { path: "/dev", rights: [read, write] }
+  # Its own /proc entries. Most runtimes read these at startup.
+  - { path: "/proc", rights: [read] }
+  # Scratch space. Compilers, package managers and test runners all want it.
+  - { path: "/tmp", rights: [read, write] }
+  # The project. `.` is the directory wardyn was launched in — run it from the
+  # project root. `exec` because a build produces binaries meant to be run.
+  - { path: ".", rights: [read, write, exec] }
+
+# ── what is denied INSIDE the boundary ───────────────────────────────────────
+# Containment removes everything outside; these remove specific objects inside
+# what is left. A `.env` in the project directory is reachable by the allowlist
+# and denied by this.
+files:
+  - { match: "**/.env", action: block }
+  - { match: "**/.env.*", action: block }
+  - { match: "**/.netrc", action: block }
+  - { match: "**/.npmrc", action: block }
+  - { match: "**", action: allow }
+
+# Egress is eBPF's alone — Landlock can only express TCP by port, not by
+# address, which is why the two halves are not interchangeable.
+network:
+  - { cidr: "127.0.0.0/8", action: allow }
+  - { cidr: "::1/128", action: allow }
+  - { domain: "github.com", action: allow }
+  - { domain: "api.anthropic.com", action: allow }
+  - { domain: "registry.npmjs.org", action: allow }
+  - { port: 53, proto: udp, action: allow } # the resolver has to work
+  - { cidr: "0.0.0.0/0", action: block }
+  - { cidr: "::/0", action: block }
+
+exec:
+  - { match: "**/nc", action: block }
+  - { match: "**/ncat", action: block }
+  - { match: "**", action: allow }

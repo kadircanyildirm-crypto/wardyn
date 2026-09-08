@@ -683,6 +683,101 @@ else
   skip "json event stream (needs BPF-LSM and jq)"
 fi
 
+# 9c) Landlock containment. Its own run with its own policy, because
+#     `allow_paths:` is a different SHAPE from everything else here — an
+#     allowlist, where anything unmentioned is denied — and mixing it into the
+#     blocklist fixture would confine that agent out of the files its own
+#     assertions depend on.
+if grep -qw landlock /sys/kernel/security/lsm 2>/dev/null; then
+  LW="$(mktemp -d)"
+  chmod 777 "$LW"
+  mkdir -p "$LW/project"
+  printf 'in the project\n' >"$LW/project/ok.txt"
+  printf 'not in the project\n' >"$LW/outside.txt"
+  chmod -R 777 "$LW"
+
+  # The agent script lives INSIDE the granted hierarchy. It has to: Landlock
+  # denies reading a script outside the allowlist, and a first attempt at this
+  # test put it beside the project instead of in it and got a silent agent —
+  # which is the containment working, and looks exactly like it is broken.
+  cat >"$LW/project/agent.sh" <<'LAGENT'
+say() { if "$@" >/dev/null 2>&1; then echo ok; else echo denied; fi; }
+say cat "$LP/ok.txt"                        >"$LP/r_inside.txt"
+say cp "$LP/ok.txt" "$LP/copy.txt"          >"$LP/w_inside.txt"
+say cat "$LO/outside.txt"                   >"$LP/r_outside.txt"
+say cp "$LP/ok.txt" "$LO/stolen.txt"        >"$LP/w_outside.txt"
+say cat /etc/hostname                       >"$LP/r_etc.txt"
+say cp "$LP/ok.txt" /etc/wardyn-probe       >"$LP/w_etc.txt"
+# A rename OUT of the allowlist. Landlock governs this through the REFER right,
+# which the ruleset must *handle* — leaving it out would give containment a hole
+# shaped exactly like `mv`.
+say mv "$LP/copy.txt" "$LO/moved.txt"       >"$LP/mv_out.txt"
+LAGENT
+
+  cat >"$LW/policy.yaml" <<LPOLICY
+version: 1
+default_action: allow
+allow_paths:
+  - { path: "/usr",  rights: [read, exec] }
+  - { path: "/lib",  rights: [read, exec] }
+  - { path: "/lib64", rights: [read, exec] }
+  - { path: "/bin",  rights: [read, exec] }
+  - { path: "/etc",  rights: [read] }
+  - { path: "/dev",  rights: [read, write] }
+  - { path: "$LW/project", rights: [read, write, exec] }
+files:
+  - { match: "**", action: allow }
+network:
+  - { cidr: "0.0.0.0/0", action: allow }
+exec:
+  - { match: "**", action: allow }
+LPOLICY
+  [[ -n "${SUDO_UID:-}" ]] && chown -R "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$LW"
+
+  LP="$LW/project" LO="$LW" "$WARDYN" --plain --policy "$LW/policy.yaml" \
+    --audit "$LW/audit.jsonl" run -- bash "$LW/project/agent.sh" \
+    >"$LW/out" 2>"$LW/err"
+
+  ll() { cat "$LW/project/$1" 2>/dev/null || echo missing; }
+
+  if grep -q 'containment ON (Landlock ABI' "$LW/err"; then
+    pass "landlock: containment applied, and the ABI is reported"
+  else
+    fail "landlock: no containment notice — was the ruleset applied at all?"
+  fi
+  case "$(ll r_inside.txt)" in
+    ok) pass "landlock: the granted hierarchy is readable" ;;
+    *)  fail "landlock: the agent could not read its own project — the grant did not apply" ;;
+  esac
+  case "$(ll w_inside.txt)" in
+    ok) pass "landlock: and writable, including creating a new file" ;;
+    *)  fail "landlock: write was granted but creating a file failed (MAKE_REG missing?)" ;;
+  esac
+  case "$(ll r_outside.txt)" in
+    denied) pass "landlock: a file OUTSIDE the allowlist is unreadable" ;;
+    *)      fail "landlock: read outside the allowlist succeeded — containment is not containing" ;;
+  esac
+  case "$(ll w_outside.txt)" in
+    denied) pass "landlock: and unwritable" ;;
+    *)      fail "landlock: the agent wrote outside the allowlist" ;;
+  esac
+  case "$(ll r_etc.txt)" in
+    ok) pass "landlock: a read-only grant permits reading" ;;
+    *)  fail "landlock: /etc was granted read and could not be read" ;;
+  esac
+  case "$(ll w_etc.txt)" in
+    denied) pass "landlock: a read-only grant refuses writing (rights are per hierarchy)" ;;
+    *)      fail "landlock: wrote into a hierarchy granted read-only" ;;
+  esac
+  case "$(ll mv_out.txt)" in
+    denied) pass "landlock: renaming OUT of the allowlist is refused (REFER is handled)" ;;
+    *)      fail "landlock: mv moved a file out of the allowlist — REFER is not handled" ;;
+  esac
+  rm -rf "$LW"
+else
+  skip "landlock containment (landlock not in /sys/kernel/security/lsm)"
+fi
+
 # 10) CONTROL: the same agent, the same fixtures, the same wardyn — but a policy
 #     with the `path:` rules stripped out. Every bypass the identity rules closed
 #     must reopen. Without this, an identity assertion that passed because some

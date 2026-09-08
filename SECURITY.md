@@ -53,6 +53,8 @@ In scope — issues that let a **watched** process:
   `block`, while `--enforce` is active and the rule is kernel-enforceable;
 - delete, rename away, or create a file that a rule marks `block` with
   `access: create`, `delete` or `all`, under the same conditions;
+- reach a path outside the `allow_paths:` hierarchies when a policy sets them —
+  reading, writing, executing, or renaming across the boundary;
 - escape the watched subtree so its children are no longer followed;
 - crash, hang, or otherwise disable Wardyn from userspace.
 
@@ -138,6 +140,18 @@ Out of scope (known limitations, documented, not vulnerabilities):
   agent uses; and a `block` by name is defeated by anyone who controls the name,
   since they choose what it answers. A domain block is a convenience, not a
   boundary — use `cidr:` where it has to hold.
+
+- **Containment is opt-in, and restricts rather than replaces.** With
+  `allow_paths:` the agent reaches the listed hierarchies and nothing else,
+  enforced by Landlock: inherited across `exec`, impossible to undo, and needing
+  no privilege, so it holds even for a root agent. Without `allow_paths:` there
+  is no containment at all and wardyn is purely a blocklist — it will not invent
+  an allowlist, since an empty one denies the agent its own loader.
+
+  What it does not do: there is no mount namespace, so a denied path still
+  exists and its name still shows up in the error. And Landlock does not govern
+  mounting, so an agent left at root (`--keep-root`) can work around it — one
+  more reason the privilege drop is the default.
 
 - **Rules are matched, not the intent behind them.** `access: read` narrows a rule
   to opens requesting `FMODE_READ`. An `O_PATH` open requests neither read nor
