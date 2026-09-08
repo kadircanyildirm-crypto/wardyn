@@ -880,6 +880,73 @@ else
 fi
 
 
+
+# ── allow_ports: TCP containment via Landlock ────────────────────────────────
+#
+# The second containment dimension. Landlock confines TCP by PORT — it has no
+# notion of an address — so this sits beside the cgroup/connect hooks rather
+# than replacing them: eBPF decides which hosts, Landlock decides which ports,
+# and nothing the agent does can undo it.
+#
+# Needs ABI 4 (Linux 6.7+). Below that wardyn refuses to start rather than run
+# an agent the policy believes is confined to ports it is not — so the outcome
+# of the run is itself the probe, and both branches are an assertion.
+PW="$(mktemp -d)"
+export PW
+trap 'rm -rf "$PW"' EXIT
+
+cat >"$PW/ports.yaml" <<'PPOL'
+version: 1
+default_action: allow
+allow_ports: [9]
+network:
+  - { cidr: "0.0.0.0/0", action: allow }
+PPOL
+cat >"$PW/agent.sh" <<'PAGENT'
+#!/bin/bash
+if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>/dev/null; then echo ok >"$PW/p9"; else echo denied >"$PW/p9"; fi
+if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7' 2>/dev/null; then echo ok >"$PW/p7"; else echo denied >"$PW/p7"; fi
+if cat /etc/hostname >/dev/null 2>&1; then echo ok >"$PW/fs"; else echo denied >"$PW/fs"; fi
+PAGENT
+chmod +x "$PW/agent.sh"
+[[ -n "${SUDO_UID:-}" ]] && chown -R "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$PW"
+
+# Listeners on both ports, so a refusal is Landlock's doing and not a missing
+# peer — without these, "denied" would prove nothing.
+(timeout 8 nc -l 127.0.0.1 9 >/dev/null 2>&1 &)
+(timeout 8 nc -l 127.0.0.1 7 >/dev/null 2>&1 &)
+sleep 0.5
+
+"$WARDYN" --plain --enforce --policy "$PW/ports.yaml" --audit "$PW/audit.jsonl" \
+  run -- "$PW/agent.sh" >"$PW/out" 2>"$PW/err" || true
+
+if grep -q 'allow_ports: needs Landlock ABI 4' "$PW/err"; then
+  # The kernel cannot enforce it, and wardyn said so instead of pretending.
+  pass "allow_ports: refused outright on a kernel below ABI 4, rather than silently ignored"
+elif grep -q 'TCP containment ON' "$PW/err"; then
+  pass "allow_ports: TCP containment is applied and reported"
+  if [[ "$(cat "$PW/p9" 2>/dev/null)" == "ok" ]]; then
+    pass "allow_ports: the listed port still connects"
+  else
+    fail "allow_ports: port 9 was listed and still refused — containment is too tight"
+  fi
+  if [[ "$(cat "$PW/p7" 2>/dev/null)" == "denied" ]]; then
+    pass "allow_ports: a port outside the list is refused by Landlock"
+  else
+    fail "allow_ports: port 7 was NOT listed and connected anyway"
+  fi
+  # The bug this dimension shipped with on its first build: handling the
+  # filesystem dimension with zero grants forbids every file, so a ports-only
+  # policy could not even exec its own agent.
+  if [[ "$(cat "$PW/fs" 2>/dev/null)" == "ok" ]]; then
+    pass "allow_ports: a ports-only policy leaves the filesystem alone"
+  else
+    fail "allow_ports: a ports-only policy also confined the filesystem"
+  fi
+else
+  fail "allow_ports: neither applied nor refused: $(head -c 200 "$PW/err")"
+fi
+
 # ── stored approvals ─────────────────────────────────────────────────────────
 #
 # `--overrides` and `--override-ttl` were accepted and did nothing for two

@@ -1115,7 +1115,8 @@ fn apply_containment(
     notices: &mut Vec<String>,
 ) -> anyhow::Result<Option<landlock::Ruleset>> {
     let grants = policy.allow_paths();
-    if grants.is_empty() {
+    let ports = policy.allow_ports();
+    if grants.is_empty() && ports.is_none() {
         return Ok(None);
     }
 
@@ -1144,10 +1145,25 @@ fn apply_containment(
         })
         .collect();
 
-    let ruleset = landlock::Ruleset::build(&built).context(
+    let ruleset = landlock::Ruleset::build(&built, ports).context(
         "building the Landlock ruleset for `allow_paths:` — the policy asks for containment this \
          kernel cannot provide",
     )?;
+
+    // Asking for ports on a kernel that cannot enforce them is refused, not
+    // downgraded. The whole point of an allowlist is that what is not on it
+    // cannot be reached; one that silently does not apply is not a weaker
+    // boundary, it is an absent one described as present. Same reasoning as
+    // `Ruleset::build` refusing outright when Landlock is missing entirely.
+    if ports.is_some() && !ruleset.net_handled {
+        bail!(
+            "allow_ports: needs Landlock ABI 4 (Linux 6.7+) and this kernel reports ABI {} — \
+             refusing to start rather than run an agent the policy believes is confined to a set \
+             of ports it is not. Remove `allow_ports:` to rely on the `network:` rules alone, \
+             which are enforced by eBPF and do not need this",
+            ruleset.abi
+        );
+    }
 
     if !ruleset.unresolved.is_empty() {
         let detail: Vec<String> = ruleset
@@ -1170,23 +1186,48 @@ fn apply_containment(
         cmd.pre_exec(move || landlock::restrict_self(fd));
     }
 
-    notices.push(format!(
-        "containment ON (Landlock ABI {}) — the agent reaches ONLY: {}",
-        ruleset.abi,
-        grants
-            .iter()
-            .map(|g| format!(
-                "{} ({})",
-                g.path.as_ref().expect("checked").display(),
-                g.rights
-                    .iter()
-                    .map(|r| r.as_str())
-                    .collect::<Vec<_>>()
-                    .join("+")
-            ))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
+    if !grants.is_empty() {
+        notices.push(format!(
+            "containment ON (Landlock ABI {}) — the agent reaches ONLY: {}",
+            ruleset.abi,
+            grants
+                .iter()
+                .map(|g| format!(
+                    "{} ({})",
+                    g.path.as_ref().expect("checked").display(),
+                    g.rights
+                        .iter()
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(want) = ports {
+        // Reported from what the KERNEL took, not from what the policy asked
+        // for. They agree here — a rejected port is a hard failure above — but
+        // a notice sourced from the request rather than the result is how a
+        // feed comes to describe enforcement that is not happening.
+        let shown = if ruleset.net_ports.is_empty() {
+            "NOTHING (no outbound or inbound TCP at all)".to_string()
+        } else {
+            ruleset
+                .net_ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        notices.push(format!(
+            "TCP containment ON (Landlock ABI {}) — the agent may connect to or bind: {shown}. \
+             By port only: Landlock has no notion of an address, so `network:` rules still decide \
+             which hosts, inside this.",
+            ruleset.abi
+        ));
+        debug_assert_eq!(want.len(), ruleset.net_ports.len());
+    }
     Ok(Some(ruleset))
 }
 

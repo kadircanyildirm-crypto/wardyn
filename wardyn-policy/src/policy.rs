@@ -598,6 +598,16 @@ struct RawPolicy {
     /// agent's own loader, so "not mentioned" cannot mean "allow nothing".
     #[serde(default)]
     allow_paths: Vec<AllowPathRaw>,
+    /// Landlock TCP ports. Present means outbound and inbound TCP are confined
+    /// to exactly these, by the same mechanism as `allow_paths:` — unprivileged,
+    /// inherited by every descendant, and impossible to undo.
+    ///
+    /// `Option`, not `Vec`, because an empty list is a real thing to ask for:
+    /// `allow_ports: []` means *no TCP at all*, while an absent key means the
+    /// policy said nothing and the network rules alone decide. A bare `Vec`
+    /// would collapse those two into each other.
+    #[serde(default)]
+    allow_ports: Option<Vec<u16>>,
 }
 
 #[derive(Deserialize)]
@@ -925,6 +935,9 @@ pub struct Policy {
     domains: DomainSet,
     /// Landlock hierarchies, resolved. Empty means no containment was asked for.
     allow_paths: Vec<AllowPath>,
+    /// Landlock TCP ports. `None` means the policy did not ask; `Some([])` means
+    /// it asked for none, which is a boundary rather than an omission.
+    allow_ports: Option<Vec<u16>>,
     /// Which of the three sources this came from. Set by `Loader::load`;
     /// `from_str` leaves it `Embedded`, since there is no file behind it.
     source: PolicySource,
@@ -1206,6 +1219,7 @@ impl Policy {
                 rights: a.rights,
             })
             .collect();
+        let allow_ports = raw.allow_ports;
 
         // The first resolution happens here, through the same path every later
         // one takes — so the load-time set and a refreshed set can never be
@@ -1232,6 +1246,7 @@ impl Policy {
             unresolved_domains,
             domains,
             allow_paths,
+            allow_ports,
             source: PolicySource::Embedded,
             source_text: text.to_string(),
         })
@@ -1277,6 +1292,14 @@ impl Policy {
     /// denies everything, including the agent's own loader.
     pub fn allow_paths(&self) -> &[AllowPath] {
         &self.allow_paths
+    }
+
+    /// The TCP ports Landlock will confine the agent to, if the policy asked.
+    ///
+    /// `None` and `Some(&[])` mean different things and the caller must keep
+    /// them apart: nothing asked for, versus no TCP permitted.
+    pub fn allow_ports(&self) -> Option<&[u16]> {
+        self.allow_ports.as_deref()
     }
 
     /// Would Landlock refuse this open/exec, given the containment boundary?
@@ -1931,6 +1954,23 @@ impl Policy {
         // Containment first: it is the outer boundary, and every block key below
         // only narrows what is left inside it. Reading them the other way round
         // suggests the block rules are the whole story.
+        if let Some(ports) = &self.allow_ports {
+            let shown = if ports.is_empty() {
+                "NOTHING — no outbound or inbound TCP at all".to_string()
+            } else {
+                ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let _ = writeln!(
+                s,
+                "\ncontained by Landlock — TCP is confined to: {shown}\n  \
+                 (by port only; Landlock has no notion of an address. The `network:` rules below \
+                 still decide addresses, and still apply inside this.)"
+            );
+        }
         if !self.allow_paths.is_empty() {
             let _ = writeln!(
                 s,
