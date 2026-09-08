@@ -2663,12 +2663,24 @@ pub fn name_key(seg: &str) -> Option<[u8; NAME_LEN]> {
         return None;
     }
     let bytes = seg.as_bytes();
-    // `>= NAME_LEN` and not `>`: the kernel reads the dentry name with
-    // `bpf_probe_read_kernel_str`, which needs room for the trailing NUL. A name
-    // that exactly fills the buffer could never be matched, so refusing it here
-    // routes the rule through `observe_only_blocks` and it is reported instead
-    // of quietly enforcing nothing.
-    if bytes.is_empty() || bytes.len() >= NAME_LEN {
+    // Two bytes of headroom, not one, and the second is the load-bearing one.
+    //
+    // The kernel reads the dentry name into a zeroed `[u8; NAME_LEN]` with
+    // `bpf_probe_read_kernel_str`, which needs room for a trailing NUL. So a
+    // name of NAME_LEN bytes or more could never be matched — refusing it here
+    // routes the rule through `observe_only_blocks`, where it is reported
+    // rather than quietly enforcing nothing.
+    //
+    // A name of exactly `NAME_LEN - 1` is worse than unmatchable: it is
+    // AMBIGUOUS. The helper truncates anything longer to `NAME_LEN - 1` bytes
+    // plus that NUL, which is byte-for-byte what a rule of exactly that length
+    // produces. `/etc/some-39-byte-name` would then also deny every file whose
+    // basename is 40+ bytes and starts with those 39 — a false EPERM the
+    // operator cannot explain from the policy text, and a kernel key broader
+    // than the rule that made it. Capping one byte lower leaves a zero at the
+    // index where a truncated read always has a real character, so the two can
+    // no longer collide.
+    if bytes.is_empty() || bytes.len() >= NAME_LEN - 1 {
         return None;
     }
     let mut k = [0u8; NAME_LEN];
@@ -3541,7 +3553,7 @@ files:
 
     // ── the policies actually shipped ───────────────────────────────────────
 
-    const SHIPPED: [(&str, &str); 3] = [
+    const SHIPPED: [(&str, &str); 4] = [
         ("policy.yaml", include_str!("../../policy.yaml")),
         (
             "policies/strict.yaml",
@@ -3550,6 +3562,13 @@ files:
         (
             "policies/permissive.yaml",
             include_str!("../../policies/permissive.yaml"),
+        ),
+        // The containment preset was shipped without ever being parsed here —
+        // a policy that does not load is a policy that protects nothing, and
+        // this is the one file in the set nobody would notice breaking.
+        (
+            "policies/contained.yaml",
+            include_str!("../../policies/contained.yaml"),
         ),
     ];
 
@@ -3563,11 +3582,16 @@ files:
 
     #[test]
     fn blocking_presets_really_protect_the_secrets_they_advertise() {
-        // permissive.yaml is warn-only by design, so it is not in this set.
-        for (name, text) in SHIPPED
-            .iter()
-            .filter(|(n, _)| *n != "policies/permissive.yaml")
-        {
+        // Two of the four are excluded, and for opposite reasons:
+        //
+        // * `permissive.yaml` is warn-only by design — it flags, never denies.
+        // * `contained.yaml` reaches the same end from the other direction. It
+        //   grants `allow_paths:` and then `files: { match: "**", allow }`, so
+        //   `~/.ssh` is unreachable because it is outside the allowlist, not
+        //   because a rule names it. Asserting a `Block` verdict there would be
+        //   asserting that containment works the way blocklists do.
+        const NOT_BLOCKLISTS: [&str; 2] = ["policies/permissive.yaml", "policies/contained.yaml"];
+        for (name, text) in SHIPPED.iter().filter(|(n, _)| !NOT_BLOCKLISTS.contains(n)) {
             let p = Policy::from_yaml_str_with(text, &null_resolver).unwrap();
             for secret in [
                 "/home/u/.env",
@@ -4633,5 +4657,59 @@ files:
         assert_eq!(p.source(), &PolicySource::Embedded);
         assert_eq!(p.source().path(), None);
         assert!(p.source().to_string().contains("built-in"));
+    }
+
+    /// The truncation collision. The kernel reads a dentry name into a zeroed
+    /// `[u8; NAME_LEN]`; anything longer than `NAME_LEN - 1` comes back as the
+    /// first `NAME_LEN - 1` bytes plus a NUL. A rule of exactly that length
+    /// produced the identical key, so it denied every longer file sharing the
+    /// prefix — a false EPERM, and a kernel key broader than the rule's text.
+    #[test]
+    fn a_name_that_a_truncated_read_could_impersonate_is_not_kernel_mappable() {
+        let longest_ok = "a".repeat(NAME_LEN - 2);
+        let ambiguous = "a".repeat(NAME_LEN - 1);
+
+        let k = name_key(&longest_ok).expect("the longest unambiguous name must still work");
+        assert_eq!(
+            k[NAME_LEN - 2],
+            0,
+            "a zero must sit where a truncated read always has a real character"
+        );
+        assert_eq!(
+            name_key(&ambiguous),
+            None,
+            "a {}-byte name is indistinguishable from any longer name sharing its prefix",
+            NAME_LEN - 1
+        );
+        assert_eq!(name_key(&"a".repeat(NAME_LEN)), None);
+
+        // What the kernel would hand the matcher for a name too long to fit:
+        // NAME_LEN-1 real bytes, then the NUL, in a zeroed buffer.
+        let mut truncated = [0u8; NAME_LEN];
+        for b in truncated.iter_mut().take(NAME_LEN - 1) {
+            *b = b'a';
+        }
+        assert_ne!(
+            k, truncated,
+            "the longest accepted rule still collides with a truncated read"
+        );
+    }
+
+    /// The containment preset is excluded from the blocklist test above, so its
+    /// own promise needs one: `~/.ssh` is out of reach because it is not in
+    /// `allow_paths:`, not because a rule names it. Without this, excluding it
+    /// would just mean nobody checks it.
+    #[test]
+    fn the_containment_preset_contains_rather_than_blocks() {
+        let text = include_str!("../../policies/contained.yaml");
+        let p = Policy::from_yaml_str_with(text, &null_resolver).unwrap();
+        assert!(
+            !p.allow_paths().is_empty(),
+            "contained.yaml grants no hierarchies — it contains nothing"
+        );
+        assert!(
+            p.containment_denies("/home/u/.ssh/id_ed25519", 0).is_some(),
+            "a path outside every granted hierarchy must be refused by containment"
+        );
     }
 }

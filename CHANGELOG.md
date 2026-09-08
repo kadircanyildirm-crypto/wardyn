@@ -28,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A rule name of exactly 39 bytes denied every longer file sharing its
+  prefix.** The kernel reads a dentry name into a zeroed 40-byte buffer, so
+  anything longer comes back truncated to 39 bytes plus a NUL — byte-for-byte
+  what a 39-byte rule produced. The result was a false `EPERM` the operator
+  could not explain from the policy text, and a kernel key broader than the rule
+  that made it. `name_key` now caps one byte lower, which leaves a zero where a
+  truncated read always has a real character; over-long names are reported
+  through `observe_only_blocks` as before.
+
+  Found while checking `docs/AUDIT.md` against the code — the report had named
+  it and nobody had gone to look.
+
+- **`policies/contained.yaml` was shipped without ever being parsed in a test.**
+  All four shipped policies are now loaded in unit tests, and the containment
+  preset has its own assertion that `~/.ssh` is unreachable because it is
+  outside `allow_paths:` rather than because a rule names it.
+
 - **The audit log could be redirected by a symlinked parent directory, and
   wardyn reported the path it was asked for either way.** `O_NOFOLLOW` refuses a
   symlinked log *file* — the hole fixed in the previous release — but not a
