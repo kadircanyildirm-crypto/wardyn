@@ -925,6 +925,9 @@ pub struct Policy {
     domains: DomainSet,
     /// Landlock hierarchies, resolved. Empty means no containment was asked for.
     allow_paths: Vec<AllowPath>,
+    /// Which of the three sources this came from. Set by `Loader::load`;
+    /// `from_str` leaves it `Embedded`, since there is no file behind it.
+    source: PolicySource,
     /// Identifies this exact policy source, so a stored approval granted under
     /// it stops applying the moment the rules change. Computed here because
     /// this is the only place the source text exists.
@@ -935,6 +938,46 @@ pub struct Policy {
 /// no `f_mode`. Distinct from any real `FMODE_*` combination so the check can
 /// tell "this needs the exec right" from "this is a read".
 pub const EXEC_ONLY: u32 = 1 << 30;
+
+/// Where a loaded policy came from.
+///
+/// Reported at startup, because "policy loaded: 11 file rules" looks identical
+/// whether those rules are the operator's or the embedded default that happened
+/// to apply when `./policy.yaml` was not where they thought. Three sources fall
+/// back to each other silently, and running from a different directory used to
+/// change the policy with nothing said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicySource {
+    /// `--policy <path>`.
+    Explicit(std::path::PathBuf),
+    /// `./policy.yaml`, found by falling back.
+    WorkingDirectory(std::path::PathBuf),
+    /// The policy compiled into the binary — nothing on disk applied.
+    Embedded,
+}
+
+impl PolicySource {
+    /// The file this came from, if any. `None` for the embedded default, which
+    /// is the one source nothing can tamper with.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            PolicySource::Explicit(p) | PolicySource::WorkingDirectory(p) => Some(p),
+            PolicySource::Embedded => None,
+        }
+    }
+}
+
+impl fmt::Display for PolicySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PolicySource::Explicit(p) => write!(f, "{}", p.display()),
+            PolicySource::WorkingDirectory(p) => {
+                write!(f, "./{} (found by falling back)", p.display())
+            }
+            PolicySource::Embedded => write!(f, "the built-in default (no policy file was read)"),
+        }
+    }
+}
 
 /// The default policy, embedded so `wardyn` runs out of the box with no file.
 const DEFAULT_POLICY: &str = include_str!("../../policy.yaml");
@@ -1184,6 +1227,7 @@ impl Policy {
             unresolved_domains,
             domains,
             allow_paths,
+            source: PolicySource::Embedded,
         })
     }
 
@@ -1209,6 +1253,11 @@ impl Policy {
     /// empty result means the answer did not move, which is the common case.
     pub fn refresh_domains(&self, resolve: Resolver<'_>) -> DomainRefresh {
         self.domains.refresh(resolve)
+    }
+
+    /// Where this policy came from.
+    pub fn source(&self) -> &PolicySource {
+        &self.source
     }
 
     /// The Landlock hierarchies this policy grants. Empty means the policy asked
@@ -2361,12 +2410,16 @@ impl<'a> Loader<'a> {
         if let Some(p) = path {
             let text = std::fs::read_to_string(p)
                 .with_context(|| format!("reading policy {}", p.display()))?;
-            return self
+            let mut policy = self
                 .from_str(&text)
-                .with_context(|| format!("parsing {}", p.display()));
+                .with_context(|| format!("parsing {}", p.display()))?;
+            policy.source = PolicySource::Explicit(p.to_path_buf());
+            return Ok(policy);
         }
         if let Ok(text) = std::fs::read_to_string("policy.yaml") {
-            return self.from_str(&text).context("parsing ./policy.yaml");
+            let mut policy = self.from_str(&text).context("parsing ./policy.yaml")?;
+            policy.source = PolicySource::WorkingDirectory("policy.yaml".into());
+            return Ok(policy);
         }
         self.from_str(DEFAULT_POLICY)
             .context("parsing embedded default policy")
@@ -4530,5 +4583,34 @@ files:
         assert!(p
             .containment_denies("/anything/at/all", fmode::READ)
             .is_none());
+    }
+
+    /// Three sources fall back to each other, and "11 file rules" reads the same
+    /// whichever won. An operator who ran from the wrong directory got the
+    /// embedded default with nothing said — which is the policy they did not
+    /// write, silently enforcing rules they did not choose.
+    #[test]
+    fn a_loaded_policy_says_which_of_the_three_sources_it_came_from() {
+        let dir = std::env::temp_dir().join(format!("wardyn-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let explicit = dir.join("mine.yaml");
+        std::fs::write(&explicit, "files:\n  - { match: \"**\", action: allow }\n").unwrap();
+
+        let p = Loader::offline().load(Some(&explicit)).expect("loads");
+        assert_eq!(p.source(), &PolicySource::Explicit(explicit.clone()));
+        assert_eq!(p.source().path(), Some(explicit.as_path()));
+        assert!(p.source().to_string().contains("mine.yaml"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The embedded default is the one source nothing on disk can tamper with,
+    /// so it reports no path — the writability check has nothing to warn about.
+    #[test]
+    fn the_embedded_default_reports_no_file() {
+        let p = Loader::offline().from_str("files: []\n").expect("parses");
+        assert_eq!(p.source(), &PolicySource::Embedded);
+        assert_eq!(p.source().path(), None);
+        assert!(p.source().to_string().contains("built-in"));
     }
 }

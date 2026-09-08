@@ -201,6 +201,19 @@ Out of scope (known limitations, documented, not vulnerabilities):
   rather than asserting a denial that did not fire, and at exit the kernel's own
   denial counters are compared against everything the receipt claimed.
 
+- **The policy must live somewhere the agent cannot write.** It is not evidence
+  like the audit log — it *is* the enforcement, so an agent that can edit it
+  decides what wardyn does on the next run. The default is `./policy.yaml`,
+  which in the documented `cd project && sudo wardyn run -- agent` is inside the
+  tree the agent works in.
+
+  Wardyn cannot refuse that: a policy checked into the project it governs is a
+  legitimate and common setup. What it does is name the source at startup — the
+  three of them (`--policy`, `./policy.yaml`, the built-in default) used to fall
+  back to each other silently, so running from the wrong directory changed the
+  policy with nothing said — and warn when the file is writable by the agent's
+  uid. Keep the policy outside the agent's reach where that matters.
+
 - **The audit log must live somewhere only root can write.** Wardyn refuses to
   open it through a symlink, refuses a file it does not own, and refuses one
   writable by group or others — a security record a second party can redirect or

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The policy's source was never reported, and the default is inside the
+  agent's reach.** `--policy`, `./policy.yaml` and the embedded default fell
+  back to each other silently, so `policy loaded: 11 file rule(s)` read
+  identically whether those rules were the operator's or the built-in default
+  that applied because they ran from a different directory. Startup now names
+  the source.
+
+  It also warns when the policy file is writable by the agent's uid. Unlike the
+  audit log, the policy is not evidence — it *is* the enforcement, so an agent
+  that can rewrite it chooses what constrains it next time. A warning rather
+  than a refusal: a policy checked into the project it governs is a legitimate
+  setup, and that is the operator's call to weigh.
+
 - **An agent could get root to append to any file, through the audit log.** The
   default `--audit` path is *relative*, so it lands in the directory wardyn was
   launched in — which for the documented `cd project && sudo wardyn run --
