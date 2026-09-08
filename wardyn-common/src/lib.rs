@@ -20,6 +20,29 @@ pub const NAME_LEN: usize = 40;
 #[derive(Clone, Copy)]
 pub struct NameKey(pub [u8; NAME_LEN]);
 
+/// The last **two** components of a path — `(parent, name)` — as one key.
+///
+/// A [`NameKey`] alone is what made `/etc/shadow` deny every file called
+/// `shadow` and `**/.aws/credentials` deny every `credentials`: the glob was
+/// reduced to its last segment because that is all the LSM hook could read
+/// cheaply. But the hook already walks `d_parent` to match directory rules, so
+/// the parent's name is one probe away — and keying on both is what lets a rule
+/// mean what it says. Two components, not N: every rule in the shipped policies
+/// fits, and a fixed-width key of `N × NAME_LEN` bytes assembled inside a
+/// bounded loop is verifier cost for a case nobody has written yet.
+///
+/// Used for both files (`**/.aws/credentials` → `(.aws, credentials)`, matched
+/// against the opened object and its parent) and directories
+/// (`**/.config/gcloud/**` → `(.config, gcloud)`, matched against each ancestor
+/// and *its* parent). Same shape, different maps, because a file pair must not
+/// match when the child happens to be a directory of that name.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PairKey {
+    pub parent: [u8; NAME_LEN],
+    pub name: [u8; NAME_LEN],
+}
+
 /// The identity of a filesystem object: `(dev, ino)` — the pair `stat(2)`
 /// returns and the kernel keeps on the inode itself.
 ///
@@ -111,6 +134,13 @@ pub mod meta {
     /// `DENY_NET`: the decision came from `NET_PROTO_PORT_RULES` — a rule that
     /// named both. The most specific of the four tries, and the first consulted.
     pub const KEY_PROTO_PORT: u32 = 6;
+    /// `DENY_FILE`/`DENY_DELETE`/`DENY_CREATE`: the object's `(parent, name)`
+    /// matched `BLOCK_PAIRS`. `path` carries the pair as two fixed
+    /// [`NAME_LEN`]-byte fields, parent first.
+    pub const KEY_PAIR: u32 = 7;
+    /// Same, for an ancestor directory and *its* parent, from
+    /// `BLOCK_DIR_PAIRS`.
+    pub const KEY_DIR_PAIR: u32 = 8;
 }
 
 /// The access mask stored beside every file/exec block key, and the `f_mode`

@@ -239,6 +239,18 @@ pub enum DenialKey {
     FileName(String),
     /// LSM `file_open`: ancestor-directory match (BLOCK_DIRS), e.g. `.ssh`.
     FileDir(String),
+    /// LSM `file_open`: the object's `(parent, name)` matched `BLOCK_PAIRS` —
+    /// `credentials` directly under `.aws`, not every `credentials`.
+    FilePair {
+        parent: String,
+        name: String,
+    },
+    /// LSM `file_open`: an ancestor and *its* parent matched `BLOCK_DIR_PAIRS`
+    /// — `gcloud` under `.config`, not every `gcloud`.
+    DirPair {
+        parent: String,
+        name: String,
+    },
     /// LSM `bprm_check`: exec basename match (BLOCK_EXEC), e.g. `nc`.
     Exec(String),
     /// cgroup connect/sendmsg: destination address (NET_RULES LPM trie).
@@ -311,6 +323,13 @@ impl DenialKey {
             DenialKey::FileDir(d) => {
                 format!("opening ANY file anywhere under a directory named `{d}`")
             }
+            DenialKey::FilePair { parent, name } => format!(
+                "opening ANY file named `{name}` directly inside a directory named `{parent}`"
+            ),
+            DenialKey::DirPair { parent, name } => format!(
+                "opening ANY file anywhere under a directory named `{name}` that sits inside one \
+                 named `{parent}`"
+            ),
             DenialKey::Exec(n) => format!("executing ANY program named `{n}` (any path)"),
             DenialKey::Net4(ip) => format!("ALL egress to {ip} (any port/protocol)"),
             DenialKey::Net6(ip) => format!("ALL egress to [{ip}] (any port/protocol)"),
@@ -362,6 +381,13 @@ impl DenialKey {
         match self {
             DenialKey::FileName(n) => format!("ANY file named `{n}` (any directory)"),
             DenialKey::FileDir(d) => format!("ANY file anywhere under a directory named `{d}`"),
+            DenialKey::FilePair { parent, name } => {
+                format!("ANY file named `{name}` directly inside a directory named `{parent}`")
+            }
+            DenialKey::DirPair { parent, name } => format!(
+                "ANY file anywhere under a directory named `{name}` that sits inside one named \
+                 `{parent}`"
+            ),
             DenialKey::FileInode { dev, ino } => {
                 format!("ONE file — {} — under any name", dev_ino(*dev, *ino))
             }
@@ -391,6 +417,10 @@ impl DenialKey {
 /// A kernel name key with the access mask stored beside it — the exact shape of
 /// one `BLOCK_NAMES` / `BLOCK_DIRS` / `BLOCK_EXEC` entry.
 pub type NameEntry = ([u8; NAME_LEN], u8);
+
+/// `(parent key, name key, access mask)` — one `BLOCK_PAIRS` / `BLOCK_DIR_PAIRS`
+/// entry.
+pub type PairEntry = ([u8; NAME_LEN], [u8; NAME_LEN], u8);
 
 /// The identity keys a policy compiles to, split by the kernel map each set
 /// goes into. Each entry is `(key, access mask)`.
@@ -450,6 +480,13 @@ fn keyed(map: &BTreeMap<String, u8>) -> Vec<NameEntry> {
         .collect()
 }
 
+/// `(parent, name)` → the two fixed-width keys, carrying the access mask.
+fn keyed_pairs(map: &BTreeMap<(String, String), u8>) -> Vec<PairEntry> {
+    map.iter()
+        .filter_map(|((p, n), &mask)| Some((name_key(p)?, name_key(n)?, mask)))
+        .collect()
+}
+
 /// `dev 8:1 ino 4242`, the form `stat` and `/proc/self/mountinfo` also speak.
 fn dev_ino(dev: u32, ino: u64) -> String {
     let (maj, min) = crate::identity::split_dev(dev);
@@ -461,6 +498,8 @@ impl fmt::Display for DenialKey {
         match self {
             DenialKey::FileName(n) => write!(f, "name={n}"),
             DenialKey::FileDir(d) => write!(f, "dir={d}"),
+            DenialKey::FilePair { parent, name } => write!(f, "name={parent}/{name}"),
+            DenialKey::DirPair { parent, name } => write!(f, "dir={parent}/{name}"),
             DenialKey::Exec(n) => write!(f, "exec={n}"),
             DenialKey::Net4(ip) => write!(f, "ip={ip}"),
             DenialKey::Net6(ip) => write!(f, "ip=[{ip}]"),
@@ -661,6 +700,11 @@ pub struct Policy {
     /// glob.
     kern_names: BTreeMap<String, u8>,
     kern_dirs: BTreeMap<String, u8>,
+    /// Mirror of `BLOCK_PAIRS` / `BLOCK_DIR_PAIRS`: rules whose glob kept a
+    /// literal parent segment, keyed `(parent, name)`. Consulted before the
+    /// single-name maps, on both sides of the boundary.
+    kern_pairs: BTreeMap<(String, String), u8>,
+    kern_dir_pairs: BTreeMap<(String, String), u8>,
     kern_execs: BTreeMap<String, u8>,
     /// Mirror of `BLOCK_INODES` / `BLOCK_DIR_INODES` / `BLOCK_EXEC_INODES`:
     /// every `path:` rule that resolved to a real object.
@@ -852,17 +896,27 @@ impl Policy {
         // widen it back into the thing it exists to replace.
         let mut kern_names = BTreeMap::new();
         let mut kern_dirs = BTreeMap::new();
+        let mut kern_pairs = BTreeMap::new();
+        let mut kern_dir_pairs = BTreeMap::new();
         for r in &files {
             if r.action != Action::Block || !matches!(r.matcher, Matcher::Glob(_)) {
                 continue;
             }
-            if let Some((is_dir, seg)) = file_seg(&r.pattern) {
-                let target = if is_dir {
-                    &mut kern_dirs
-                } else {
-                    &mut kern_names
-                };
-                merge_mask(target, seg, r.access.mask());
+            let Some(seg) = file_seg(&r.pattern) else {
+                continue;
+            };
+            let mask = r.access.mask();
+            match (seg.parent, seg.is_dir) {
+                (Some(p), true) => merge_mask(
+                    &mut kern_dir_pairs,
+                    (p.to_string(), seg.name.to_string()),
+                    mask,
+                ),
+                (Some(p), false) => {
+                    merge_mask(&mut kern_pairs, (p.to_string(), seg.name.to_string()), mask)
+                }
+                (None, true) => merge_mask(&mut kern_dirs, seg.name.to_string(), mask),
+                (None, false) => merge_mask(&mut kern_names, seg.name.to_string(), mask),
             }
         }
         let mut kern_execs = BTreeMap::new();
@@ -871,7 +925,7 @@ impl Policy {
                 continue;
             }
             if let Some(seg) = last_segment(&r.pattern).filter(|s| name_key(s).is_some()) {
-                merge_mask(&mut kern_execs, seg, r.access.mask());
+                merge_mask(&mut kern_execs, seg.to_string(), r.access.mask());
             }
         }
 
@@ -883,6 +937,8 @@ impl Policy {
             network,
             kern_names,
             kern_dirs,
+            kern_pairs,
+            kern_dir_pairs,
             kern_execs,
             anchors,
             unresolved_anchors,
@@ -1109,6 +1165,22 @@ impl Policy {
         (keyed(&self.kern_names), keyed(&self.kern_dirs))
     }
 
+    /// The two-component keys, `(files, directories)`, each entry as
+    /// `(parent key, name key, access mask)` — the exact shape of one
+    /// `BLOCK_PAIRS` / `BLOCK_DIR_PAIRS` entry.
+    pub fn pair_enforcement(&self) -> (Vec<PairEntry>, Vec<PairEntry>) {
+        (
+            keyed_pairs(&self.kern_pairs),
+            keyed_pairs(&self.kern_dir_pairs),
+        )
+    }
+
+    /// Whether any rule compiled to a two-component key. Drives `CFG_PAIRS_ON`,
+    /// so a policy with none pays no extra lookup per ancestor level.
+    pub fn has_pair_rules(&self) -> bool {
+        !self.kern_pairs.is_empty() || !self.kern_dir_pairs.is_empty()
+    }
+
     /// Identity keys for `BLOCK_INODES` / `BLOCK_DIR_INODES` / `BLOCK_EXEC_INODES`,
     /// each with the access mask stored beside it.
     pub fn inode_enforcement(&self) -> InodeKeys {
@@ -1192,13 +1264,40 @@ impl Policy {
             m.get(k)
                 .is_some_and(|&mask| fmode::matches(mask, requested))
         };
-        let mut segs = path.rsplit('/').filter(|s| !s.is_empty());
-        let name = segs.next()?;
+        let hit_pair = |m: &BTreeMap<(String, String), u8>, p: &str, n: &str| -> bool {
+            m.get(&(p.to_string(), n.to_string()))
+                .is_some_and(|&mask| fmode::matches(mask, requested))
+        };
+        // Nearest first: `segs[0]` is the file, `segs[1]` its parent, and so
+        // on — the same order the kernel's `d_parent` walk produces.
+        let segs: Vec<&str> = path.rsplit('/').filter(|s| !s.is_empty()).collect();
+        let name = *segs.first()?;
+        // The pair before the bare name, exactly as the hook does it.
+        if let Some(parent) = segs.get(1) {
+            if hit_pair(&self.kern_pairs, parent, name) {
+                return Some(DenialKey::FilePair {
+                    parent: parent.to_string(),
+                    name: name.to_string(),
+                });
+            }
+        }
         if hit(&self.kern_names, name) {
             return Some(DenialKey::FileName(name.to_string()));
         }
-        // Ancestors, nearest first, bounded exactly like the kernel walk.
-        for dir in segs.take(MAX_DIR_WALK) {
+        // Ancestors, bounded exactly like the kernel walk. At `level`, `dir` is
+        // `segs[level + 1]` and the name below it is `segs[level]`; the pair
+        // check starts at level 1 because at level 0 that lower name is the
+        // file, and `(parent, file)` was consulted above in the file map.
+        for level in 0..MAX_DIR_WALK {
+            let Some(&dir) = segs.get(level + 1) else {
+                break;
+            };
+            if level > 0 && hit_pair(&self.kern_dir_pairs, dir, segs[level]) {
+                return Some(DenialKey::DirPair {
+                    parent: dir.to_string(),
+                    name: segs[level].to_string(),
+                });
+            }
             if hit(&self.kern_dirs, dir) {
                 return Some(DenialKey::FileDir(dir.to_string()));
             }
@@ -1228,16 +1327,27 @@ impl Policy {
             if r.action != Action::Block || !r.is_glob() {
                 continue;
             }
-            if let Some((is_dir, seg)) = file_seg(&r.pattern) {
-                let (exact, reach) = if is_dir {
-                    (
-                        format!("**/{seg}/**"),
-                        format!("any file anywhere under a dir named `{seg}`"),
-                    )
-                } else {
-                    (format!("**/{seg}"), format!("any file named `{seg}`"))
+            if let Some(seg) = file_seg(&r.pattern) {
+                // Exactly what the kernel key covers, phrased so the gap between
+                // it and the glob is what the reader sees. A pair is still a
+                // suffix match — `/etc/shadow` compiles to `etc/shadow` at ANY
+                // depth — and saying "under a dir named `etc`" is what keeps
+                // that honest without pretending the old `shadow` reach.
+                let reach = match (seg.parent, seg.is_dir) {
+                    (Some(p), true) => format!(
+                        "any file anywhere under a dir named `{}` that sits in a dir named `{p}`",
+                        seg.name
+                    ),
+                    (Some(p), false) => {
+                        format!(
+                            "any file named `{}` directly under a dir named `{p}`",
+                            seg.name
+                        )
+                    }
+                    (None, true) => format!("any file anywhere under a dir named `{}`", seg.name),
+                    (None, false) => format!("any file named `{}`", seg.name),
                 };
-                if r.pattern != exact {
+                if r.pattern != seg.exact_glob() {
                     out.push((r.pattern.clone(), reach));
                 }
             }
@@ -1264,37 +1374,61 @@ impl Policy {
     pub fn shadowed_by_kernel(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let empty = BTreeMap::new();
-        let mut check =
-            |rules: &[PathRule], names: &BTreeMap<String, u8>, dirs: &BTreeMap<String, u8>| {
-                for (i, r) in rules.iter().enumerate() {
-                    if r.action == Action::Block || !r.is_glob() {
-                        continue;
-                    }
-                    // Does a *later* block rule's key cover paths this rule matches?
-                    let later_blocks = rules[i + 1..].iter().any(|b| b.action == Action::Block);
-                    if !later_blocks {
-                        continue;
-                    }
-                    if let Some(seg) = last_segment(&r.pattern) {
-                        if names.contains_key(seg) {
-                            out.push((r.pattern.clone(), format!("name={seg}")));
+        let no_pairs = BTreeMap::new();
+        let mut check = |rules: &[PathRule],
+                         names: &BTreeMap<String, u8>,
+                         dirs: &BTreeMap<String, u8>,
+                         pairs: &BTreeMap<(String, String), u8>,
+                         dir_pairs: &BTreeMap<(String, String), u8>| {
+            for (i, r) in rules.iter().enumerate() {
+                if r.action == Action::Block || !r.is_glob() {
+                    continue;
+                }
+                // Does a *later* block rule's key cover paths this rule matches?
+                let later_blocks = rules[i + 1..].iter().any(|b| b.action == Action::Block);
+                if !later_blocks {
+                    continue;
+                }
+                // The most specific key first, so the report names the one the
+                // kernel would actually fire.
+                if let Some(seg) = file_seg(&r.pattern) {
+                    if let Some(p) = seg.parent {
+                        if pairs.contains_key(&(p.to_string(), seg.name.to_string())) {
+                            out.push((r.pattern.clone(), format!("name={}", seg.label())));
                             continue;
                         }
                     }
-                    // Any literal segment of this pattern that is a blocked dir name
-                    // makes the whole subtree denied, wherever it appears.
-                    if let Some(seg) = r
-                        .pattern
-                        .split('/')
-                        .filter(|s| !s.is_empty())
-                        .find(|s| dirs.contains_key(*s))
-                    {
-                        out.push((r.pattern.clone(), format!("dir={seg}")));
+                }
+                if let Some(seg) = last_segment(&r.pattern) {
+                    if names.contains_key(seg) {
+                        out.push((r.pattern.clone(), format!("name={seg}")));
+                        continue;
                     }
                 }
-            };
-        check(&self.files, &self.kern_names, &self.kern_dirs);
-        check(&self.exec, &self.kern_execs, &empty);
+                // Any adjacent pair of literal segments that is a blocked dir
+                // pair, or any single literal segment that is a blocked dir
+                // name, makes the whole subtree denied wherever it appears.
+                let literal: Vec<&str> = r.pattern.split('/').filter(|s| !s.is_empty()).collect();
+                if let Some(w) = literal
+                    .windows(2)
+                    .find(|w| dir_pairs.contains_key(&(w[0].to_string(), w[1].to_string())))
+                {
+                    out.push((r.pattern.clone(), format!("dir={}/{}", w[0], w[1])));
+                    continue;
+                }
+                if let Some(seg) = literal.iter().find(|s| dirs.contains_key(**s)) {
+                    out.push((r.pattern.clone(), format!("dir={seg}")));
+                }
+            }
+        };
+        check(
+            &self.files,
+            &self.kern_names,
+            &self.kern_dirs,
+            &self.kern_pairs,
+            &self.kern_dir_pairs,
+        );
+        check(&self.exec, &self.kern_execs, &empty, &no_pairs, &no_pairs);
         out
     }
 
@@ -1393,6 +1527,24 @@ impl Policy {
                 mask_verbs(mask)
             );
         }
+        // Two-component keys, where the operator can see that `/etc/shadow`
+        // no longer means every `shadow` — and exactly what it does mean.
+        for ((p, n), &mask) in &self.kern_pairs {
+            let key = format!("name={p}/{n}");
+            let _ = writeln!(
+                s,
+                "  file  {key:<29} denies {} ANY file named `{n}` directly under a dir named `{p}`",
+                mask_verbs(mask)
+            );
+        }
+        for ((p, n), &mask) in &self.kern_dir_pairs {
+            let key = format!("dir={p}/{n}");
+            let _ = writeln!(
+                s,
+                "  file  {key:<29} denies {} ANY file under a dir named `{n}` that sits in `{p}` (any depth)",
+                mask_verbs(mask)
+            );
+        }
         for e in self.kern_execs.keys() {
             let _ = writeln!(
                 s,
@@ -1465,6 +1617,8 @@ impl Policy {
         }
         if self.kern_names.is_empty()
             && self.kern_dirs.is_empty()
+            && self.kern_pairs.is_empty()
+            && self.kern_dir_pairs.is_empty()
             && self.kern_execs.is_empty()
             && self.anchors.is_empty()
         {
@@ -1948,11 +2102,11 @@ fn compile_rules(
 /// rather than narrow — the alternative is a rule that silently stops applying
 /// because an unrelated rule was added next to it. [`fmode::widen`] owns that
 /// algebra, because the kernel side needs the same answer.
-fn merge_mask(map: &mut BTreeMap<String, u8>, key: &str, mask: u8) {
-    match map.get_mut(key) {
+fn merge_mask<K: Ord>(map: &mut BTreeMap<K, u8>, key: K, mask: u8) {
+    match map.get_mut(&key) {
         Some(existing) => *existing = fmode::widen(*existing, mask),
         None => {
-            map.insert(key.to_string(), mask);
+            map.insert(key, mask);
         }
     }
 }
@@ -1962,20 +2116,66 @@ fn last_segment(p: &str) -> Option<&str> {
     p.rsplit('/').find(|s| !s.is_empty())
 }
 
-/// The literal segment the kernel would key a file glob on, if it reduces to
-/// one: `**/dir/**` → `(true, "dir")`; `**/name` or `/abs/name` →
-/// `(false, "name")`. Glob-y segments return `None` (observe-only).
-fn file_seg(pattern: &str) -> Option<(bool, &str)> {
-    match pattern.strip_suffix("/**") {
-        Some(stripped) => last_segment(stripped).map(|s| (true, s)),
-        None => last_segment(pattern).map(|s| (false, s)),
-    }
-    .filter(|(_, s)| name_key(s).is_some())
+/// What a file glob reduces to in the kernel: its last literal segment, and —
+/// when the segment before it is literal too — that one as a parent.
+///
+/// `**/.aws/credentials` → `{ parent: Some(".aws"), name: "credentials" }`;
+/// `/etc/shadow` → `{ parent: Some("etc"), name: "shadow" }`;
+/// `**/.env` → `{ parent: None, name: ".env" }` (the segment before it is `**`,
+/// which names nothing); `**/.config/gcloud/**` → `{ is_dir: true, parent:
+/// Some(".config"), name: "gcloud" }`.
+///
+/// Two components is the ceiling. `/etc/ssl/private/key.pem` keeps `private/
+/// key.pem` and drops the rest — still far narrower than `key.pem` alone, and
+/// [`Policy::overbroad_block_keys`] says exactly what was dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seg<'a> {
+    is_dir: bool,
+    parent: Option<&'a str>,
+    name: &'a str,
 }
 
-/// As [`file_seg`], but as the NUL-padded fixed-width kernel map key.
+impl Seg<'_> {
+    /// The glob this key is exactly equivalent to. Anything the rule said
+    /// beyond this is what the kernel does NOT see.
+    fn exact_glob(&self) -> String {
+        let tail = if self.is_dir { "/**" } else { "" };
+        match self.parent {
+            Some(p) => format!("**/{p}/{}{tail}", self.name),
+            None => format!("**/{}{tail}", self.name),
+        }
+    }
+
+    /// `parent/name` or `name`, for display.
+    fn label(&self) -> String {
+        match self.parent {
+            Some(p) => format!("{p}/{}", self.name),
+            None => self.name.to_string(),
+        }
+    }
+}
+
+fn file_seg(pattern: &str) -> Option<Seg<'_>> {
+    let (is_dir, body) = match pattern.strip_suffix("/**") {
+        Some(stripped) => (true, stripped),
+        None => (false, pattern),
+    };
+    let mut segs = body.rsplit('/').filter(|s| !s.is_empty());
+    let name = segs.next().filter(|s| name_key(s).is_some())?;
+    // `name_key` already refuses `**` and anything with glob metacharacters,
+    // so a `**/name` pattern yields no parent and lands in the single-name map
+    // exactly as it always did.
+    let parent = segs.next().filter(|s| name_key(s).is_some());
+    Some(Seg {
+        is_dir,
+        parent,
+        name,
+    })
+}
+
+/// Whether a file glob reduces to *some* kernel key at all.
 fn file_key(pattern: &str) -> Option<(bool, [u8; NAME_LEN])> {
-    file_seg(pattern).and_then(|(is_dir, s)| name_key(s).map(|k| (is_dir, k)))
+    file_seg(pattern).and_then(|seg| name_key(seg.name).map(|k| (seg.is_dir, k)))
 }
 
 /// A literal path segment -> NUL-padded fixed key, or `None` if it contains glob
@@ -2178,13 +2378,38 @@ files:
                 r#"
 files:
   - { match: "**/secret", action: block, access: read }
-  - { match: "/etc/secret", action: block, access: write }
+  - { match: "**/secret", action: block, access: write }
 "#,
             )
             .expect("parses");
         let (names, _) = p.file_enforcement();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].1, (fmode::READ | fmode::WRITE) as u8);
+    }
+
+    /// This used to be the merge test's fixture — `**/secret` and
+    /// `/etc/secret` — and both landed on the bare key `secret`. They no
+    /// longer share a key at all: the second keeps its parent, so the two
+    /// rules mean two different things and the kernel holds two entries.
+    #[test]
+    fn a_rule_with_a_literal_parent_does_not_collapse_onto_the_bare_name() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/secret", action: block, access: read }
+  - { match: "/etc/secret", action: block, access: write }
+"#,
+            )
+            .expect("parses");
+        let (names, _) = p.file_enforcement();
+        let (pairs, _) = p.pair_enforcement();
+        assert_eq!(names.len(), 1, "only `**/secret` is a bare name");
+        assert_eq!(names[0].1, fmode::READ as u8, "and it kept its own mask");
+        assert_eq!(pairs.len(), 1, "`/etc/secret` is a pair");
+        assert_eq!(pairs[0].0, key("etc"));
+        assert_eq!(pairs[0].1, key("secret"));
+        assert_eq!(pairs[0].2, fmode::WRITE as u8);
     }
 
     /// An `exec:` rule pointing at a directory can never be enforced — the
@@ -2475,9 +2700,13 @@ network:
     fn file_enforcement_compiles_block_rules() {
         let p = policy();
         let (names, dirs) = p.file_enforcement();
+        let (pairs, _) = p.pair_enforcement();
         let has = |v: &[([u8; NAME_LEN], u8)], s: &str| v.iter().any(|(k, _)| *k == key(s));
         assert!(has(&names, ".env")); // **/.env
-        assert!(has(&names, "shadow")); // /etc/shadow
+        assert!(!has(&names, "shadow")); // /etc/shadow is NOT a bare name any more...
+        assert!(pairs
+            .iter()
+            .any(|(p, n, _)| *p == key("etc") && *n == key("shadow"))); // ...it is this
         assert!(has(&dirs, ".ssh")); // **/.ssh/**
         assert!(!has(&names, ".env.*")); // glob segment -> not enforced
 
@@ -2488,6 +2717,9 @@ network:
         // Every key here is stored with MASK_ANY: none of these rules named an
         // access, so they must behave exactly as they did before the axis existed.
         for (_, mask) in names.iter().chain(&dirs).chain(&execs) {
+            assert_eq!(*mask, fmode::MASK_ANY);
+        }
+        for (_, _, mask) in &pairs {
             assert_eq!(*mask, fmode::MASK_ANY);
         }
     }
@@ -2525,12 +2757,27 @@ network:
     #[test]
     fn kernel_file_denial_mirrors_the_coarse_lsm_matcher() {
         let p = policy();
-        // `/etc/shadow` reduced to bare name `shadow`: the kernel denies it
-        // ANYWHERE, even where the glob-based eval says allow.
+        // `/etc/shadow` compiles to the pair `(etc, shadow)`. It used to
+        // reduce to the bare name `shadow` and deny it ANYWHERE; now a `shadow`
+        // that is not directly under an `etc` is left alone...
         assert_eq!(p.eval_file("/home/u/shadow").action, Action::Allow);
+        assert_eq!(denies_read(&p, "/home/u/shadow"), None);
+        // ...while the one the rule actually named is denied, by the pair.
         assert_eq!(
-            denies_read(&p, "/home/u/shadow"),
-            Some(DenialKey::FileName("shadow".into()))
+            denies_read(&p, "/etc/shadow"),
+            Some(DenialKey::FilePair {
+                parent: "etc".into(),
+                name: "shadow".into()
+            })
+        );
+        // Still a suffix match, not an anchored path: this is the honest
+        // remaining over-reach, and `overbroad_block_keys` reports it.
+        assert_eq!(
+            denies_read(&p, "/srv/jail/etc/shadow"),
+            Some(DenialKey::FilePair {
+                parent: "etc".into(),
+                name: "shadow".into()
+            })
         );
         // A file directly in `.ssh` IS denied by the kernel.
         assert_eq!(
@@ -2752,7 +2999,7 @@ network:
         let text = policy().explain();
         for expected in [
             "name=.env",
-            "name=shadow",
+            "name=etc/shadow",
             "dir=.ssh",
             "exec  name=nc",
             "cidr:0.0.0.0/0",
@@ -3315,5 +3562,219 @@ network:
         assert!(text.contains("blocked by protocol"), "{text}");
         assert!(text.contains("MOST SPECIFIC FIRST"), "{text}");
         assert!(text.contains("NOT predicted in the feed"), "{text}");
+    }
+
+    // ── two-component keys ─────────────────────────────────────────────────
+
+    /// The wart this exists to fix: `**/.aws/credentials` used to deny every
+    /// file called `credentials`. Now it denies the one under `.aws`.
+    #[test]
+    fn a_literal_parent_narrows_the_kernel_key_to_the_pair() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.aws/credentials", action: block }
+"#,
+            )
+            .expect("parses");
+
+        assert!(p.has_pair_rules());
+        let (names, _) = p.file_enforcement();
+        assert!(names.is_empty(), "nothing landed in the bare-name map");
+
+        assert_eq!(
+            denies_read(&p, "/home/u/.aws/credentials"),
+            Some(DenialKey::FilePair {
+                parent: ".aws".into(),
+                name: "credentials".into()
+            })
+        );
+        // The over-reach that used to happen, and no longer does.
+        assert_eq!(denies_read(&p, "/home/u/project/credentials"), None);
+        assert_eq!(denies_read(&p, "/home/u/.aws/other"), None);
+        // A pair is a FILE key: a directory called `credentials` under `.aws`
+        // does not put its contents under the rule.
+        assert_eq!(denies_read(&p, "/home/u/.aws/credentials/inner"), None);
+    }
+
+    /// The directory form: `**/.config/gcloud/**` denies what is under a
+    /// `gcloud` that sits in a `.config` — at any depth below it — and leaves
+    /// a `gcloud` anywhere else alone.
+    #[test]
+    fn a_directory_pair_covers_the_subtree_and_only_that_subtree() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.config/gcloud/**", action: block }
+"#,
+            )
+            .expect("parses");
+
+        let (_, dirs) = p.file_enforcement();
+        assert!(dirs.is_empty(), "nothing landed in the bare-dir map");
+        let hit = Some(DenialKey::DirPair {
+            parent: ".config".into(),
+            name: "gcloud".into(),
+        });
+        assert_eq!(denies_read(&p, "/home/u/.config/gcloud/creds.json"), hit);
+        assert_eq!(denies_read(&p, "/home/u/.config/gcloud/a/b/c/deep"), hit);
+        // Not under `.config`: not covered.
+        assert_eq!(denies_read(&p, "/home/u/gcloud/creds.json"), None);
+        assert_eq!(denies_read(&p, "/opt/gcloud/bin/gcloud"), None);
+    }
+
+    /// `strict.yaml` had to make `**/.git/config` a `warn` because it and
+    /// `**/.kube/config` both reduced to `config` and would have blocked each
+    /// other's files. They are now two keys.
+    #[test]
+    fn two_rules_that_used_to_collide_on_a_basename_are_now_distinct() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.kube/config", action: block }
+  - { match: "**/.git/config",  action: block, access: delete }
+"#,
+            )
+            .expect("parses");
+
+        let (pairs, _) = p.pair_enforcement();
+        assert_eq!(pairs.len(), 2, "two keys, not one merged `config`");
+
+        // The kube one blocks reads; the git one does not.
+        assert!(denies_read(&p, "/proj/.kube/config").is_some());
+        assert!(denies_read(&p, "/proj/.git/config").is_none());
+        // And neither touches an unrelated `config`.
+        assert!(denies_read(&p, "/proj/nginx/config").is_none());
+        // The git one carries its own axis, on its own key.
+        let git = pairs
+            .iter()
+            .find(|(par, _, _)| *par == key(".git"))
+            .expect("git pair");
+        assert!(fmode::covers(git.2, fmode::DELETE));
+    }
+
+    /// Order matters for which key the feed names: a pair is more specific than
+    /// a bare name and must be reported first, because the exception it offers
+    /// is the smaller one.
+    #[test]
+    fn a_pair_is_reported_before_a_bare_name_that_also_matches() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/config",       action: block }
+  - { match: "**/.kube/config", action: block }
+"#,
+            )
+            .expect("parses");
+        assert_eq!(
+            denies_read(&p, "/x/.kube/config"),
+            Some(DenialKey::FilePair {
+                parent: ".kube".into(),
+                name: "config".into()
+            })
+        );
+        // Where only the bare name applies, that is what is reported.
+        assert_eq!(
+            denies_read(&p, "/x/nginx/config"),
+            Some(DenialKey::FileName("config".into()))
+        );
+    }
+
+    /// What is still over-broad, said precisely: two components is a suffix
+    /// match, so `/etc/shadow` is `etc/shadow` at any depth, and a three-segment
+    /// rule loses its first one. What is no longer over-broad must not be
+    /// reported as if it were.
+    #[test]
+    fn overbroad_reports_only_what_the_pair_still_drops() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "**/.aws/credentials",       action: block }
+  - { match: "**/.config/gcloud/**",      action: block }
+  - { match: "/etc/shadow",               action: block }
+  - { match: "/etc/ssl/private/key.pem",  action: block }
+  - { match: "**/.env",                   action: block }
+"#,
+            )
+            .expect("parses");
+        let over: Vec<String> = p
+            .overbroad_block_keys()
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert!(
+            !over.contains(&"**/.aws/credentials".to_string()),
+            "{over:?}"
+        );
+        assert!(
+            !over.contains(&"**/.config/gcloud/**".to_string()),
+            "{over:?}"
+        );
+        assert!(!over.contains(&"**/.env".to_string()), "{over:?}");
+        assert!(over.contains(&"/etc/shadow".to_string()), "{over:?}");
+        assert!(
+            over.contains(&"/etc/ssl/private/key.pem".to_string()),
+            "{over:?}"
+        );
+
+        let reach = p
+            .overbroad_block_keys()
+            .into_iter()
+            .find(|(r, _)| r == "/etc/ssl/private/key.pem")
+            .map(|(_, reach)| reach)
+            .unwrap();
+        assert!(
+            reach.contains("`key.pem` directly under a dir named `private`"),
+            "{reach}"
+        );
+    }
+
+    /// An `allow` written before a `block` that the kernel's pair key covers is
+    /// shadowed — and the report names the pair, not the bare name.
+    #[test]
+    fn shadowing_is_detected_through_a_pair_key() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "/home/me/.aws/credentials", action: allow }
+  - { match: "**/.aws/credentials",       action: block }
+  - { match: "/tmp/.config/gcloud/x",     action: allow }
+  - { match: "**/.config/gcloud/**",      action: block }
+"#,
+            )
+            .expect("parses");
+        let shadowed = p.shadowed_by_kernel();
+        let keys: Vec<&str> = shadowed.iter().map(|(_, k)| k.as_str()).collect();
+        assert!(keys.contains(&"name=.aws/credentials"), "{keys:?}");
+        assert!(keys.contains(&"dir=.config/gcloud"), "{keys:?}");
+    }
+
+    /// `--dry-run` has to show the pair, or the operator cannot tell the
+    /// narrowed key from the old broad one.
+    #[test]
+    fn dry_run_lists_pairs_as_pairs() {
+        let p = Loader::offline()
+            .from_str(
+                r#"
+files:
+  - { match: "/etc/shadow",          action: block }
+  - { match: "**/.config/gcloud/**", action: block, access: all }
+"#,
+            )
+            .expect("parses");
+        let text = p.explain();
+        assert!(text.contains("name=etc/shadow"), "{text}");
+        assert!(text.contains("dir=.config/gcloud"), "{text}");
+        assert!(text.contains("DELETING"), "{text}");
+        assert!(
+            !text.contains("name=shadow "),
+            "the bare key must be gone: {text}"
+        );
     }
 }

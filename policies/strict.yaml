@@ -10,10 +10,10 @@ files:
   - { match: "**/.ssh/**", action: block }
   - { match: "**/.aws/**", action: block }
   - { match: "**/.config/gcloud/**", action: block }
-  # Use directory form (**/dir/**) not **/.kube/config: the kernel matcher keys on
-  # the basename, so `.../config` would reduce to "deny ANY file named config" and
-  # also block .git/config — contradicting the warn rule below. The dir form keys
-  # on `.kube`/`.docker` instead.
+  # Directory form, because these directories hold more than one secret. (It
+  # used to be forced: `**/.kube/config` once reduced to the bare name `config`
+  # and would have blocked `.git/config` too. A glob now keeps its parent —
+  # `(.kube, config)` — so that collision is gone; the dir form is a choice.)
   - { match: "**/.kube/**", action: block }
   - { match: "**/.docker/**", action: block }
   - { match: "**/.netrc", action: block }

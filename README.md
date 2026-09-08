@@ -179,7 +179,10 @@ most useful protocol rule there is would quietly not mean what it says.
 > own row reports it. `--dry-run` prints the same warning.
 
 A file or exec rule is written with **either** `match:` (a glob over names) or
-`path:` (one concrete object, pinned by identity) — never both. File rules also
+`path:` (one concrete object, pinned by identity) — never both. In the kernel a
+`match:` glob keeps its **last two literal segments**: `**/.aws/credentials`
+denies `credentials` under `.aws`, not every file called `credentials`. What a
+glob says beyond that is dropped, and `--dry-run` names what was dropped. File rules also
 take an **`access:`**, which picks the operation the rule covers across two axes:
 
 | `access:` | matched when | hook |
@@ -211,7 +214,7 @@ files:
   # `match:` — a glob over names. Covers files that do not exist yet.
   - { match: "**/.env",      action: block }   # any file named .env
   - { match: "**/.ssh/**",   action: block }   # anything under a dir named .ssh, at any depth
-  - { match: "/etc/shadow",  action: block }
+  - { match: "/etc/shadow",  action: block }   # `shadow` under `etc` — not every `shadow`
   # `path:` — one object, pinned by (dev, ino) at load. `mv` and `ln` do not
   # shake it off. `~` is the AGENT's home; a bare name is relative to where
   # wardyn was launched. `wardyn --dry-run` prints what each one resolved to.

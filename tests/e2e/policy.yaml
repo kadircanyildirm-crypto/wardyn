@@ -20,6 +20,12 @@ files:
   # Access axis: this file may be appended to, but not read back. `block` used to
   # mean "cannot be opened at all", which forbade both.
   - { match: "**/writable.log", action: block, access: read }
+  # Two-component keys. Each of these used to reduce to its LAST segment —
+  # `credentials`, `gcloud` — and deny every file of that name anywhere. Now
+  # the parent is part of the key, and the fixtures include a `credentials`
+  # and a `gcloud` that must stay readable to prove it.
+  - { match: "**/.aws/credentials", action: block }
+  - { match: "**/.config/gcloud/**", action: block }
   # Lifecycle axis (M6). `rm` is not an open, and `file_open` never fires for
   # unlink(2) — so none of the rules above say anything about destroying the
   # thing they protect. These do. Note what is NOT here: no `access: delete` on

@@ -28,7 +28,7 @@ use aya_ebpf::{
     programs::{LsmContext, SockAddrContext, TracePointContext},
 };
 use wardyn_common::{
-    action, fmode, kind, meta, stat, Event, InodeKey, Ip6Key, NameKey, PortKey4, PortKey6,
+    action, fmode, kind, meta, stat, Event, InodeKey, Ip6Key, NameKey, PairKey, PortKey4, PortKey6,
     ProtoKey4, ProtoKey6, ProtoPortKey4, ProtoPortKey6, COMM_LEN, MAX_DIR_WALK, NAME_LEN, PATH_LEN,
     PORT_BITS, PROTO_BITS,
 };
@@ -145,6 +145,25 @@ static BLOCK_DIRS: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 #[map]
 static BLOCK_EXEC: HashMap<NameKey, u8> = HashMap::with_max_entries(256, 0);
 
+// ── two-component name keys ─────────────────────────────────────────────────
+//
+// A rule like `**/.aws/credentials` used to compile to the bare name
+// `credentials`, and `/etc/shadow` to `shadow` — the glob's last segment was all
+// the hook could key on, so the kernel denied far more than the policy said.
+// The hook already walks `d_parent`, which means the parent's name is one probe
+// away; these two maps key on `(parent, name)` and are consulted BEFORE the
+// single-name maps, because a rule that names more is the more specific one
+// and the exception it offers is the smaller one.
+
+/// `(parent, basename)` of a blocked file — `**/.aws/credentials`, `/etc/shadow`.
+#[map]
+static BLOCK_PAIRS: HashMap<PairKey, u8> = HashMap::with_max_entries(256, 0);
+
+/// `(grandparent, dir)` of a blocked subtree — `**/.config/gcloud/**` — matched
+/// against every ancestor together with *its* parent.
+#[map]
+static BLOCK_DIR_PAIRS: HashMap<PairKey, u8> = HashMap::with_max_entries(256, 0);
+
 // ── identity maps (M6) ──────────────────────────────────────────────────────
 //
 // Keyed by `(dev, ino)` — the object, not its label. A name key is shaken off by
@@ -209,6 +228,9 @@ const CFG_LIFECYCLE_ON: u32 = 21;
 /// Set when the policy has at least one rule naming a `proto:`. Skips two trie
 /// lookups per connect for the policies that do not use them.
 const CFG_PROTO_RULES_ON: u32 = 22;
+/// Set when the policy compiled at least one two-component key. Skips a
+/// 80-byte hash lookup per ancestor level for the policies that have none.
+const CFG_PAIRS_ON: u32 = 23;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
 // personality(persona) — persona is the 1st arg, same slot as execve's filename.
@@ -899,6 +921,29 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // basename: dentry->d_name.name
     let mut name = [0u8; NAME_LEN];
     read_name(dentry, name_off, &mut name)?;
+    let pairs = cfg(CFG_PAIRS_ON) != 0;
+
+    // `(parent, name)` before the bare name: it is the more specific key, and
+    // the exception it offers ("this credentials, under .aws") is the smaller
+    // one. Reading the parent here, ahead of the walk, is what makes that order
+    // possible — the walk re-reads it a few lines down, and two probes of a hot
+    // dentry are cheaper than a report that names the wrong rule.
+    if pairs {
+        if let Some(mask) = pair_mask(dentry, name_off, parent_off, &name, false) {
+            if access_matches(mask, requested) {
+                bump(stat::DENIED_FILE);
+                emit_deny_pair(
+                    kind::DENY_FILE,
+                    dentry,
+                    name_off,
+                    parent_off,
+                    &name,
+                    meta::KEY_PAIR,
+                );
+                return Ok(EPERM);
+            }
+        }
+    }
     if let Some(&mask) = unsafe { BLOCK_NAMES.get(&NameKey(name)) } {
         if access_matches(mask, requested) {
             bump(stat::DENIED_FILE);
@@ -912,7 +957,12 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // what it says; matching only the direct parent quietly let `.ssh/sub/key`
     // through while the feed showed the rule as covering it.
     let mut cur = dentry;
-    for _ in 0..MAX_DIR_WALK {
+    // The name one level below `cur`, so an ancestor can be keyed together with
+    // its own parent. Starts as the file's name, which is why the pair check in
+    // the loop skips the first level: `(parent, file)` is a FILE pair and was
+    // consulted above, in the file map.
+    let mut prev = name;
+    for level in 0..MAX_DIR_WALK {
         let Ok(parent) = read_ptr(cur, parent_off) else {
             break;
         };
@@ -938,6 +988,21 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         if read_name(parent, name_off, &mut dir).is_err() {
             break;
         }
+        // `(this ancestor's parent, this ancestor)` — i.e. `(dir, prev)` where
+        // `prev` is the level below. More specific than `dir` alone, so first.
+        if pairs && level > 0 {
+            let key = PairKey {
+                parent: dir,
+                name: prev,
+            };
+            if let Some(&mask) = unsafe { BLOCK_DIR_PAIRS.get(&key) } {
+                if access_matches(mask, requested) {
+                    bump(stat::DENIED_FILE);
+                    emit_deny_pair_key(kind::DENY_FILE, &key, meta::KEY_DIR_PAIR);
+                    return Ok(EPERM);
+                }
+            }
+        }
         if let Some(&mask) = unsafe { BLOCK_DIRS.get(&NameKey(dir)) } {
             if access_matches(mask, requested) {
                 bump(stat::DENIED_FILE);
@@ -945,10 +1010,100 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
                 return Ok(EPERM);
             }
         }
+        prev = dir;
         cur = parent;
     }
 
     Ok(OK)
+}
+
+/// The mask stored for `(parent-of-dentry, name)` in the file or directory pair
+/// map, or `None` when the dentry has no parent (it is the root) or nothing is
+/// stored. `is_dir` picks the map: a file pair must not match a directory that
+/// happens to share the name.
+#[inline(always)]
+fn pair_mask(
+    dentry: *const u8,
+    name_off: usize,
+    parent_off: usize,
+    name: &[u8; NAME_LEN],
+    is_dir: bool,
+) -> Option<u8> {
+    let parent = read_ptr(dentry, parent_off).ok()?;
+    if parent.is_null() || parent == dentry {
+        return None;
+    }
+    let mut dir = [0u8; NAME_LEN];
+    read_name(parent, name_off, &mut dir).ok()?;
+    let key = PairKey {
+        parent: dir,
+        name: *name,
+    };
+    let hit = if is_dir {
+        unsafe { BLOCK_DIR_PAIRS.get(&key) }
+    } else {
+        unsafe { BLOCK_PAIRS.get(&key) }
+    };
+    hit.copied()
+}
+
+/// Emit a denial for a pair matched on the object itself: re-reads the parent
+/// name so the event carries both halves of the key that fired.
+#[inline(always)]
+fn emit_deny_pair(
+    ev_kind: u32,
+    dentry: *const u8,
+    name_off: usize,
+    parent_off: usize,
+    name: &[u8; NAME_LEN],
+    meta_val: u32,
+) {
+    let mut dir = [0u8; NAME_LEN];
+    if let Ok(parent) = read_ptr(dentry, parent_off) {
+        if !parent.is_null() && parent != dentry {
+            let _ = read_name(parent, name_off, &mut dir);
+        }
+    }
+    let key = PairKey {
+        parent: dir,
+        name: *name,
+    };
+    emit_deny_pair_key(ev_kind, &key, meta_val);
+}
+
+/// Emit a denial carrying a two-component key: parent in `path[..NAME_LEN]`,
+/// name in `path[NAME_LEN..2*NAME_LEN]`. Two fixed-width fields rather than a
+/// `parent/name` string, so userspace splits at a constant and the copy is a
+/// constant-length memcpy the verifier is happiest with.
+#[inline(always)]
+fn emit_deny_pair_key(ev_kind: u32, key: &PairKey, meta_val: u32) {
+    let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        bump(stat::RING_DROPS);
+        return;
+    };
+    let e = entry.as_mut_ptr();
+    unsafe {
+        (*e).kind = ev_kind;
+        (*e).action = action::BLOCK;
+        (*e).meta = meta_val;
+        (*e).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).ppid = 0;
+        (*e).uid = bpf_get_current_uid_gid() as u32;
+        (*e).comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
+        (*e).daddr = 0;
+        (*e).daddr6 = [0u8; 16];
+        (*e).dport = 0;
+        (*e).family = 0;
+        (*e).dev = 0;
+        (*e).ino = 0;
+        (*e).fmode = 0;
+        (*e).proto = 0;
+        let dst = core::slice::from_raw_parts_mut((*e).path.as_mut_ptr(), PATH_LEN);
+        dst[..NAME_LEN].copy_from_slice(&key.parent);
+        dst[NAME_LEN..2 * NAME_LEN].copy_from_slice(&key.name);
+        (*e).path_len = (2 * NAME_LEN) as u32;
+    }
+    entry.submit(0);
 }
 
 /// Every access a rule can name. Used when the hook could not read `f_mode`, so
@@ -1125,9 +1280,32 @@ fn lifecycle_denied(dentry: *const u8, op: u8, ev_kind: u32, counter: u32, self_
         }
     }
 
-    // The object's own name.
+    // The object's own name — as a pair first, then bare. Same order and same
+    // reason as `file_open`: the pair is the more specific key.
     let mut name = [0u8; NAME_LEN];
+    let pairs = cfg(CFG_PAIRS_ON) != 0;
     if read_name(dentry, name_off, &mut name).is_ok() {
+        if pairs {
+            let dir_hit = if self_maps & SELF_DIR != 0 {
+                pair_mask(dentry, name_off, parent_off, &name, true)
+            } else {
+                None
+            };
+            let hit = match dir_hit {
+                Some(m) => Some(m),
+                None if self_maps & SELF_FILE != 0 => {
+                    pair_mask(dentry, name_off, parent_off, &name, false)
+                }
+                None => None,
+            };
+            if let Some(mask) = hit {
+                if fmode::covers(mask, op) {
+                    bump(counter);
+                    emit_deny_pair(ev_kind, dentry, name_off, parent_off, &name, meta::KEY_PAIR);
+                    return true;
+                }
+            }
+        }
         let dir_hit = if self_maps & SELF_DIR != 0 {
             unsafe { BLOCK_DIRS.get(&NameKey(name)) }
         } else {
@@ -1151,7 +1329,8 @@ fn lifecycle_denied(dentry: *const u8, op: u8, ev_kind: u32, counter: u32, self_
     // `~/.ssh` may be deleted" — and it is why the walk is here and not only in
     // `file_open`.
     let mut cur = dentry;
-    for _ in 0..MAX_DIR_WALK {
+    let mut prev = name;
+    for level in 0..MAX_DIR_WALK {
         let Ok(parent) = read_ptr(cur, parent_off) else {
             break;
         };
@@ -1174,6 +1353,21 @@ fn lifecycle_denied(dentry: *const u8, op: u8, ev_kind: u32, counter: u32, self_
         if read_name(parent, name_off, &mut dir).is_err() {
             break;
         }
+        // Skipped at level 0 for the same reason as in `file_open`: there
+        // `prev` is the object itself, and that pair was consulted above.
+        if pairs && level > 0 {
+            let key = PairKey {
+                parent: dir,
+                name: prev,
+            };
+            if let Some(&mask) = unsafe { BLOCK_DIR_PAIRS.get(&key) } {
+                if fmode::covers(mask, op) {
+                    bump(counter);
+                    emit_deny_pair_key(ev_kind, &key, meta::KEY_DIR_PAIR);
+                    return true;
+                }
+            }
+        }
         if let Some(&mask) = unsafe { BLOCK_DIRS.get(&NameKey(dir)) } {
             if fmode::covers(mask, op) {
                 bump(counter);
@@ -1181,6 +1375,7 @@ fn lifecycle_denied(dentry: *const u8, op: u8, ev_kind: u32, counter: u32, self_
                 return true;
             }
         }
+        prev = dir;
         cur = parent;
     }
     false
