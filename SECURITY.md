@@ -130,6 +130,15 @@ Out of scope (known limitations, documented, not vulnerabilities):
   (`SOCK_RAW`, `AF_PACKET`) or an already-established connection is outside what
   these hooks see at all.
 
+- **`domain:` rules are only as sound as DNS.** They are re-resolved every 60
+  seconds and the kernel tries are updated in place, so an allowlisted CDN that
+  rotates is followed rather than silently falling through to a deny-all. What
+  that does **not** fix: between two refreshes the answer can be stale; wardyn
+  resolves through the *system* resolver, which is not necessarily the one the
+  agent uses; and a `block` by name is defeated by anyone who controls the name,
+  since they choose what it answers. A domain block is a convenience, not a
+  boundary — use `cidr:` where it has to hold.
+
 - **Rules are matched, not the intent behind them.** `access: read` narrows a rule
   to opens requesting `FMODE_READ`. An `O_PATH` open requests neither read nor
   write and is covered only by a rule with no `access:` (the default), or by

@@ -58,6 +58,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`domain:` rules were resolved once and then frozen for the life of the run.**
+  A `{ domain: "registry.npmjs.org", action: allow }` was expanded at load into
+  one host rule per address the resolver happened to return, and nothing ever
+  re-resolved. CDN-fronted names rotate within minutes — and all three names in
+  the shipped default policy are CDN-fronted — so a long agent session would
+  start seeing legitimate traffic to an allowlisted host fall through to the
+  `0.0.0.0/0` deny-all. Users experience that as wardyn being flaky, and
+  flakiness is how a security tool gets switched off.
+
+  Domain rules are now kept as *specs* and re-resolved every 60 seconds, with
+  the difference pushed into the live kernel tries — the maps are held for the
+  whole run precisely so they can be mutated, which the approve-once path
+  already proved. The userspace mirror reads the same live set, so the feed
+  cannot disagree with what is enforced.
+
+  A refresh **replaces** the address set rather than growing it. Accumulating
+  every address a name has ever had would never break a working agent, which is
+  what makes it tempting — and it would let an `allow` drift steadily more
+  permissive than what the operator wrote. A policy may not loosen itself.
+
+  Changes are feed rows, including failures: a name that stops resolving stops
+  enforcing, and that has to reach the operator while it is happening. It
+  previously went to a `log::warn!` that nothing printed, since the logger is
+  not initialised under the TUI at all.
+
+  Precedence survives the split. Domain rules live in their own collection now,
+  so a tie with a `cidr:` rule on the same `/32` can no longer be decided by
+  position in one vector; every rule carries its position in the file instead,
+  and a test pins both orderings.
+
 - **The built-in LSM offsets were trusted on any architecture.** When BTF
   resolution fails, wardyn falls back to struct offsets measured with `pahole`
   on kernel 6.8 — and the check guarding that fallback compared only the kernel
