@@ -2,7 +2,11 @@
 name = "wardyn-common"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Dual-licensed for the same reason as wardyn-ebpf: this crate is `no_std` and
+# is compiled INTO the kernel object as well as into userspace, so it has to be
+# available under the GPLv2 the object declares. Userspace links the AGPL arm,
+# exactly as before.
+license = "GPL-2.0-only OR AGPL-3.0-or-later"
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true

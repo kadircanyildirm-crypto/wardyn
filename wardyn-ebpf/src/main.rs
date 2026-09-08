@@ -37,6 +37,13 @@ use wardyn_common::{
 /// matcher here depends on) unless the object carries a GPL-compatible license
 /// tag. Declaring it explicitly, rather than relying on a loader default, is
 /// also what makes the object's terms visible to anyone inspecting it.
+///
+/// `"GPL"` means GPLv2 to the kernel, which is why this crate and
+/// `wardyn-common` are dual-licensed `GPL-2.0-only OR AGPL-3.0-or-later` while
+/// the rest of the workspace is AGPL alone. AGPL-3.0 is not on the kernel's
+/// `license_is_gpl_compatible()` list, so declaring it honestly would fail the
+/// load — and declaring `"GPL"` from an AGPL-only crate was shipping an object
+/// under terms its source did not grant.
 #[no_mangle]
 #[link_section = "license"]
 pub static LICENSE: [u8; 4] = *b"GPL\0";

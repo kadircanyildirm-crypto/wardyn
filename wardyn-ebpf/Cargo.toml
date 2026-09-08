@@ -2,7 +2,21 @@
 name = "wardyn-ebpf"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Dual-licensed, unlike the rest of the workspace, because this crate is
+# compiled into the object the KERNEL loads — and the kernel decides what it
+# will accept.
+#
+# `src/main.rs` declares `GPL` in the ELF's license section, which it must: BPF
+# LSM programs are required to be GPL-compatible, and `bpf_probe_read_kernel`
+# is a GPL-only helper. That string means GPLv2. AGPL-3.0 is not on the
+# kernel's `license_is_gpl_compatible()` list and would be rejected if declared
+# honestly — so a crate licensed AGPL-only was shipping an object under terms
+# its source did not grant.
+#
+# The GPL-2.0 arm makes the declaration true. The AGPL arm keeps this crate
+# usable under the same terms as the rest of the workspace. Nobody loses a
+# right; the ambiguity goes away.
+license = "GPL-2.0-only OR AGPL-3.0-or-later"
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true

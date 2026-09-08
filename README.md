@@ -484,6 +484,26 @@ Wardyn, but any distributed derivative — **including one offered to others ove
 network** — must be released under the AGPL and make its complete source
 available. You must preserve the copyright and licence notices.
 
+### The kernel-side crates are dual-licensed
+
+`wardyn-ebpf` and `wardyn-common` are **`GPL-2.0-only OR AGPL-3.0-or-later`**.
+Everything else is AGPL alone.
+
+That is not a softening; it is what makes the object honest. Those two crates
+compile into the eBPF object the *kernel* loads, and the kernel decides what it
+accepts: a BPF LSM program must be GPL-compatible, and `bpf_probe_read_kernel`
+is a GPL-only helper. The object declares `GPL` in its ELF license section,
+which to the kernel means GPLv2 — and AGPL-3.0 is **not** on the kernel's
+`license_is_gpl_compatible()` list, so declaring it truthfully would fail the
+load outright.
+
+An AGPL-only crate shipping an object under a GPLv2 declaration was granting
+terms its source did not. The GPL-2.0 arm makes the declaration true; the AGPL
+arm keeps the crates usable exactly as before. No right is removed from anyone.
+
+Userspace — `wardyn` and `wardyn-policy`, which is the tool you run — is
+unchanged: AGPL-3.0-or-later.
+
 Unless you explicitly state otherwise, any contribution you intentionally submit
 for inclusion in the work shall be licensed as above, without any additional
 terms or conditions.
