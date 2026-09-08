@@ -135,6 +135,24 @@ impl OverrideStore {
         exc
     }
 
+    /// The keys currently in force for `policy_fingerprint` — what a run must
+    /// hand the kernel at startup so an approval granted yesterday is not
+    /// re-asked today.
+    ///
+    /// Separate from `exceptions_for`, which answers the userspace mirror's
+    /// "is this key excepted?" and is deliberately opaque. Applying to the
+    /// kernel needs the keys themselves.
+    pub fn active_keys<'a>(
+        &'a self,
+        policy_fingerprint: &'a str,
+        now_unix: i64,
+    ) -> impl Iterator<Item = &'a DenialKey> + 'a {
+        self.overrides
+            .iter()
+            .filter(move |o| o.policy == policy_fingerprint && o.is_active_at(now_unix))
+            .map(|o| &o.key)
+    }
+
     /// Record an approval, replacing any existing one for the same key under the
     /// same policy — re-approving extends the deadline instead of stacking a
     /// second entry that the operator would have to revoke twice.

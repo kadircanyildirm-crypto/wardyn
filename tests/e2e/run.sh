@@ -879,6 +879,103 @@ else
   skip "control run + identity counters (BPF-LSM not active)"
 fi
 
+
+# ── stored approvals ─────────────────────────────────────────────────────────
+#
+# `--overrides` and `--override-ttl` were accepted and did nothing for two
+# releases: the store, its file handling, the fingerprinting and the expiry were
+# all written and never connected to a run. These assert the connection, and the
+# one property that makes it safe to have — an approval is an exception TO a set
+# of rules, so it must not survive the rules changing.
+OVW="$(mktemp -d)"
+trap 'rm -rf "$OVW"' EXIT
+cat >"$OVW/policy.yaml" <<'OVPOL'
+version: 1
+default_action: allow
+files:
+  - { match: "**/.env", action: block }
+OVPOL
+mkdir -p "$OVW/proj"
+echo 'THE-SECRET' >"$OVW/proj/.env"
+[[ -n "${SUDO_UID:-}" ]] && chown -R "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$OVW"
+
+# The approval, written by hand in the documented shape, so the test also pins
+# the file format an operator is expected to audit and edit. The fingerprint it
+# needs comes from `--dry-run`, which reports it for exactly that reason.
+write_store() {
+  cat >"$OVW/overrides.yaml" <<OVSTORE
+version: 1
+overrides:
+  - key:
+      kind: file_name
+      value: ".env"
+    policy: "$1"
+    granted: 1700000000
+    expires: 4102444800
+OVSTORE
+  chmod 600 "$OVW/overrides.yaml"
+}
+
+if [[ $LSM_ACTIVE -eq 1 ]]; then
+  OVFP="$("$WARDYN" --dry-run --policy "$OVW/policy.yaml" | awk '/^fingerprint: / { print $2 }')"
+  if [[ -z "$OVFP" ]]; then
+    fail "approvals: --dry-run did not report a policy fingerprint"
+  else
+    pass "approvals: --dry-run reports the fingerprint ($OVFP)"
+  fi
+  write_store "$OVFP"
+
+  # 1) no store: the rule bites.
+  "$WARDYN" --plain --enforce --policy "$OVW/policy.yaml" --audit "$OVW/a1.jsonl" \
+    --overrides "$OVW/absent.yaml" run -- cat "$OVW/proj/.env" \
+    >"$OVW/out1" 2>"$OVW/err1" || true
+  if grep -q 'THE-SECRET' "$OVW/out1"; then
+    fail "approvals: the block did not fire without a store — the rest proves nothing"
+  else
+    pass "approvals: with no stored approval the rule is enforced"
+  fi
+
+  # 2) a stored approval for THIS policy is applied to the kernel before spawn.
+  "$WARDYN" --plain --enforce --policy "$OVW/policy.yaml" --audit "$OVW/a2.jsonl" \
+    --overrides "$OVW/overrides.yaml" run -- cat "$OVW/proj/.env" \
+    >"$OVW/out2" 2>"$OVW/err2" || true
+  if grep -q 'stored approval(s).*in force' "$OVW/err2"; then
+    pass "approvals: a stored approval is reported at startup"
+  else
+    fail "approvals: nothing said about the stored approval: $(head -c 200 "$OVW/err2")"
+  fi
+  if grep -q 'THE-SECRET' "$OVW/out2"; then
+    pass "approvals: the kernel stopped denying — the approval reached the map, not just the mirror"
+  else
+    fail "approvals: the stored approval was reported but the read was still denied"
+  fi
+
+  # 3) the property that makes this safe to ship: an approval is an exception to
+  #    a set of rules, and must not outlive them. One comment is enough.
+  echo '# the policy changed' >>"$OVW/policy.yaml"
+  "$WARDYN" --plain --enforce --policy "$OVW/policy.yaml" --audit "$OVW/a3.jsonl" \
+    --overrides "$OVW/overrides.yaml" run -- cat "$OVW/proj/.env" \
+    >"$OVW/out3" 2>"$OVW/err3" || true
+  if grep -q 'THE-SECRET' "$OVW/out3"; then
+    fail "approvals: an approval granted under a DIFFERENT policy was still honoured"
+  else
+    pass "approvals: an approval does not survive the policy it was granted against"
+  fi
+
+  # 4) a store anyone could edit is a store that grants anyone an exception.
+  cp "$OVW/overrides.yaml" "$OVW/loose.yaml"
+  chmod 666 "$OVW/loose.yaml"
+  "$WARDYN" --plain --enforce --policy "$OVW/policy.yaml" --audit "$OVW/a4.jsonl" \
+    --overrides "$OVW/loose.yaml" run -- true >"$OVW/out4" 2>"$OVW/err4" || true
+  if grep -qi 'group- or world-writable' "$OVW/err4"; then
+    pass "approvals: a world-writable store is refused, loudly"
+  else
+    fail "approvals: a world-writable store was accepted: $(head -c 200 "$OVW/err4")"
+  fi
+else
+  skip "stored approvals (needs BPF-LSM to show the kernel actually stopped denying)"
+fi
+
 # ── summary ─────────────────────────────────────────────────────────────────
 echo
 if [[ $FAIL -gt 0 ]]; then

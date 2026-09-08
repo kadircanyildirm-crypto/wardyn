@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--overrides` and `--override-ttl` now do something.** The approval store,
+  its hardened file handling, the policy fingerprinting and the expiry were all
+  written and never connected to a run, so both flags accepted values and had no
+  effect — an operator who pointed `--overrides` at a file was told nothing and
+  got nothing. Approvals granted in the TUI are now written down, and approvals
+  from an earlier run are applied to the kernel maps *before* the agent starts,
+  so the same prompt is not re-asked every session.
+
+  Each approval is filed under a fingerprint of the policy text it was granted
+  against. An approval is an exception *to* a set of rules, so it does not
+  survive those rules changing — one edited comment is enough to retire it. It
+  stays in the file, so reverting the policy restores it, but it is not in force
+  meanwhile.
+
+- **`--dry-run` reports the policy fingerprint**, which is the only way to learn
+  the key an approval must be filed under when editing the store by hand.
+
 ### Fixed
 
 - **The audit log could be redirected by a symlinked parent directory, and
