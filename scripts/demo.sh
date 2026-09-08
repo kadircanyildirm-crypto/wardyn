@@ -25,7 +25,7 @@ HOME_DIR="$(getent passwd "$(id -un)" | cut -d: -f6)"
 HOME_DIR="${HOME_DIR:-$HOME}"
 DEMO="$HOME_DIR/wardyn-demo"
 
-for _ in 1 2 3 4 5 6 7 8; do
+for _ in 1 2 3 4 5; do
   # ── file reads ──
   cat /etc/hostname            >/dev/null 2>&1   # open  -> allow
   cat "$DEMO/.env"             >/dev/null 2>&1   # open  -> BLOCK  (**/.env)
@@ -40,5 +40,18 @@ for _ in 1 2 3 4 5 6 7 8; do
   # ── outbound connections (bash /dev/tcp; connect() fires even if refused) ──
   timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/22'  2>/dev/null  # connect -> allow (loopback)
   timeout 2 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'   2>/dev/null  # connect -> BLOCK (default deny)
-  sleep 1
+
+  # ── the same filename, twice: the rule names a parent, so only one is denied ──
+  # `**/.aws/credentials` used to compile to the bare name `credentials` and would
+  # have denied both of these. The kernel key is `(.aws, credentials)` now, so an
+  # `ok` row sits directly under a BLOCK row for an identically named file.
+  #
+  # Deliberately LAST in the loop, right before the pause: every `cat` and
+  # `timeout` above spawns a process that opens ld.so.cache and libc, and those
+  # rows are real — wardyn is right to show them — but they scroll a two-line
+  # story off the screen in well under a second. Here the pair is what the feed
+  # is resting on while the viewer reads it.
+  cat "$HOME_DIR/.aws/credentials" >/dev/null 2>&1  # open  -> BLOCK  (**/.aws/credentials)
+  cat "$DEMO/credentials"          >/dev/null 2>&1  # open  -> allow  (same name, other parent)
+  sleep 2
 done

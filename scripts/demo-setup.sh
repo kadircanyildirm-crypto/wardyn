@@ -18,16 +18,24 @@ DEMO_USER="${SUDO_USER:-$USER}"
 DEMO_HOME="$(getent passwd "$DEMO_USER" | cut -d: -f6)"
 DEMO_HOME="${DEMO_HOME:-$HOME}"
 
-mkdir -p "$DEMO_HOME/wardyn-demo" "$DEMO_HOME/.ssh"
+mkdir -p "$DEMO_HOME/wardyn-demo" "$DEMO_HOME/.ssh" "$DEMO_HOME/.aws"
 echo "SECRET_API_KEY=sk-demo-not-real" > "$DEMO_HOME/wardyn-demo/.env"
 echo "//registry.npmjs.org/:_authToken=xx" > "$DEMO_HOME/.npmrc"
 [ -f "$DEMO_HOME/.ssh/id_ed25519" ] || echo "FAKE-DEMO-KEY" > "$DEMO_HOME/.ssh/id_ed25519"
 chmod 700 "$DEMO_HOME/.ssh"
 chmod 600 "$DEMO_HOME/.ssh/id_ed25519" "$DEMO_HOME/.npmrc"
 
+# Two files with the SAME basename, in different parents. The demo reads both,
+# and only the one the rule names is denied — which is what a two-segment kernel
+# key buys, and it does not show at all without the second file to compare.
+echo "aws_secret_access_key=demo-not-real" > "$DEMO_HOME/.aws/credentials"
+echo "not a secret; just named like one" > "$DEMO_HOME/wardyn-demo/credentials"
+chmod 600 "$DEMO_HOME/.aws/credentials"
+chmod 644 "$DEMO_HOME/wardyn-demo/credentials"
+
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_UID:-}" ]; then
   chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" \
-    "$DEMO_HOME/wardyn-demo" "$DEMO_HOME/.ssh" "$DEMO_HOME/.npmrc"
+    "$DEMO_HOME/wardyn-demo" "$DEMO_HOME/.ssh" "$DEMO_HOME/.aws" "$DEMO_HOME/.npmrc"
 fi
 
 echo "demo fixtures ready in $DEMO_HOME"
