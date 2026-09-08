@@ -391,7 +391,9 @@ Full design, hook map, and the eBPF-verifier war stories are in
 - Root (to load/attach eBPF).
 - Built with Rust nightly + `bpf-linker` ([aya](https://aya-rs.dev)).
 - Works from inside pid namespaces (containers, WSL2 distros): wardyn learns its
-  kernel-view pid via an in-kernel handshake and says so when it differs.
+  kernel-view pid via an in-kernel handshake and says so when it differs. If the
+  handshake cannot complete there, `run` refuses to start rather than watch a pid
+  that means something else to the kernel.
 
 > The LSM file/exec matcher reads a few `struct file`, `dentry` and `inode`
 > fields by offset. Wardyn resolves those offsets **at runtime from the kernel's

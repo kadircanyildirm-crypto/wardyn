@@ -46,7 +46,7 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 | Thread creations insert TIDs into the TGID-keyed WATCHED map, which… | high | ✅ Doğrulandı | **high** | — |
 | `CgroupAttachMode::Single` on the root cgroup aborts if any other t… | medium | ❌ Reddedildi | **info** | — |
 | Basename/parent-dir matching is defeated by `cp`, hardlinks, and in… | medium | ✅ Doğrulandı | **medium** | — |
-| A failed pid-ns handshake falls back to the local pid, which under … | medium | ✅ Doğrulandı | **medium** | — |
+| A failed pid-ns handshake falls back to the local pid, which under … | medium | ✅ Doğrulandı | **medium** | ✅ **Kapatıldı** |
 
 **Sonuç:** 10 doğrulandı · 2 reddedildi · 12 inceleme.
 
@@ -191,7 +191,7 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 
 > ✅ **Doğrulama:** Confirmed with corrections. (a) The rename/hardlink bypass direction is genuinely undocumented — SECURITY.md's four out-of-scope bullets (57-71) frame the basename reduction only as over-blocking and non-enforceable globs, while SECURITY.md:50-53 puts "read a file that policy marks block ... the rule is kernel-enforceable" explicitly IN scope, which is exactly what `ln ~/.ssh/id_ed25519 ~/k && cat ~/k` achieves. (b) PoC fix: the /tmp hardlink usually fails EXDEV — use a same-filesystem link or `mv`. (c) `cp` bypasses only the EXEC check; `cp` of a blocked secret is itself denied since cp must open the source. (d) Symlinks do NOT bypass (resolution ends at the target dentry) — only link()/rename(), neither of which is hooked. (e) The netcat half is largely neutered by the name-independent cgroup CIDR default-deny; residual risk is a reverse shell to an allowed range (127/8, 10/8, 172.1…
 
-### 🟡 ORTA — A failed pid-ns handshake falls back to the local pid, which under a namespace is an unrelated init-ns process that gets seeded into WATCHED
+### ✅ KAPATILDI (🟡 ORTA idi) — A failed pid-ns handshake falls back to the local pid, which under a namespace is an unrelated init-ns process that gets seeded into WATCHED
 *`correctness` · efor: M · id: `handshake-fallback-watches-a-stranger` · **doğrulama: ✅ doğrulandı → medium***
 
 - **Konum:** `wardyn/src/main.rs:545-604, 949-972`
@@ -200,6 +200,52 @@ paketleme/release altyapısı. Bunlar README'nin Roadmap'ında ve
 - **Öneri:** Under `--enforce`, treat handshake failure as fatal instead of a warning — enforcing the wrong process is worse than not starting. Validate the learned tgid (run the handshake twice and require the same answer; cross-check against `/proc/self/status`'s `NSpid` when it has a single entry). Replace the tracepoint handshake with `BPF_PROG_TEST_RUN` on a `BPF_PROG_TYPE_SYSCALL` program, which runs in the caller's own context and returns `bpf_get_current_pid_tgid()` with no global hook and no race window at all.
 
 > ✅ **Doğrulama:** Confirmed at medium, with two corrections — one that strengthens the finding, one that weakens part of the recommendation.  STRENGTHEN: the claim only cites the seed at main.rs:577/603 as a millisecond window. The more serious insert is main.rs:595, `let _ = watched.insert(pid, 1u8, 0);`, guarded by `if !ns_mismatch` — which passes on handshake failure. Nothing ever removes it (main.rs:603 removes `seed_tgid` only). So the stranger colliding with the *child's* local pid is watched and enforced for the whole run, and its forks are adopted transitively and permanently. ARCHITECTURE.md:50-53 asserts this hazard is handled; it is handled only when the handshake succeeds.  WEAKEN: the recommended `/proc/self/status` NSpid cross-check does not work. NSpid is rendered relative to the *reading* process's pid namespace, so a process inside a container reading its own status sees a single entry…
+
+> ✅ **Kapatıldı** (`plan_seed` / `in_pid_namespace`, `wardyn/src/main.rs`). Wardyn
+> no longer *assumes* the friendly case when the handshake produces nothing — it
+> establishes whether it is namespaced first, independently of eBPF, and refuses
+> to start `run` unless it can point at the agent honestly.
+>
+> The verification note above is what made this fixable: it ruled out the
+> `NSpid` cross-check, and re-testing confirmed why — `NSpid:` is rendered from
+> the *reader's* namespace inward, so a process inside a container sees a single
+> entry, exactly like one on the host. `/proc/self/ns/pid` versus
+> `/proc/1/ns/pid` fails for the same reason: the visible pid 1 *is* the
+> namespace's own init, so the two links compare equal.
+>
+> What survives is the namespace's **inode**: the initial pid namespace has a
+> fixed value (`PROC_PID_INIT_INO`, `0xEFFFFFFC`) rather than an allocated one,
+> so `stat("/proc/self/ns/pid").st_ino != 0xEFFFFFFC` answers the question from
+> the inside with no privilege. Measured on the WSL2 lab, whose distro turns out
+> to be namespaced: `pid` 4026532223 and `uts`/`ipc` likewise differ, while
+> `user`, `cgroup` and `time` match their initial constants exactly.
+>
+> Three behaviours changed:
+>
+> - **Handshake absent + namespaced (or unknown) → refuse to start**, with a
+>   message naming the ways out. This follows the Landlock precedent rather than
+>   the fail-open one: a watch set aimed at the wrong process is not a weakened
+>   watch, it is a false report.
+> - **`ns_mismatch` no longer comes from `tgid != self_pid` alone.** An init-ns
+>   tgid can coincide with the in-namespace pid by chance; reading that as "no
+>   namespace" would have re-opened the `main.rs:595` insert the verification
+>   note identified as the more serious half.
+> - The handshake-attach warning no longer promises that scoping "will silently
+>   fail" — it now says `run` will refuse to start.
+>
+> The reachable path was never exotic: a container with a default seccomp
+> profile restricts `personality()` to a fixed argument list, which is precisely
+> what the nonce handshake needs.
+>
+> `plan_seed` is a pure function so the decision is pinned by tests rather than
+> living inline — six of them, including one that runs the detector inside a
+> real `unshare --user --pid` namespace and one that asserts the coincidental-
+> tgid case is not mistaken for the init namespace.
+>
+> Not adopted: the `BPF_PROG_TYPE_SYSCALL` / `BPF_PROG_TEST_RUN` alternative
+> remains the better handshake and is worth doing, but it replaces a mechanism
+> that works; this fix repairs the case where *any* mechanism fails, which the
+> better handshake would still need.
 
 ### ⚪ DÜŞÜK — NAME_LEN=40 truncation can produce false denials, and the truncation error is discarded
 *`correctness` · efor: S · id: `namelen-truncation`*

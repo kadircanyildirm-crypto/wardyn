@@ -57,6 +57,18 @@ Wardyn is scoped to *one* agent invocation, not the whole host:
 3. On `sched_process_fork`, if the parent is watched, the child is added.
 4. Every observe/enforce hook first checks `watched.contains(pid)` — unwatched processes are ignored.
 
+`watched` is keyed by tgid **as the kernel sees it**, which inside a pid
+namespace is not the pid userspace can read. Wardyn learns its own kernel-view
+tgid through an in-kernel handshake and seeds that. When the handshake produces
+nothing — the tracepoint is missing, or a container seccomp profile restricts
+the `personality()` argument it rides on — wardyn checks whether it is
+namespaced at all (the initial pid namespace has a fixed inode, so
+`/proc/self/ns/pid` answers this without eBPF) and **refuses to start `run`**
+unless it can show that its own pid is the kernel's view of it. Seeding a pid
+that names a different process to the kernel would report a stranger's syscalls
+as the agent's, and enforce against them, while the agent ran unwatched: not a
+weaker watch, a false one.
+
 This makes Wardyn safe to run on a shared machine: it only constrains the subtree you launched.
 
 Two portability traps live in that seeding, both handled at startup:
