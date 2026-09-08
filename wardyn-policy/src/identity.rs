@@ -238,7 +238,11 @@ pub fn resolve(rule: &str, raw: &str, base: &AnchorBase, stat: Stat<'_>) -> Reso
             rule: rule.to_string(),
             path: PathBuf::from(raw),
             reason: if raw.starts_with('~') {
-                "no home directory known for the agent — either no identity to drop to was                  found (run under `sudo`, or pass --as-user), or the requested uid has no                  /etc/passwd entry. Wardyn will not fall back to root's home here, because a                  `~` rule anchored there would protect the wrong directory while reading as                  correct. Write an absolute path if the rule must apply regardless"
+                "no home directory known for the agent — either no identity to drop to was found \
+                 (run under `sudo`, or pass --as-user), or the requested uid has no /etc/passwd \
+                 entry. Wardyn will not fall back to root's home here, because a `~` rule anchored \
+                 there would protect the wrong directory while reading as correct. Write an \
+                 absolute path if the rule must apply regardless"
                     .into()
             } else {
                 "relative path and no working directory known".into()

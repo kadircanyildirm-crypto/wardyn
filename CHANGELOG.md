@@ -27,10 +27,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **GOVERNANCE.md** says who decides, what gets accepted, the release cadence,
+  the licensing stance, and what the project does *not* promise. It states the
+  bus factor of one plainly, because leaving that unsaid lets a reader assume
+  more than is true about a tool they put between an agent and their filesystem.
+  SECURITY.md's supported-version table was two releases stale and now says
+  0.3.x.
+
+- **The over-broad-key warning names the remedy.** A `block` glob that is
+  already an absolute literal path now gets told what to write instead:
+  `Write { path: "/etc/shadow", action: block } to pin exactly that file.`
+  Turning a warning the operator could only note into one they can act on.
+
 - **Every GitHub Action is pinned to a commit SHA** (16 of 16; the tag follows
   as a comment). A moving tag is a standing invitation to whoever can push it.
 
 ### Fixed
+
+- **Six operator-facing messages rendered with 10-18 spaces mid-sentence.** Lost
+  `\` line continuations in the string literals. They now read as sentences.
 
 - **The pid-ns handshake nonce set real `personality(2)` bits.** It was passed
   to the syscall raw, and the kernel stores what it is handed without

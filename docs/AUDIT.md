@@ -12,9 +12,9 @@
 
 | Durum | Sayı | Anlamı |
 |---|---:|---|
-| ✅ Kapatıldı | **96** | Gösterilebilir bir mekanizma var; her birinin Durum satırı onu adlandırıyor |
+| ✅ Kapatıldı | **97** | Gösterilebilir bir mekanizma var; her birinin Durum satırı onu adlandırıyor |
 | ⏸️ Bilerek açık | **10** | Kapsam dışı ya da belgelenmiş sınır (SECURITY.md / README Roadmap) |
-| 🔓 Açık | **6** | Hâlâ gerçek; aşağıda listeli |
+| 🔓 Açık | **5** | Hâlâ gerçek; aşağıda listeli |
 | ❌ Reddedildi | **1** | Adversaryal doğrulama bulguyu çürüttü |
 | | **113** | |
 
@@ -39,10 +39,8 @@ düzeltmeye çalıştığı hatanın ta kendisi olurdu.
   doğrulanmadı; crates.io üzerinden hiç yayın denenmedi.
 - `readme-and-release-profile-untested` — yeniden doğrulanmadı.
 
-**Konumlandırma ve yönetişim (2)**
+**Konumlandırma ve yönetişim (1)**
 
-- `governance-and-security-guarantees-thin` — SECURITY.md var; GOVERNANCE.md ve
-  ilan edilmiş bir destek penceresi yok.
 - `no-container-k8s-or-mcp-integration-story` — `.devcontainer/` var; Dockerfile,
   DaemonSet ve MCP sunucusu yok.
 
@@ -1538,7 +1536,7 @@ The same structure blocks a cheap CI win: a `macos-latest`/`windows-latest` leg 
 ### 🟡 ORTA — Governance is single-maintainer with no versioned security guarantees, no semver policy for the wire/policy formats, and a threat model that stops at one page
 *`positioning` · efor: M · id: `governance-and-security-guarantees-thin`*
 
-> **Durum:** 🔓 **Açık** — SECURITY.md exists; there is no GOVERNANCE.md and no stated support window.
+> **Durum:** ✅ **Kapatıldı** — GOVERNANCE.md eklendi: kimin karar verdiği, neyin kabul edildiği, sürüm ritmi, lisans duruşu ve projenin **vaat etmediği** şeyler. Bakımcı sayısının bir olduğu ve buna bağlı otobüs faktörünün açıkça yazıldığı yer de burası. SECURITY.md'nin desteklenen sürüm tablosu 0.3.x'e güncellendi (0.1.x'te kalmıştı).
 
 - **Konum:** `SECURITY.md:48-72, CHANGELOG.md:6-7, .github/CODEOWNERS`
 - **Sorun:** SECURITY.md is genuinely above average for a 0.1 project — it names in-scope and out-of-scope classes and admits fail-open, observe-only rules, and offset drift. But it stops short of what a security tool needs before anyone deploys it: there is no statement of what Wardyn *guarantees* at a given version, no enumeration of known bypasses (the watched tree can use `io_uring` to issue file operations that never hit the traced syscalls; it can hardlink a blocked basename to an unblocked one since matching is by dentry name; it can `chdir` to defeat the relative-path reconstruction; on kernels without BPF LSM, file/exec enforcement silently does not exist), no CVE/advisory process beyond "report privately", and no semver policy covering the two formats that are already de-facto public APIs (the audit JSONL schema and `policy.yaml`). CODEOWNERS lists one person, and the repo has no succession or bus-factor statement.
