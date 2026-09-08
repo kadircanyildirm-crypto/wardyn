@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "wardyn"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aya",
@@ -2111,11 +2111,11 @@ dependencies = [
 
 [[package]]
 name = "wardyn-common"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "wardyn-ebpf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "wardyn-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "globset",
