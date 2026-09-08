@@ -12,9 +12,9 @@
 
 | Durum | Sayı | Anlamı |
 |---|---:|---|
-| ✅ Kapatıldı | **92** | Gösterilebilir bir mekanizma var; her birinin Durum satırı onu adlandırıyor |
+| ✅ Kapatıldı | **96** | Gösterilebilir bir mekanizma var; her birinin Durum satırı onu adlandırıyor |
 | ⏸️ Bilerek açık | **10** | Kapsam dışı ya da belgelenmiş sınır (SECURITY.md / README Roadmap) |
-| 🔓 Açık | **10** | Hâlâ gerçek; aşağıda listeli |
+| 🔓 Açık | **6** | Hâlâ gerçek; aşağıda listeli |
 | ❌ Reddedildi | **1** | Adversaryal doğrulama bulguyu çürüttü |
 | | **113** | |
 
@@ -32,20 +32,9 @@ düzeltmeye çalıştığı hatanın ta kendisi olurdu.
 > kural adıyla aynı anahtara iniyordu, yani 40+ baytlık her dosya o kuralla
 > yanlış yere reddediliyordu.
 
-**Düşük şiddetli (2)**
+**Test ve tedarik zinciri (3)**
 
-- `personality-handshake-side-effects` / `personality-arbitrary-persona` — pid-ns
-  el sıkışmasının nonce'u maskelenmemiş 32 bit. `READ_IMPLIES_EXEC`,
-  `ADDR_NO_RANDOMIZE` gibi bitleri wardyn'in *kendi* sürecinde bir an için
-  kuruyor (hemen geri alınıyor).
-
-**Test ve tedarik zinciri (5)**
-
-- `no-property-test-kernel-mirror-truncation-bug` — çekirdek eşleştiricisiyle
-  kullanıcı-alanı aynası arasında property/differential test yok.
 - `no-fuzzing` — ağaçta fuzz hedefi yok.
-- `actions-unpinned-supply-chain` — 16 `uses:` satırının **0'ı** commit SHA'sına
-  sabitlenmiş.
 - `cargo-publish-broken` / `crates-io-publish-structurally-broken` — yeniden
   doğrulanmadı; crates.io üzerinden hiç yayın denenmedi.
 - `readme-and-release-profile-untested` — yeniden doğrulanmadı.
@@ -328,7 +317,7 @@ dosya/ağ arasındaki default-deny asimetrisi, prefix ve süreç-başına kurall
 ### ⚪ DÜŞÜK — The pid-ns handshake sets a random 32-bit personality on wardyn itself, including exec-domain and memory-semantics bits
 *`robustness` · efor: S · id: `personality-handshake-side-effects`*
 
-> **Durum:** 🔓 **Açık** — the nonce is still an unmasked 32-bit value, so the handshake briefly sets arbitrary persona bits on wardyn's own process (restored immediately).
+> **Durum:** ✅ **Kapatıldı** — nonce artık `PERSONALITY_FREE_BITS` (0xf001_ff00) ile maskeleniyor: `PER_MASK` ve `UNAME26`..`ADDR_LIMIT_3GB` arasındaki tanımlı bayrakların hiçbirine dokunmuyor. Geriye 13 bit kalıyor, ki nonce'un tek işi eşzamanlı bir `personality()` çağrısını ayırt etmek. WSL'de beş koşuda el sıkışmanın hâlâ tuttuğu doğrulandı.
 
 - **Konum:** `wardyn/src/main.rs:949-972`
 - **Sorun:** The nonce is a raw 32-bit random value passed straight to `personality(2)`. Its low byte is the exec-domain selector (`PER_MASK`) and the upper bits include `READ_IMPLIES_EXEC`, `ADDR_NO_RANDOMIZE`, `MMAP_PAGE_ZERO`, `ADDR_LIMIT_3GB` and `ADDR_COMPAT_LAYOUT` — all of which change how the process's memory and subsequent execs behave.
@@ -789,7 +778,7 @@ dosya/ağ arasındaki default-deny asimetrisi, prefix ve süreç-başına kurall
 ### ⚪ DÜŞÜK — The pid-ns handshake sets a fully random 32-bit personality on the calling thread
 *`robustness` · efor: S · id: `personality-arbitrary-persona`*
 
-> **Durum:** 🔓 **Açık** — duplicate of `personality-handshake-side-effects`; the nonce is still unmasked.
+> **Durum:** ✅ **Kapatıldı** — `personality-handshake-side-effects` ile birlikte.
 
 - **Konum:** `wardyn/src/main.rs:949-972`
 - **Sorun:** `learn_init_ns_tgid` reads 4 random bytes and passes them straight to `personality()`. The persona word is not opaque: its low byte selects a personality *type* (PER_LINUX32, PER_SVR4, PER_BSD, ...) and the high bits are behaviour flags (ADDR_NO_RANDOMIZE, READ_IMPLIES_EXEC, MMAP_PAGE_ZERO, ADDR_LIMIT_3GB, ADDR_COMPAT_LAYOUT). The code guards only the two sentinel values 0 and `u32::MAX`. The window is one syscall wide and the persona is restored immediately, and `personality` is per-task so no other thread is affected — but relying on 'nothing happens in between' for a randomly-chosen ABI-altering process attribute is fragile, and the restore is skipped entirely if the set call returns -1 for any reason other than the persona genuinely having been -1.
@@ -1167,7 +1156,7 @@ Both are exactly what a five-line table test pins forever. Neither has one. Rela
 ### 🟡 ORTA — No differential/property test between the kernel matcher and its userspace mirror — and they already disagree on NAME_LEN truncation
 *`testing` · efor: M · id: `no-property-test-kernel-mirror-truncation-bug`*
 
-> **Durum:** 🔓 **Açık** — çekirdek eşleştiricisiyle aynası arasında property/differential test yok. (Kırpılma hatası, o testin yakalayacağı türdendi ve elle bulundu.)
+> **Durum:** ✅ **Kapatıldı** — çekirdek eşleştiricisinin sadık bir modeli (`kernel_denies`) ile kullanıcı-alanı aynası, 1110 yol × 6 politika üzerinde sistematik olarak karşılaştırılıyor. İki yönlü invaryant: çekirdek kuraldan **fazlasını** reddediyorsa `overbroad_block_keys` bunu kabul etmeli, **azını** reddediyorsa `observe_only_blocks`. Boşa geçmediği kanıtlandı — kırpılma hatası geri konduğunda sweep onu kendi ürettiği karşı örnekle buluyor: `**/L…(39)` kuralı `/.env/.env/L…(45)`'i sessizce reddediyor.
 
 - **Konum:** `wardyn/src/policy.rs:408-419, 580-591; wardyn-ebpf/src/main.rs:374-378, 397-403`
 - **Sorun:** The project's central honesty claim is that userspace reproduces the kernel matcher exactly (`kernel_file_denial` is documented at policy.rs:401-407 as "the userspace mirror of the kernel's matcher"). That equivalence is checked by one hand-written test with five hardcoded paths (policy.rs:748). There is no property test and no differential fuzzing, so a divergence surfaces only when a user notices a wrong colour.
@@ -1298,7 +1287,7 @@ fn resolve_domain(domain: &str) -> Vec<IpAddr> {
 ### 🟡 ORTA — Supply chain beyond cargo-deny: actions pinned to mutable tags, no Scorecard, no cargo-vet/auditable, and a deny.toml comment that misstates its own config
 *`supply-chain` · efor: S · id: `actions-unpinned-supply-chain`*
 
-> **Durum:** 🔓 **Açık** — 0 of 16 `uses:` lines are pinned to a commit SHA.
+> **Durum:** ✅ **Kapatıldı** — 16 `uses:` satırının 16'sı da commit SHA'sına sabitlendi, okunabilirlik için etiket yorum olarak yanında.
 
 - **Konum:** `.github/workflows/ci.yml:24-36; .github/workflows/audit.yml:28-32; deny.toml:14-20; Cargo.lock:1061-1062`
 - **Sorun:** `cargo-deny` is genuinely well set up, but it is the only supply-chain control, and the workflows that *produce* the artifact are less protected than the dependencies they audit:

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A differential test between the kernel matcher and its userspace mirror.**
+  The two are checked over every path of depth 1–3 across an alphabet chosen to
+  sit on the edges that matter, for six single-rule policies, against a faithful
+  model of `try_file_open`'s matching — file pair, bare basename, then the
+  ancestor walk with its dir pairs, same `MAX_DIR_WALK` bound, same truncation.
+
+  The invariant runs both ways: if the kernel denies **more** than the rule says,
+  `overbroad_block_keys` must admit it; if it denies **less**,
+  `observe_only_blocks` must. Both directions were previously covered only by
+  hand-written examples, which is how a 39-byte rule name came to deny every
+  longer file sharing its prefix for two releases.
+
+  Proven non-vacuous: with that bug reintroduced, the sweep finds it and prints
+  a counterexample it generated itself — `**/L…(39)` silently denies
+  `/.env/.env/L…(45)`.
+
+### Changed
+
+- **Every GitHub Action is pinned to a commit SHA** (16 of 16; the tag follows
+  as a comment). A moving tag is a standing invitation to whoever can push it.
+
+### Fixed
+
+- **The pid-ns handshake nonce set real `personality(2)` bits.** It was passed
+  to the syscall raw, and the kernel stores what it is handed without
+  validating — so `READ_IMPLIES_EXEC`, `ADDR_NO_RANDOMIZE`, `MMAP_PAGE_ZERO`,
+  `UNAME26` and an arbitrary exec domain were set on wardyn's own thread for the
+  instant before the restore. The nonce is now masked to bits the syscall gives
+  no meaning; 13 remain, which is ample for telling our own call apart from an
+  unrelated one in the same nanosecond.
+
 ## [0.3.0] — 2026-09-08
 
 The release where wardyn was pointed at itself.
