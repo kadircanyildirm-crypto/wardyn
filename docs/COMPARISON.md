@@ -51,15 +51,22 @@ tools do **not** give you together:
 Being explicit here is the point — a security tool that oversells is worse than
 one that is modest and honest.
 
-- **No allowlist shape — and that is the real limitation.** A rule names what is
-  *forbidden*. `access:` can narrow a rule to reads, writes, creations or
-  removals, so "may append to this log, may not read it back" and "may not `rm`
-  anything under `~/.ssh`" are both expressible. What is *not* expressible is
-  "everything is read-only except these three directories": there is no
-  read-only-root, and anything a policy forgot to name stays fully writable. An
-  isolator inverts that default, which is why the two belong together.
-- **No filesystem namespace / containment.** No mount namespace, no chroot, no
-  overlay. The whole real filesystem is visible.
+- **The allowlist shape is Landlock's, and it is opt-in.** `allow_paths:` gives
+  the inverted default — the agent reaches the listed hierarchies and nothing
+  else — but a policy that does not use it is still pure blocklist, and anything
+  it forgot to name stays reachable and writable. There is no middle setting and
+  no automatic containment: wardyn will not invent an allowlist, because an
+  empty one denies the agent its own loader.
+- **Containment restricts the filesystem; it does not replace it.** No mount
+  namespace, no chroot, no overlay. With `allow_paths:` a denied path is denied,
+  but it still exists and its name still appears in the error — an isolator that
+  gives the agent a different filesystem *view* hides that a path is there at
+  all. If the agent must not learn a path exists, that part is still somebody
+  else's job.
+
+  Landlock also does not govern mounting, so an agent that keeps
+  `CAP_SYS_ADMIN` (`--keep-root`) is not fully contained by it. One more reason
+  the privilege drop is the default.
 - **Name-based rules are still dodgeable by a rename.** The LSM matcher keys a
   `match:` glob on its last two literal segments and on its ancestor directory
   names, which stops *accidental and naive* access and nothing more: `mv .env x` detaches the
@@ -83,7 +90,7 @@ one that is modest and honest.
 
 | Tool | Category | Scope | Files | Egress | Root? | userns? | Agent feedback | Audit trail |
 |---|---|---|---|---|---|---|---|---|
-| **Wardyn** | Supervisor (observe + deny + receipt) | One launched subtree | LSM, by name **or** `(dev, ino)` identity; read/write + create/delete | cgroup CIDR, v4/v6, TCP+UDP, `port:` + `proto:` | needs root to load | not required | **yes** (`WARDYN_DENIALS`) | **yes** (JSONL + versioned `--format json` stream) |
+| **Wardyn** | Supervisor (observe + deny + receipt) + isolator | One launched subtree | Landlock allowlist (`allow_paths:`) **plus** eBPF LSM blocklist by name or `(dev, ino)`; read/write + create/delete | cgroup CIDR, v4/v6, TCP+UDP, `port:` + `proto:` | needs root to load | not required | **yes** (`WARDYN_DENIALS`) | **yes** (JSONL + versioned `--format json` stream) |
 | Claude Code sandbox | Isolator | The agent it ships with | bubblewrap FS isolation | allowlisting HTTP(S) proxy | no | typically yes | n/a | limited |
 | Codex CLI sandbox | Isolator | The agent it ships with | bubblewrap + Landlock | seccomp net restriction | no | typically yes | n/a | limited |
 | Linux **Landlock** | Isolator (kernel LSM) | Inherited across fork/exec | resolved-path hierarchy, ~15 rights: **read/write/exec, remove, make** | TCP bind/connect **by port only** (no CIDR, no UDP) | **no root** | not required | no | ABI≥7 audit (node-wide) |
@@ -117,10 +124,11 @@ the agent they ship with.
 
 Use Wardyn **with** an isolator, each doing what it is best at:
 
-- **Filesystem containment** → an isolator (a vendor sandbox, or Landlock via the
-  planned `--isolate` mode when the policy is allowlist-shaped). A read-only root
-  is theirs to give; Wardyn can deny writes to things a policy *names*, which is
-  not the same guarantee.
+- **Filesystem containment** → Wardyn's own `allow_paths:`, which is Landlock.
+  This used to be listed as somebody else's job; it is not any more. What a
+  vendor sandbox still adds is a mount namespace — a *different* filesystem view
+  rather than a restricted one — which matters if the agent must not even see
+  that a path exists.
 - **Specific objects that must survive being renamed** → Wardyn. `path:` rules
   pin `(dev, ino)`, so `mv` and `ln` do not shake them off and `access: delete`
   stops the object being removed at all.
@@ -133,10 +141,12 @@ Being first to say *"use both"* is more credible than claiming to replace either
 
 ## Roadmap implied by this comparison
 
-- **Hybrid engine.** Adopt Landlock for hard filesystem containment when the
-  policy is allowlist-shaped (a new `allow_paths:` shape with per-hierarchy
-  read/write/exec rights); keep eBPF LSM for blocklist-shaped rules and for the
-  observability isolators cannot provide; keep eBPF as the **sole** egress engine.
+- ~~**Hybrid engine.**~~ **Done.** `allow_paths:` applies Landlock to the child
+  before `exec` with per-hierarchy read/write/exec rights; eBPF LSM keeps the
+  blocklist rules and the observability an isolator cannot provide; eBPF remains
+  the sole egress engine. What is left of this item is scope wardyn does not yet
+  use: Landlock's network rights (TCP bind/connect by port, ABI 4+) and its
+  scoping of signals and abstract unix sockets (ABI 6+).
 - **Anchored file matching.** Globs now keep their last *two* literal segments,
   which is what every shipped rule needed; `path:` identity rules cover objects
   the policy can name today. What is left is the difference between a suffix

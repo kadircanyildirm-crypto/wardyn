@@ -42,6 +42,43 @@ pub enum Action {
     Block,
 }
 
+/// One right an `allow_paths:` entry grants over a hierarchy.
+///
+/// Three, not Landlock's sixteen. The kernel's bits distinguish making a FIFO
+/// from making a socket, which no policy author has an opinion about; what they
+/// have an opinion about is whether the agent may read a directory, change it,
+/// or run things from it. The expansion is in `wardyn::landlock`, and `write`
+/// deliberately covers creating, removing and renaming — a project directory an
+/// agent cannot save a new file into is not one it can work in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Right {
+    Read,
+    Write,
+    Exec,
+}
+
+impl Right {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Right::Read => "read",
+            Right::Write => "write",
+            Right::Exec => "exec",
+        }
+    }
+}
+
+/// One hierarchy the agent may reach, and what it may do there.
+#[derive(Debug, Clone)]
+pub struct AllowPath {
+    /// As written, for reporting.
+    pub raw: String,
+    /// Resolved against the agent's home and working directory. `None` when the
+    /// base was unknown — reported, never guessed.
+    pub path: Option<std::path::PathBuf>,
+    pub rights: Vec<Right>,
+}
+
 /// Which operation a file rule applies to.
 ///
 /// Two axes, and the split is not cosmetic — they are enforced at different
@@ -555,6 +592,22 @@ struct RawPolicy {
     network: Vec<NetRuleRaw>,
     #[serde(default)]
     exec: Vec<PathRuleRaw>,
+    /// Landlock hierarchies. Present means the agent is *contained*: it reaches
+    /// these and nothing else. Absent means no containment at all — this is an
+    /// allowlist, and an empty allowlist would deny everything including the
+    /// agent's own loader, so "not mentioned" cannot mean "allow nothing".
+    #[serde(default)]
+    allow_paths: Vec<AllowPathRaw>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AllowPathRaw {
+    path: String,
+    /// Named `rights:` rather than `access:` on purpose. `access:` already means
+    /// something else one section up — which operation a *block* rule covers —
+    /// and reusing it would suggest the two axes are the same.
+    rights: Vec<Right>,
 }
 
 /// A file or exec rule. Exactly one of `match:` (a glob over names) and `path:`
@@ -870,6 +923,8 @@ pub struct Policy {
     unresolved_domains: Vec<String>,
     /// The `domain:` rules, and the addresses they point at right now.
     domains: DomainSet,
+    /// Landlock hierarchies, resolved. Empty means no containment was asked for.
+    allow_paths: Vec<AllowPath>,
     /// Identifies this exact policy source, so a stored approval granted under
     /// it stops applying the moment the rules change. Computed here because
     /// this is the only place the source text exists.
@@ -1084,6 +1139,21 @@ impl Policy {
             }
         }
 
+        // Resolved the same way `path:` rules are, so `~` means the agent's home
+        // in both and a relative path means the directory wardyn was launched
+        // in. An entry that cannot be resolved is kept with `path: None` rather
+        // than dropped: a containment allowlist missing an entry is how an agent
+        // fails to start with an error nobody traces back to the policy.
+        let allow_paths: Vec<AllowPath> = raw
+            .allow_paths
+            .into_iter()
+            .map(|a| AllowPath {
+                path: base.expand(&a.path),
+                raw: a.path,
+                rights: a.rights,
+            })
+            .collect();
+
         // The first resolution happens here, through the same path every later
         // one takes — so the load-time set and a refreshed set can never be
         // built differently.
@@ -1108,6 +1178,7 @@ impl Policy {
             unresolved_anchors,
             unresolved_domains,
             domains,
+            allow_paths,
         })
     }
 
@@ -1133,6 +1204,13 @@ impl Policy {
     /// empty result means the answer did not move, which is the common case.
     pub fn refresh_domains(&self, resolve: Resolver<'_>) -> DomainRefresh {
         self.domains.refresh(resolve)
+    }
+
+    /// The Landlock hierarchies this policy grants. Empty means the policy asked
+    /// for no containment, and wardyn must not invent one — an empty allowlist
+    /// denies everything, including the agent's own loader.
+    pub fn allow_paths(&self) -> &[AllowPath] {
+        &self.allow_paths
     }
 
     /// Whether this policy has anything to re-resolve at all. A policy with no
@@ -1710,6 +1788,45 @@ impl Policy {
         use std::fmt::Write as _;
         let mut s = String::new();
         let _ = writeln!(s, "policy: {}", self.summary());
+
+        // Containment first: it is the outer boundary, and every block key below
+        // only narrows what is left inside it. Reading them the other way round
+        // suggests the block rules are the whole story.
+        if !self.allow_paths.is_empty() {
+            let _ = writeln!(
+                s,
+                "\ncontained by Landlock — the agent reaches ONLY these, whatever the rules below \
+                 say:"
+            );
+            for a in &self.allow_paths {
+                let rights = a
+                    .rights
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+");
+                match &a.path {
+                    Some(p) => {
+                        let shown = p.display().to_string();
+                        let _ = writeln!(s, "  path  {shown:<29} {rights}");
+                    }
+                    None => {
+                        let _ = writeln!(
+                            s,
+                            "  path  {:<29} UNRESOLVED — wardyn will refuse to start",
+                            a.raw
+                        );
+                    }
+                }
+            }
+            let _ = writeln!(
+                s,
+                "\nnote: this is an ALLOWLIST — anything not listed is denied, including paths the\
+                 \n      agent needs but nobody thought of (its loader, /dev/null, its own \
+                 script).\n      A missing entry looks like a broken agent, not like a policy \
+                 gap. Landlock\n      is applied to the child before exec and cannot be undone."
+            );
+        }
 
         let _ = writeln!(s, "\nkernel-enforced under --enforce:");
         for (n, &mask) in &self.kern_names {
@@ -4168,5 +4285,96 @@ network:
             1,
             "still in the proto+port trie"
         );
+    }
+
+    // ── allow_paths: (Landlock containment) ─────────────────────────────────
+
+    #[test]
+    fn allow_paths_resolve_like_path_rules_do() {
+        let p = identity_loader()
+            .from_str(
+                r#"
+allow_paths:
+  - { path: "/usr",     rights: [read, exec] }
+  - { path: "~/work",   rights: [read, write] }
+  - { path: "sub",      rights: [read] }
+"#,
+            )
+            .expect("parses");
+        let got: Vec<String> = p
+            .allow_paths()
+            .iter()
+            .map(|a| a.path.as_ref().unwrap().display().to_string())
+            .collect();
+        // `~` is the agent's home and a bare name is relative to the launch
+        // directory — the same two bases `path:` rules use, so an operator does
+        // not have to hold two rules in their head.
+        assert_eq!(got, vec!["/usr", "/home/a/work", "/proj/sub"]);
+        assert_eq!(p.allow_paths()[0].rights, vec![Right::Read, Right::Exec]);
+    }
+
+    /// An entry that cannot be resolved is kept, not dropped. Dropping it would
+    /// confine the agent out of a hierarchy the policy grants, and the failure
+    /// would surface as the agent crashing rather than as a policy problem.
+    #[test]
+    fn an_unresolvable_allow_path_is_kept_and_marked() {
+        let p = Loader::offline()
+            .base(AnchorBase {
+                cwd: None,
+                home: None,
+            })
+            .from_str("allow_paths:\n  - { path: \"~/work\", rights: [read] }\n")
+            .expect("parses");
+        assert_eq!(p.allow_paths().len(), 1);
+        assert!(p.allow_paths()[0].path.is_none());
+        assert_eq!(p.allow_paths()[0].raw, "~/work");
+    }
+
+    /// No `allow_paths:` must mean no containment — never an empty allowlist,
+    /// which denies everything including the agent's own loader.
+    #[test]
+    fn a_policy_without_allow_paths_asks_for_no_containment() {
+        let p = policy();
+        assert!(p.allow_paths().is_empty());
+        assert!(!p.explain().contains("contained by Landlock"));
+    }
+
+    /// `--dry-run` has to show the boundary before the rules inside it, and say
+    /// out loud that an unlisted path is denied — the one thing about an
+    /// allowlist that bites people who have only written blocklists.
+    #[test]
+    fn dry_run_shows_containment_and_warns_that_it_is_an_allowlist() {
+        let p = identity_loader()
+            .from_str(
+                r#"
+allow_paths:
+  - { path: "/usr", rights: [read, exec] }
+files:
+  - { match: "**/.env", action: block }
+"#,
+            )
+            .expect("parses");
+        let text = p.explain();
+        assert!(text.contains("contained by Landlock"), "{text}");
+        assert!(text.contains("/usr"), "{text}");
+        assert!(text.contains("read+exec"), "{text}");
+        assert!(text.contains("ALLOWLIST"), "{text}");
+        // The boundary is listed before the keys it contains.
+        let boundary = text.find("contained by Landlock").unwrap();
+        let keys = text.find("kernel-enforced under --enforce").unwrap();
+        assert!(boundary < keys, "containment must be listed first");
+    }
+
+    /// An unknown right is a typo, and a typo in an allowlist silently narrows
+    /// or widens what the agent can reach. `deny_unknown_fields` covers the key;
+    /// the enum covers the value.
+    #[test]
+    fn an_unknown_right_is_refused_rather_than_ignored() {
+        assert!(Loader::offline()
+            .from_str("allow_paths:\n  - { path: \"/usr\", rights: [execute] }\n")
+            .is_err());
+        assert!(Loader::offline()
+            .from_str("allow_paths:\n  - { path: \"/usr\", right: [read] }\n")
+            .is_err());
     }
 }

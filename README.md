@@ -54,6 +54,7 @@ For the process subtree you launch (`wardyn run -- <cmd>`, followed across `fork
 |---|---|---|---|
 | **exec** — programs run | ✅ path + comm | ⛔ deny blocked binaries, by name **or identity** | `tracepoint/execve` + LSM `bprm_check_security` |
 | **file** — files opened | ✅ path + access | ⛔ deny secret reads (`.env`, `.ssh/*`), by name **or identity**, and per read/write | `tracepoint/openat` + LSM `file_open` |
+| **filesystem containment** | — | ⛔ the agent reaches only `allow_paths:`, nothing else | Landlock (no privilege needed) |
 | **file** — files created or deleted | ⛔ only when refused (no tracepoint) | ⛔ deny `rm`, `rmdir`, `mv` and file creation, by name **or identity** | LSM `inode_unlink` / `inode_rmdir` / `inode_rename` / `inode_create` / `inode_mkdir` |
 | **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs (TCP + UDP, IPv4/IPv6) | `tracepoint/connect` + `cgroup/connect4·6` + `sendmsg4·6` |
 
@@ -237,6 +238,35 @@ exec:                                    # glob against the executable path
   - { match: "**/nc",        action: block }   # netcat / reverse shells
   - { match: "**",           action: allow }
 ```
+
+### Containment: `allow_paths:`
+
+Everything above is a **blocklist** — name what is forbidden, and anything the
+policy forgot stays reachable. `allow_paths:` is the other shape, and it uses a
+different kernel mechanism (Landlock) to do it:
+
+```yaml
+allow_paths:
+  - { path: "/usr", rights: [read, exec] }
+  - { path: "/etc", rights: [read] }
+  - { path: ".",    rights: [read, write, exec] }   # the project
+```
+
+The agent reaches those hierarchies and **nothing else** — not `/home`, not
+another checkout, not a mounted drive. It is applied to the child before `exec`,
+inherited by every descendant, and cannot be undone; unlike the eBPF half it
+needs no privilege, so it holds even for a root agent.
+
+The two compose: containment removes everything outside, `files:`/`exec:` deny
+specific objects inside what remains, and egress stays eBPF's alone — Landlock
+can only express TCP by port, never by address.
+
+> **It is an allowlist, and that bites.** Anything unlisted is denied, including
+> what nobody thinks about: the agent's loader, `/dev/null`, the script it was
+> asked to run. A missing entry looks like a broken agent, not like a policy
+> gap. Start from [`policies/contained.yaml`](./policies/contained.yaml) and run
+> `wardyn --dry-run` first. If a granted path cannot be resolved, wardyn refuses
+> to start rather than confining the agent out of something it was promised.
 
 Ready-made presets live in [`policies/`](./policies).
 
