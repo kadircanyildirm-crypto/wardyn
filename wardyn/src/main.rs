@@ -1420,6 +1420,17 @@ async fn run() -> anyhow::Result<i32> {
         }
     }
     let mut audit = Audit::create(&opts.audit_path)?;
+    // The default `--audit` path is relative, so it usually lands in the very
+    // directory the agent is working in. The open descriptor is safe — appends
+    // follow the inode — but the finished log can be moved aside afterwards and
+    // replaced, which nobody reading it later could detect.
+    if let Some((uid, _)) = resolve_target_identity(&opts) {
+        if audit::Audit::directory_is_writable_by(&opts.audit_path, uid) {
+            notices.push(format!(
+                "the audit log's directory is writable by the agent (uid {uid}) — this run's                  records are safe, but the file can be swapped for another after wardyn exits.                  Point --audit somewhere only root can write if the log has to be evidence."
+            ));
+        }
+    }
 
     // Agent-facing denial receipt: only under --enforce (observe mode denies
     // nothing), created before spawn so the child can inherit its path in

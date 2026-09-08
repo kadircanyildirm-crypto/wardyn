@@ -201,6 +201,20 @@ Out of scope (known limitations, documented, not vulnerabilities):
   rather than asserting a denial that did not fire, and at exit the kernel's own
   denial counters are compared against everything the receipt claimed.
 
+- **The audit log must live somewhere only root can write.** Wardyn refuses to
+  open it through a symlink, refuses a file it does not own, and refuses one
+  writable by group or others — a security record a second party can redirect or
+  rewrite is not one. It creates the log `0600`, because the log names every
+  path the agent touched.
+
+  What it cannot fix is the *directory*. The default `--audit` path is relative,
+  so it usually lands in the project the agent is working in. Records written
+  during the run are safe (appends follow the open descriptor, so a rename
+  cannot redirect them), but the finished file can be moved aside and replaced
+  once wardyn exits, and nobody reading it later could tell. Startup says so
+  when it detects that. If the log has to be evidence, put it somewhere the
+  agent cannot write.
+
 - **Events can still be lost under load.** The ring buffer is finite; a burst that
   overruns it drops events, and a dropped event for a denied action means no feed
   row, no audit record and no receipt line. Wardyn counts drops in the kernel and
