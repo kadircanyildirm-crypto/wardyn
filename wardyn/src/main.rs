@@ -40,7 +40,7 @@ use wardyn_common::{
     action, fmode, kind, meta, stat, Event, InodeKey, PairKey, PortKey4, PortKey6, ProtoKey4,
     ProtoKey6, ProtoPortKey4, ProtoPortKey6, NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS,
 };
-use wardyn_policy::cli::{self, Mode, Opts, ParseOutcome};
+use wardyn_policy::cli::{self, Format, Mode, Opts, ParseOutcome};
 use wardyn_policy::identity::AnchorBase;
 use wardyn_policy::policy::{
     self, Action, DenialKey, Exceptions, LifecycleOp, Loader, Policy, Proto, Verdict,
@@ -1116,7 +1116,10 @@ async fn run() -> anyhow::Result<i32> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("wardyn must run as root — it loads eBPF programs (try: sudo wardyn ...)");
     }
-    let use_tui = !opts.plain && std::io::stdout().is_terminal();
+    // A TUI needs a terminal to draw on: asking for one over a pipe would
+    // render escape sequences into whatever is reading. `--format json` never
+    // gets one, whether or not stdout is a tty.
+    let use_tui = opts.format == Format::Tui && std::io::stdout().is_terminal();
     if !use_tui {
         env_logger::builder()
             .filter_level(log::LevelFilter::Info)
@@ -1542,7 +1545,7 @@ async fn run() -> anyhow::Result<i32> {
         for n in &notices {
             eprintln!("wardyn: {n}");
         }
-        run_plain(async_fd, &mut child, &mut ctx).await
+        run_stream(async_fd, &mut child, &mut ctx, opts.format).await
     };
 
     // Whatever happened above — clean exit, error, or the operator quitting —
@@ -1636,12 +1639,19 @@ fn report_kernel_stats(s: &StatSnapshot, enforce: bool, claimed: u64) {
     }
 }
 
-/// Plain line-printer used when stdout is not a terminal (pipes, CI, `--plain`).
-/// No interactivity, so no exceptions can be granted here.
-async fn run_plain(
+/// Non-interactive line printer, used when stdout is not a terminal or when a
+/// format was asked for. No keyboard, so no exceptions can be granted here.
+///
+/// `Plain` and `Json` share this loop rather than each having their own: the
+/// signal handling, the periodic `/proc` sweep, and the final post-exit drain
+/// are the parts that are easy to get subtly wrong, and a second copy of them
+/// would be a second place for an event to go missing. Only the rendering
+/// differs, which is the last thing that happens to a `Desc`.
+async fn run_stream(
     mut async_fd: AsyncFd<RingBuf<MapData>>,
     child: &mut Option<Child>,
     ctx: &mut RunCtx<'_>,
+    format: Format,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
     // `println!` panics on a closed pipe (`wardyn --plain | head`) and blocks on
@@ -1656,15 +1666,34 @@ async fn run_plain(
     }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut open = line(
-        &mut out,
-        format_args!(
-            "{:<7} {:<15} {:<8} {:<6} DETAIL",
-            "PID", "COMM", "EVENT", "ACT"
-        ),
-    );
-
     let enforce = ctx.enforce;
+
+    // The header. For the table it is a column legend; for the stream it is a
+    // record like any other, so a consumer that starts reading mid-pipe is not
+    // required to have seen it — everything it says is repeated per event
+    // except `wardyn`, which is there so a mixed log can be filtered.
+    let mut open = match format {
+        Format::Json => line(
+            &mut out,
+            format_args!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": audit::SCHEMA_VERSION,
+                    "wardyn": "event-stream",
+                    "ts": audit::now(),
+                    "enforcing": enforce,
+                })
+            ),
+        ),
+        _ => line(
+            &mut out,
+            format_args!(
+                "{:<7} {:<15} {:<8} {:<6} DETAIL",
+                "PID", "COMM", "EVENT", "ACT"
+            ),
+        ),
+    };
+
     let exceptions = Exceptions::default();
     let mut sweep = tokio::time::interval(std::time::Duration::from_secs(2));
     // One Ctrl-C future for the whole loop: recreating it every iteration drops
@@ -1693,10 +1722,7 @@ async fn run_plain(
                 let mut guard = guard?;
                 drain(guard.get_inner_mut(), ctx, &exceptions, |d| {
                     if open {
-                        open = line(&mut out, format_args!(
-                            "{:<7} {:<15} {:<8} {:<6} {}",
-                            d.pid, d.comm_display(), d.label, d.act(enforce), d.shown()
-                        ));
+                        open = emit(&mut out, format, enforce, &d);
                     }
                 });
                 guard.clear_ready();
@@ -1711,20 +1737,75 @@ async fn run_plain(
     // more so those final events are shown and audited, not dropped.
     drain(async_fd.get_mut(), ctx, &exceptions, |d| {
         if open {
-            open = line(
-                &mut out,
-                format_args!(
-                    "{:<7} {:<15} {:<8} {:<6} {}",
-                    d.pid,
-                    d.comm_display(),
-                    d.label,
-                    d.act(enforce),
-                    d.shown()
-                ),
-            );
+            open = emit(&mut out, format, enforce, &d);
         }
     });
     Ok(())
+}
+
+/// Render one event in the chosen format. Returns whether the reader is still
+/// there — a closed pipe (`wardyn --format json | head`) ends output rather
+/// than panicking.
+fn emit(out: &mut std::io::StdoutLock<'_>, format: Format, enforce: bool, d: &Desc) -> bool {
+    use std::io::Write as _;
+    let text = match format {
+        Format::Json => stream_json(enforce, d).to_string(),
+        _ => format!(
+            "{:<7} {:<15} {:<8} {:<6} {}",
+            d.pid,
+            d.comm_display(),
+            d.label,
+            d.act(enforce),
+            d.shown()
+        ),
+    };
+    match writeln!(out, "{text}") {
+        Ok(()) => out.flush().is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// One stream record.
+///
+/// The observation events (`allow` rows) are the reason this is not just the
+/// audit log on stdout: the log deliberately holds only violations, because it
+/// is a security record and an operator should not have to grep a million
+/// `ld.so.cache` opens to find the one denial. A stream has the opposite job —
+/// a SIEM wants the baseline too, and the consumer does the filtering.
+///
+/// `notice` rows are wardyn talking about itself (an LSM that failed to attach,
+/// an exception granted). They are marked rather than dropped, because a
+/// consumer reconstructing what the tool was capable of at a given moment needs
+/// them, and one that only wants agent behaviour can filter on the field.
+fn stream_json(enforce: bool, d: &Desc) -> serde_json::Value {
+    if d.notice {
+        return serde_json::json!({
+            "schema_version": audit::SCHEMA_VERSION,
+            "ts": audit::now(),
+            "event": "notice",
+            "detail": d.detail,
+        });
+    }
+    let mut v = audit::event_json(
+        &audit::now(),
+        d.pid,
+        &d.comm,
+        d.label,
+        &d.detail,
+        d.action,
+        &d.rule,
+        d.denied(enforce),
+        d.kernel,
+        d.matched_key().as_deref(),
+    );
+    // Two fields the audit log has no use for, because it only ever holds
+    // violations: whether this row would be enforced if it were a block, and
+    // whether an exception is already covering it.
+    if let Some(o) = v.as_object_mut() {
+        o.insert("enforceable".into(), d.enforceable.into());
+        o.insert("excepted".into(), d.excepted.into());
+    }
+    v
 }
 
 // ── shared event decoding / display ─────────────────────────────────────────
@@ -1749,6 +1830,19 @@ pub(crate) struct Desc {
     /// An operator/diagnostic message, not an observed action: never counted as
     /// a policy verdict.
     pub notice: bool,
+}
+
+impl Desc {
+    /// The kernel key this event was decided on, rendered the way every other
+    /// surface renders it (`name=.aws/credentials`, `ip=1.1.1.1:25`) — the same
+    /// string `--dry-run` prints and the TUI offers to except.
+    ///
+    /// `None` for a warn: nothing was denied, so no key fired. That is a
+    /// meaningful null rather than a missing field, and consumers should read it
+    /// as "this record is a flag, not a decision".
+    pub fn matched_key(&self) -> Option<String> {
+        self.denial_key.as_ref().map(|k| k.to_string())
+    }
 }
 
 /// Escape control bytes for terminal display. Paths and `comm` are entirely
@@ -1874,6 +1968,7 @@ pub(crate) fn drain(
                 &d.rule,
                 d.denied(enforce),
                 d.kernel,
+                d.matched_key().as_deref(),
             );
             // The receipt is the agent's view: only what the kernel really
             // denied belongs there — not warns, not unenforced `block~`.
@@ -2758,5 +2853,129 @@ mod tests {
         assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(0x0100)), 1);
         // 9 = killed by SIGKILL -> 128 + 9.
         assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
+    }
+
+    // ── the JSON event stream (docs/EVENT_SCHEMA.md) ────────────────────────
+
+    fn desc_for_test(action: Action, kernel: bool, key: Option<DenialKey>) -> Desc {
+        Desc {
+            pid: 42,
+            comm: "cat".into(),
+            kind: kind::OPEN,
+            label: "open",
+            detail: "/home/u/.env".into(),
+            action,
+            rule: "**/.env".into(),
+            enforceable: true,
+            denial_key: key,
+            excepted: false,
+            kernel,
+            notice: false,
+        }
+    }
+
+    /// Every field the schema documents, present and of the documented type.
+    /// This is the contract; a field disappearing here is a version bump.
+    #[test]
+    fn a_stream_record_carries_every_documented_field() {
+        let d = desc_for_test(
+            Action::Block,
+            true,
+            Some(DenialKey::FileName(".env".into())),
+        );
+        let v = stream_json(true, &d);
+
+        assert_eq!(v["schema_version"], audit::SCHEMA_VERSION);
+        assert!(v["ts"].is_string());
+        assert_eq!(v["pid"], 42);
+        assert_eq!(v["comm"], "cat");
+        assert_eq!(v["event"], "open");
+        assert_eq!(v["action"], "block");
+        assert_eq!(v["enforced"], true);
+        assert_eq!(v["source"], "kernel");
+        assert_eq!(v["detail"], "/home/u/.env");
+        assert_eq!(v["rule"], "**/.env");
+        assert_eq!(v["matched_key"], "name=.env");
+        assert_eq!(v["enforceable"], true);
+        assert_eq!(v["excepted"], false);
+    }
+
+    /// The schema's loudest instruction: count denials with `enforced`, not with
+    /// `action == "block"`. A consumer that got this wrong would over-report
+    /// denials by every warn and every unenforceable block, so the two fields
+    /// have to be demonstrably independent.
+    #[test]
+    fn action_and_enforced_are_not_the_same_field() {
+        // A warn is a flag; nothing was denied and no key fired.
+        let warn = stream_json(true, &desc_for_test(Action::Warn, false, None));
+        assert_eq!(warn["action"], "warn");
+        assert_eq!(warn["enforced"], false);
+        assert_eq!(warn["matched_key"], serde_json::Value::Null);
+
+        // A block under observe mode (enforce = false) is also not a denial.
+        let observing = stream_json(
+            false,
+            &desc_for_test(
+                Action::Block,
+                false,
+                Some(DenialKey::FileName(".env".into())),
+            ),
+        );
+        assert_eq!(observing["action"], "block");
+        assert_eq!(observing["enforced"], false);
+
+        // Only an enforced block is one.
+        let denied = stream_json(
+            true,
+            &desc_for_test(
+                Action::Block,
+                false,
+                Some(DenialKey::FileName(".env".into())),
+            ),
+        );
+        assert_eq!(denied["enforced"], true);
+    }
+
+    /// `source` distinguishes proof from prediction, and the stream must carry
+    /// that through — an audit that cannot tell them apart cannot be relied on.
+    #[test]
+    fn source_reports_whether_the_kernel_or_userspace_said_so() {
+        let k = stream_json(true, &desc_for_test(Action::Block, true, None));
+        let u = stream_json(true, &desc_for_test(Action::Block, false, None));
+        assert_eq!(k["source"], "kernel");
+        assert_eq!(u["source"], "observed");
+    }
+
+    /// A notice is wardyn talking about itself. It is marked, not dropped, and
+    /// it must not look like an agent action: no pid, no verdict, nothing a
+    /// consumer counting behaviour would pick up.
+    #[test]
+    fn a_notice_is_marked_and_carries_no_verdict() {
+        let mut d = desc_for_test(Action::Allow, false, None);
+        d.notice = true;
+        d.detail = "BPF LSM enforcement unavailable".into();
+        let v = stream_json(true, &d);
+
+        assert_eq!(v["event"], "notice");
+        assert_eq!(v["schema_version"], audit::SCHEMA_VERSION);
+        assert_eq!(v["detail"], "BPF LSM enforcement unavailable");
+        assert!(v["action"].is_null(), "a notice is not a verdict");
+        assert!(v["pid"].is_null(), "a notice is not an agent action");
+    }
+
+    /// One object per line is the whole format: a path containing a newline or
+    /// an escape sequence must not be able to forge a second record. The feed
+    /// already refuses to render control bytes; the stream has to be safe for a
+    /// different reason — `jq -c` reads lines.
+    #[test]
+    fn a_hostile_path_cannot_forge_a_second_stream_record() {
+        let mut d = desc_for_test(Action::Block, false, None);
+        d.detail = "/tmp/x\n{\"action\":\"allow\",\"enforced\":false}".into();
+        let text = stream_json(true, &d).to_string();
+
+        assert_eq!(text.lines().count(), 1, "one record is one line");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        // The newline survives as data inside the field, not as a separator.
+        assert!(parsed["detail"].as_str().unwrap().contains('\n'));
     }
 }
