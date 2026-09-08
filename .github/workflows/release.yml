@@ -162,8 +162,14 @@ jobs:
             echo "::error::no eBPF object was built into the ${TARGET} binary"
             exit 1
           fi
+          # -W, or readelf truncates section names to fit a column and the
+          # report says `cgroup/c` — which is unreadable for the one thing it
+          # is here to show. Not asserted against a count: every tracepoint
+          # program shares a single `tracepoint` section, so sections are not
+          # programs. `verifier_smoke` is the check that names them all, and it
+          # needs root, which a release runner does not have.
           echo "embedded eBPF programs (${TARGET}):"
-          readelf -S "$obj" | grep -oE '(lsm|cgroup|tracepoint)/[a-z0-9_]*' | sort -u | sed 's/^/  /'
+          readelf -SW "$obj" | grep -oE '(lsm|cgroup|tracepoint)/[a-z0-9_]+' | sort -u | sed 's/^/  /'
 
   publish:
     name: publish release
