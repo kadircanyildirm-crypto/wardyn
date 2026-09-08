@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-08
+
+The release where wardyn was pointed at itself.
+
+0.2.0 gave it containment and an honest feed. This one is the result of asking,
+for every claim the tool makes, *how would we know if that were false* — and then
+going to look. Four of the answers were "we wouldn't", and one of them had been
+sitting in the project's own audit report for months.
+
+### The four
+
+- **`run` could watch, and enforce against, an unrelated process.** Wardyn names
+  the agent to the kernel by tgid. When the handshake that learns it produced
+  nothing, wardyn fell back to its own pid — which inside a pid namespace names
+  somebody else. The feed then reported a stranger's syscalls as the agent's,
+  `--enforce` denied them, and the agent itself ran unwatched.
+- **`--as-user 0` ran the agent as root while printing "not root".**
+- **The audit log could be redirected by a symlinked parent directory**, and
+  wardyn reported the path it was asked for either way.
+- **A 39-byte rule name denied every longer file sharing its prefix** — a kernel
+  key broader than the rule that made it, which is the one thing this project
+  says it will not do.
+
+None of these were exotic. The first is reachable in any container whose seccomp
+profile restricts `personality()`; the third needs only a symlink the agent
+plants on an earlier run.
+
+### Two flags that did nothing
+
+`--overrides` and `--override-ttl` had been accepted since they were added. The
+store, its hardened file handling, the fingerprinting and the expiry were all
+written — and never called. They work now, and an approval is filed against a
+fingerprint of the policy it was granted under, so it does not outlive the rules
+it was an exception to.
+
+### The audit report
+
+`docs/AUDIT.md` listed 113 findings and one status marker, so it announced ten
+open critical issues when nearly all had been fixed. Every finding now carries a
+status checked against the code: **92 closed, 10 deliberately open, 10 open, 1
+rejected**. Findings that could not be re-verified are counted as open, not
+closed — treating unverified as fixed is the same error in a smaller font.
+
+Going through it is what turned up the 39-byte collision.
+
+### Upgrading from 0.2.0
+
+Policies keep working. Three behaviours changed:
+
+- **`run` refuses to start** when it cannot establish which pid identifies the
+  agent — inside a container without `--pid=host`, most likely. The error names
+  the ways out. Previously it started and watched the wrong process.
+- **`--as-user 0` is refused.** Use `--keep-root` if running the agent as root
+  is what you meant.
+- **A rule name of 39 bytes or more is no longer kernel-enforceable** (the cap
+  was 40). Such rules are reported by `--dry-run` and at startup, as
+  un-enforceable rules always have been. Rules get narrower, never wider.
+
 ### Added
 
 - **`--overrides` and `--override-ttl` now do something.** The approval store,
@@ -100,7 +158,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Reachable wherever a container seccomp profile restricts `personality()` to a
   fixed argument list, which is what the handshake rides on.
 
-### Fixed
 
 - **The policy's source was never reported, and the default is inside the
   agent's reach.** `--policy`, `./policy.yaml` and the embedded default fell
@@ -1035,6 +1092,7 @@ copying a *blocked binary* to a new name still runs it.
   network-only enforcement when BPF LSM is unavailable.
 - Ready-made policy presets (`policies/permissive.yaml`, `policies/strict.yaml`).
 
-[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.1.0
