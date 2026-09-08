@@ -26,8 +26,15 @@ version = 2
 unused-allowed-license = "allow"
 # Wardyn itself is AGPL-3.0; its dependencies remain permissive (that direction is
 # compatible). Both must be on the allow list so `cargo deny` passes.
+#
+# `GPL-2.0-only` is here for wardyn's OWN kernel-side crates (wardyn-ebpf and
+# wardyn-common), which are dual-licensed so the object they compile into can
+# honestly declare the GPLv2 the kernel requires of a BPF LSM program. It is not
+# an invitation for a GPLv2 dependency: nothing in the tree has one, and one
+# would be a deliberate decision rather than something this line waves through.
 allow = [
     "AGPL-3.0-or-later",
+    "GPL-2.0-only",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

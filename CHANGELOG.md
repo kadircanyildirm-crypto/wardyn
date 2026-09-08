@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The kernel-side crates are dual-licensed `GPL-2.0-only OR
+  AGPL-3.0-or-later`.** `wardyn-ebpf` and `wardyn-common` compile into the eBPF
+  object the kernel loads, and that object declares `GPL` in its ELF license
+  section — which it must, since BPF LSM programs are required to be
+  GPL-compatible and `bpf_probe_read_kernel` is a GPL-only helper.
+
+  `GPL` means GPLv2 to the kernel. AGPL-3.0 is not on its
+  `license_is_gpl_compatible()` list and would be rejected if declared honestly,
+  so an AGPL-only crate was shipping an object under terms its source did not
+  grant. The GPL-2.0 arm makes the declaration true and the AGPL arm keeps the
+  crates usable exactly as before — nobody loses a right, and the ambiguity is
+  gone.
+
+  Userspace (`wardyn`, `wardyn-policy`) is unchanged: AGPL-3.0-or-later.
+
 ## [0.2.0] — 2026-09-08
 
 Wardyn gained the shape it was missing, and lost three ways of being wrong about
