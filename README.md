@@ -57,6 +57,7 @@ For the process subtree you launch (`wardyn run -- <cmd>`, followed across `fork
 | **filesystem containment** | — | ⛔ the agent reaches only `allow_paths:`, nothing else | Landlock (no privilege needed) |
 | **file** — files created or deleted | ⛔ only when refused (no tracepoint) | ⛔ deny `rm`, `rmdir`, `mv` and file creation, by name **or identity** | LSM `inode_unlink` / `inode_rmdir` / `inode_rename` / `inode_create` / `inode_mkdir` |
 | **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs (TCP + UDP, IPv4/IPv6) | `tracepoint/connect` + `cgroup/connect4·6` + `sendmsg4·6` |
+| **TCP containment** | — | ⛔ the agent reaches only `allow_ports:`, in or out | Landlock ABI 4 (no privilege needed) |
 
 **Rules match names or identities.** A `match:` rule is a glob over the path —
 it covers files that do not exist yet, and it comes off with a single `mv`. A
@@ -257,9 +258,36 @@ another checkout, not a mounted drive. It is applied to the child before `exec`,
 inherited by every descendant, and cannot be undone; unlike the eBPF half it
 needs no privilege, so it holds even for a root agent.
 
-The two compose: containment removes everything outside, `files:`/`exec:` deny
-specific objects inside what remains, and egress stays eBPF's alone — Landlock
-can only express TCP by port, never by address.
+The two compose: containment removes everything outside, and `files:`/`exec:`
+deny specific objects inside what remains.
+
+### Containment: `allow_ports:`
+
+Egress has the same two shapes. `network:` is the blocklist — CIDRs, ports and
+protocols, decided by eBPF, which is the only half that can see an *address*.
+`allow_ports:` is the boundary:
+
+```yaml
+allow_ports: [443, 53]
+```
+
+The agent may connect to, or bind, exactly those TCP ports. Landlock again: no
+privilege needed, inherited by every descendant, and impossible to undo.
+
+**By port only** — Landlock has no notion of an address, which is precisely why
+this sits beside the eBPF hooks rather than replacing them. `network:` still
+decides *which hosts*, inside the ports that remain.
+
+Two things to know:
+
+- `allow_ports: []` means **no TCP at all**. Leaving the key out means the policy
+  said nothing, and only `network:` applies. They are different statements.
+- Both directions are confined. Restricting only outbound would leave the agent
+  free to listen and be connected to instead — the same egress, drawn the other
+  way.
+
+It needs Landlock ABI 4 (Linux 6.7+). On an older kernel wardyn refuses to start
+rather than run an agent the policy believes is confined to ports it is not.
 
 <p align="center"><img src="docs/wardyn-contained.gif" width="820"
   alt="An agent confined to one project directory: reads inside it succeed, everything outside is BLOCK"></p>

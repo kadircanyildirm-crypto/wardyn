@@ -68,6 +68,15 @@ network:
   - { cidr: "0.0.0.0/0", action: block }
   - { cidr: "::/0", action: block }
 
+# TCP containment, the second Landlock dimension. Commented out because it needs
+# Landlock ABI 4 (Linux 6.7+) and wardyn REFUSES TO START without it, rather
+# than pretending — so enabling it here would break this preset on every kernel
+# between 5.13 and 6.6. Uncomment if yours is new enough:
+#
+# allow_ports: [443, 53]   # https and DNS-over-TCP, nothing else, in or out
+#
+# It confines by port only; the `network:` rules above still decide which hosts.
+
 exec:
   - { match: "**/nc", action: block }
   - { match: "**/ncat", action: block }

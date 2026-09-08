@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["wardyn", "wardyn-common", "wardyn-ebpf", "wardyn-policy"]
+# `fuzz/` is deliberately not a member: libfuzzer-sys needs a nightly sanitizer
+# runtime and its own profile, and every ordinary `cargo build` would carry it.
+exclude = ["fuzz"]
 # wardyn-ebpf is built for the BPF target by wardyn/build.rs (aya-build), not by a
 # normal host `cargo build`, so keep it out of the default set.
 default-members = ["wardyn", "wardyn-common", "wardyn-policy"]
