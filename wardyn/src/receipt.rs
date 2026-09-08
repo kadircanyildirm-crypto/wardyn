@@ -44,6 +44,11 @@ pub struct Receipt {
     writer: BufWriter<File>,
     path: String,
     count: u64,
+    /// How many of `count` were Landlock's rather than the eBPF hooks'. Kept
+    /// apart because the end-of-run cross-check compares the receipt against
+    /// the kernel's own counters, and Landlock keeps none — counting a
+    /// containment denial there would report a working run as observe-only.
+    contained: u64,
 }
 
 impl Receipt {
@@ -78,6 +83,7 @@ impl Receipt {
             writer: BufWriter::new(file),
             path: path.display().to_string(),
             count: 0,
+            contained: 0,
         };
         receipt.write_line(&serde_json::json!({
             "wardyn": "denial-receipt",
@@ -97,6 +103,20 @@ impl Receipt {
     /// Denials written so far (the header doesn't count).
     pub fn count(&self) -> u64 {
         self.count
+    }
+
+    /// Denials Landlock containment made. They are real, and are in the
+    /// receipt; they simply have no kernel counter to be checked against.
+    pub fn contained(&self) -> u64 {
+        self.contained
+    }
+
+    /// Denials an eBPF counter could account for — everything except
+    /// containment. This is the number the end-of-run cross-check compares
+    /// against `STATS`, and comparing the raw `count()` there reported a
+    /// containment-only run as "enforcement did NOT fire".
+    pub fn kernel_backed(&self) -> u64 {
+        self.count - self.contained
     }
 
     /// Append one denied event. Call only for events the kernel actually denied
@@ -119,6 +139,11 @@ impl Receipt {
             "rule": rule,
         }))?;
         self.count += 1;
+        // Landlock's, not the hooks'. Split here rather than at the call site
+        // so the two counters can never disagree about the same record.
+        if rule.starts_with(crate::CONTAINMENT_RULE) {
+            self.contained += 1;
+        }
         Ok(())
     }
 
@@ -266,5 +291,39 @@ mod tests {
         );
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&victim).ok();
+    }
+
+    /// The receipt splits its records by a prefix the *verdict builder* writes.
+    /// Two places, one string — so this pins them together. If the prefix in
+    /// `main.rs` changes and this does not, a containment run goes back to
+    /// reporting itself as observe-only, silently.
+    #[test]
+    fn containment_records_are_counted_apart_from_kernel_denials() {
+        let path = temp("contained");
+        std::fs::remove_file(&path).ok();
+        let mut r = Receipt::create(&path, "agent", "1 rule", None).unwrap();
+        r.record(1, "cat", "open", "/etc/passwd", "**/passwd")
+            .unwrap();
+        r.record(
+            1,
+            "cat",
+            "open",
+            "/outside/x",
+            &format!("{}not listed", crate::CONTAINMENT_RULE),
+        )
+        .unwrap();
+
+        assert_eq!(
+            r.count(),
+            2,
+            "both are real denials and both are in the file"
+        );
+        assert_eq!(r.contained(), 1);
+        assert_eq!(
+            r.kernel_backed(),
+            1,
+            "only the eBPF one can appear in a kernel counter"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

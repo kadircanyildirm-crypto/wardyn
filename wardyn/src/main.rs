@@ -2187,7 +2187,10 @@ async fn run() -> anyhow::Result<i32> {
     report_kernel_stats(
         &snapshot,
         opts.enforce,
-        receipt.as_ref().map(|r| r.count()).unwrap_or(0),
+        // Only the records an eBPF counter could account for. A containment
+        // denial is Landlock's, and Landlock reports to nobody here.
+        receipt.as_ref().map(|r| r.kernel_backed()).unwrap_or(0),
+        receipt.as_ref().map(|r| r.contained()).unwrap_or(0),
     );
     result?;
     if we_stopped_it {
@@ -2200,7 +2203,7 @@ async fn run() -> anyhow::Result<i32> {
 /// Print the counters only the kernel could know. Silence here would mean a full
 /// ring buffer (lost audit records), a full watch set (unenforced children), or
 /// an enforcement path that never fired, all looking exactly like a clean run.
-fn report_kernel_stats(s: &StatSnapshot, enforce: bool, claimed: u64) {
+fn report_kernel_stats(s: &StatSnapshot, enforce: bool, claimed: u64, contained: u64) {
     if s.ring_drops > 0 {
         eprintln!(
             "wardyn: WARNING: {} event(s) were dropped by a full ring buffer — those actions have \
@@ -2240,9 +2243,23 @@ fn report_kernel_stats(s: &StatSnapshot, enforce: bool, claimed: u64) {
                 s.denied_identity
             );
         }
+        // Landlock's denials, which have no kernel counter to appear in. Said
+        // plainly, because their absence from the line above would otherwise
+        // read as enforcement that did not happen.
+        if contained > 0 {
+            eprintln!(
+                "wardyn: {contained} more denied by Landlock containment (`allow_paths:`), which \
+                 keeps no counter — a different LSM, enforced before wardyn's hooks are consulted."
+            );
+        }
         // The one cross-check that cannot be fooled by a wrong struct offset or
         // an LSM that failed to attach: if the receipt told the agent it was
         // denied N times and the kernel counted none, the receipt was fiction.
+        //
+        // `claimed` excludes containment for exactly that reason. A run whose
+        // denials were ALL Landlock's is a working run, and this used to call
+        // it observe-only — the containment demo recorded wardyn declaring its
+        // own success a failure.
         if claimed > 0 && s.denials() == 0 {
             eprintln!(
                 "wardyn: WARNING: {claimed} denial(s) were reported to the agent but the kernel \
@@ -2439,6 +2456,16 @@ fn stream_json(enforce: bool, d: &Desc) -> serde_json::Value {
 }
 
 // ── shared event decoding / display ─────────────────────────────────────────
+
+/// The prefix every containment verdict's `rule` carries.
+///
+/// It ties two places together that must not drift apart: the verdict built
+/// when `containment_denies` fires, and the receipt's count of how many of its
+/// records the *kernel counters* could possibly account for. Landlock is a
+/// different LSM and reports to nobody here, so a containment denial will never
+/// appear in `STATS` — and the honesty cross-check at the end of a run has to
+/// know that, or it declares a working containment run a failure.
+pub(crate) const CONTAINMENT_RULE: &str = "allow_paths: ";
 
 pub(crate) struct Desc {
     pub pid: u32,
@@ -2954,7 +2981,7 @@ pub(crate) fn describe(
                 if let Some(why) = policy.containment_denies(&d, requested) {
                     v = Verdict {
                         action: Action::Block,
-                        rule: format!("allow_paths: {why}"),
+                        rule: format!("{CONTAINMENT_RULE}{why}"),
                         enforceable: true,
                     };
                 }
