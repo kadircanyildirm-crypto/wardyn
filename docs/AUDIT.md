@@ -12,9 +12,9 @@
 
 | Durum | Sayı | Anlamı |
 |---|---:|---|
-| ✅ Kapatıldı | **97** | Gösterilebilir bir mekanizma var; her birinin Durum satırı onu adlandırıyor |
+| ✅ Kapatıldı | **98** | Gösterilebilir bir mekanizma var; her birinin Durum satırı onu adlandırıyor |
 | ⏸️ Bilerek açık | **10** | Kapsam dışı ya da belgelenmiş sınır (SECURITY.md / README Roadmap) |
-| 🔓 Açık | **5** | Hâlâ gerçek; aşağıda listeli |
+| 🔓 Açık | **4** | Hâlâ gerçek; aşağıda listeli |
 | ❌ Reddedildi | **1** | Adversaryal doğrulama bulguyu çürüttü |
 | | **113** | |
 
@@ -32,9 +32,8 @@ düzeltmeye çalıştığı hatanın ta kendisi olurdu.
 > kural adıyla aynı anahtara iniyordu, yani 40+ baytlık her dosya o kuralla
 > yanlış yere reddediliyordu.
 
-**Test ve tedarik zinciri (3)**
+**Test ve tedarik zinciri (2)**
 
-- `no-fuzzing` — ağaçta fuzz hedefi yok.
 - `cargo-publish-broken` / `crates-io-publish-structurally-broken` — yeniden
   doğrulanmadı; crates.io üzerinden hiç yayın denenmedi.
 - `readme-and-release-profile-untested` — yeniden doğrulanmadı.
@@ -1181,7 +1180,7 @@ So with a blocked rule whose basename is exactly 39 bytes, the kernel denies eve
 ### 🟡 ORTA — No fuzzing: `parse_event` performs an unaligned read of kernel-supplied bytes and is the only `unsafe` in userspace
 *`testing` · efor: M · id: `no-fuzzing`*
 
-> **Durum:** 🔓 **Açık** — no fuzz target in the tree.
+> **Durum:** ✅ **Kapatıldı** — `fuzz/fuzz_targets/policy_parse.rs`: politika ayrıştırıcısı, yani saldırganın gerçekten kontrol edebileceği tek girdi (varsayılan `./policy.yaml` ajanın yazabildiği dizinde). `just fuzz` yerelde av için; CI'da **tohumlu** 60 saniyelik bir koşu var — tohum sabit, çünkü tohumsuz bir koşu alakasız bir PR'ı rastgele kırar ve işi "tekrar çalıştır"a alıştırır. Laboratuvarda 1.537.628 koşu, çökme yok.
 
 - **Konum:** `wardyn/src/main.rs:774-779, 781-856, 975-983; wardyn/src/policy.rs:232-336`
 - **Sorun:** There is no `fuzz/` directory and no fuzz target. The obvious candidate is the ring-buffer decoder:

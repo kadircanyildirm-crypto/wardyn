@@ -1,0 +1,25 @@
+# Kept OUT of the workspace on purpose: `libfuzzer-sys` needs a nightly
+# sanitizer runtime and its own profile, and pulling it into the main workspace
+# would make every ordinary `cargo build` carry it.
+[package]
+name = "wardyn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wardyn-policy = { path = "../wardyn-policy" }
+
+[[bin]]
+name = "policy_parse"
+path = "fuzz_targets/policy_parse.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

@@ -36,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start** rather than run an agent the policy believes is confined to a set of
   ports it is not — the same reasoning `allow_paths:` already used.
 
+- **A fuzz target for the policy parser** (`just fuzz`), plus a seeded 60-second
+  run in CI. The parser is the one input an attacker may actually control: the
+  default policy path is `./policy.yaml`, which lands in the directory the
+  watched agent works in, so the next run parses attacker-chosen bytes as root.
+
+  The CI seed is fixed deliberately. An unseeded run explores different inputs
+  every time, so a newly-found crash would fail an unrelated PR at random and
+  the job would train people to re-run it. Fixed, it is a regression check over
+  a known slice — and it proves the target still compiles, which is what
+  actually rots when the policy API changes. Hunting is `just fuzz 600`, locally.
+
+  1,537,628 runs on the lab kernel, no crashes.
+
 ### Added
 
 - **A differential test between the kernel matcher and its userspace mirror.**

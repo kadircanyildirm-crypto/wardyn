@@ -112,3 +112,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: ShellCheck
         run: shellcheck scripts/*.sh tests/e2e/run.sh .devcontainer/*.sh
+
+  # A short, SEEDED fuzz run. The seed is fixed on purpose: an unseeded run
+  # explores different inputs every time, so a newly-found crash would fail an
+  # unrelated PR at random and the job would train people to re-run it. Fixed,
+  # it is a regression check over a known slice — and it also proves the fuzz
+  # target still compiles, which is what actually rots when the policy API
+  # changes. Hunt for new crashes with `just fuzz 600` locally.
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz the policy parser (seeded, 60s)
+        run: cargo fuzz run policy_parse -- -max_total_time=60 -max_len=4096 -seed=20260908

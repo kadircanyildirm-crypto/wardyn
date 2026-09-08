@@ -88,3 +88,23 @@ check-lsm:
      else \
         echo "BPF-LSM: NOT ACTIVE — file/exec assertions will skip (see docs/WSL2.md or scripts/enable-bpf-lsm.sh)"; \
      fi
+
+# Fuzz the policy parser. The one input an attacker may control: the default
+# policy path is `./policy.yaml`, which lands in the directory the watched agent
+# works in — so on the next run wardyn parses attacker-chosen bytes, as root.
+#
+# Needs `cargo install cargo-fuzz` and a nightly toolchain. `just fuzz 300`
+# for a five-minute run; the default is short enough to sit in a pre-push check.
+fuzz seconds="60":
+    cargo fuzz run policy_parse -- -max_total_time={{seconds}} -max_len=4096
+
+# Re-run every input that has ever crashed the fuzzer. Fast, and the thing that
+# actually belongs in CI — a corpus regression, not a fresh hunt.
+fuzz-regress:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -d fuzz/artifacts/policy_parse ] || [ -z "$(ls -A fuzz/artifacts/policy_parse 2>/dev/null)" ]; then
+        echo "no crash artifacts — nothing to regress"
+        exit 0
+    fi
+    cargo fuzz run policy_parse fuzz/artifacts/policy_parse/*
