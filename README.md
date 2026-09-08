@@ -91,12 +91,13 @@ its kernel already ships BTF, cgroup v2 and `CONFIG_BPF_LSM=y`, and one line in
 `.wslconfig` turns the LSM on, so the full tool (file and exec blocking included)
 runs and is testable there. See [`docs/WSL2.md`](./docs/WSL2.md).
 
-**Prebuilt binary** (x86_64, statically linked — no toolchain, no glibc floor;
-the eBPF object is compiled into it, so this one file is the whole tool):
+**Prebuilt binary** (x86_64 and arm64, statically linked — no toolchain, no
+glibc floor; the eBPF object is compiled into it, so this one file is the whole
+tool):
 
 ```bash
 # from https://github.com/kadircanyildirm-crypto/wardyn/releases
-tar xzf wardyn-*-x86_64-unknown-linux-musl.tar.gz && cd wardyn-*/
+tar xzf wardyn-*-$(uname -m)-unknown-linux-musl.tar.gz && cd wardyn-*/
 sha256sum -c ../wardyn-*.tar.gz.sha256        # verify what you downloaded
 ./wardyn --dry-run --policy policy.yaml       # what will this policy do? (no root)
 ```

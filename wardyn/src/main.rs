@@ -782,11 +782,38 @@ fn load_tracepoint(
 /// The kernel the LSM struct offsets in wardyn-ebpf were derived for.
 const OFFSETS_KERNEL: &str = "6.8";
 
-/// Whether the running kernel's major.minor matches the built-in LSM offset
-/// kernel (`OFFSETS_KERNEL`). Used only as the fallback trust signal when BTF
-/// offset resolution is unavailable: on a match the built-in 6.8 offsets are
-/// correct, so file/exec `BLOCK` can be predicted honestly.
+/// The architecture they were derived ON — `scripts/kernel-offsets.sh` was run
+/// against an x86_64 vmlinux, and nothing in the numbers records that.
+const OFFSETS_ARCH: &str = "x86_64";
+
+/// Whether the built-in LSM offsets can be trusted on the machine we are on.
+///
+/// Only consulted when BTF resolution fails, which is rare — wardyn needs BTF
+/// to attach the LSM programs at all — but it decides something specific: it is
+/// the signal that lets the feed *predict* a file/exec `BLOCK`. Get it wrong and
+/// wardyn claims denials the kernel may never make, which is the one thing this
+/// codebase refuses to do.
+///
+/// Both halves have to match.
+///
+/// **The kernel version**, because `struct file` is reorganised between
+/// releases — 6.13 moved `f_path` into an anonymous union, which is what the
+/// BTF walker had to learn to descend into.
+///
+/// **The architecture**, because these numbers came off one. Field offsets
+/// within these structs are not guaranteed to agree across arches on the same
+/// release: distro configs differ (lock debugging, `CONFIG_FSNOTIFY`, preempt
+/// model), and several members inside `struct file` and `struct dentry` are
+/// behind `#ifdef`. Assuming aarch64 lays out like x86_64 would be a guess, and
+/// a wrong guess reads the wrong words and silently permits.
+///
+/// So on any architecture but the one they were measured on, the built-ins are
+/// never trusted. The cost is nil in practice and the alternative is a number
+/// that looks authoritative and is not.
 fn kernel_matches_builtin_offsets() -> bool {
+    if std::env::consts::ARCH != OFFSETS_ARCH {
+        return false;
+    }
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     let mm = release
         .trim()
@@ -1399,10 +1426,21 @@ async fn run() -> anyhow::Result<i32> {
                          {OFFSETS_KERNEL} LSM offsets (running kernel matches)."
                     ));
                 } else {
+                    // Say WHICH half failed. "not 6.8" on an aarch64 6.8 box
+                    // would send the reader hunting for a version problem that
+                    // is not there.
+                    let mismatch = if std::env::consts::ARCH != OFFSETS_ARCH {
+                        format!(
+                            "the built-in offsets were measured on {OFFSETS_ARCH} and this is {}",
+                            std::env::consts::ARCH
+                        )
+                    } else {
+                        format!("the running kernel is not {OFFSETS_KERNEL}")
+                    };
                     notices.push(format!(
-                        "could not resolve LSM struct offsets from BTF ({why}) and the running \
-                         kernel is not {OFFSETS_KERNEL}; file/exec blocking may silently fail. \
-                         Such rows are shown as block~ until the kernel reports a denial itself."
+                        "could not resolve LSM struct offsets from BTF ({why}) and {mismatch}; \
+                         file/exec blocking may silently fail. Such rows are shown as block~ \
+                         until the kernel reports a denial itself."
                     ));
                 }
             }
@@ -2977,5 +3015,33 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         // The newline survives as data inside the field, not as a separator.
         assert!(parsed["detail"].as_str().unwrap().contains('\n'));
+    }
+
+    /// The built-in LSM offsets were measured on one kernel *and* one
+    /// architecture, and both have to hold before the feed is allowed to
+    /// predict a `BLOCK` from them.
+    ///
+    /// The architecture half has no runtime failure to point at yet — there is
+    /// no aarch64 build to have got it wrong on — which is exactly why it is
+    /// pinned here: the check exists so that shipping one cannot quietly make
+    /// x86_64's numbers authoritative somewhere they were never measured.
+    #[test]
+    fn builtin_offsets_are_trusted_only_on_the_arch_they_were_measured_on() {
+        let trusted = kernel_matches_builtin_offsets();
+        if std::env::consts::ARCH != OFFSETS_ARCH {
+            assert!(
+                !trusted,
+                "built-in {OFFSETS_ARCH} offsets were trusted on {} — the feed would predict \
+                 denials from numbers nobody measured here",
+                std::env::consts::ARCH
+            );
+        } else {
+            // On the arch they came from, the version is what decides, and this
+            // machine is whatever CI happens to run. Assert the shape of the
+            // answer rather than the answer.
+            let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+            let on_that_kernel = release.trim().starts_with(&format!("{OFFSETS_KERNEL}."));
+            assert_eq!(trusted, on_that_kernel);
+        }
     }
 }

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **arm64 builds.** Releases now ship `aarch64-unknown-linux-musl` beside
+  x86_64. Each is built **and started** on its own architecture — GitHub's arm64
+  runners are free for public repositories — because the release job verifies
+  its artifact by running `--dry-run` against every shipped policy, and a
+  cross-built binary could not be started on the builder. That would have
+  reduced "we ran it" to "it linked".
+
 - **`--format json`: a structured event stream, and a schema to hold it to.**
   One JSON object per line on stdout — **every** event, allow rows included,
   because a SIEM wants the baseline and the audit log deliberately holds only
@@ -48,6 +55,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `--plain` still means what it did. `--format` wins where both are given, since
   `--plain --format json` is a request for machine output and not an ambiguity.
+
+### Fixed
+
+- **The built-in LSM offsets were trusted on any architecture.** When BTF
+  resolution fails, wardyn falls back to struct offsets measured with `pahole`
+  on kernel 6.8 — and the check guarding that fallback compared only the kernel
+  *version*. On an aarch64 machine running 6.8 it would have trusted numbers
+  measured on x86_64, and predicted `BLOCK` for rows the kernel might never
+  deny. Field offsets are not guaranteed to agree across architectures on one
+  release: distro configs differ, and members of `struct file` and
+  `struct dentry` sit behind `#ifdef`.
+
+  Harmless until now only because there was no arm64 build to be wrong on —
+  which is exactly why it is fixed in the same change that adds one. The
+  fallback is now refused on any architecture but the one the numbers came from,
+  and the startup notice says which half failed rather than reporting a version
+  problem that is not there.
 
 ### Changed
 
