@@ -2579,7 +2579,23 @@ pub(crate) fn describe(
             } else {
                 policy.eval_file(&d)
             };
-            let (v, key, ex) = reconcile(base, enforce, kd, exc);
+            let (mut v, key, ex) = reconcile(base, enforce, kd, exc);
+            // Containment is a second, independent boundary, and Landlock does
+            // not report to us — so without this the feed says `ok` for an open
+            // the agent was just refused. It runs after `reconcile` because it
+            // can only ever turn an allow into a denial: an `allow_paths:`
+            // hierarchy grants reachability, never permission that a `files:`
+            // block rule took away.
+            if !ex && v.action != Action::Block {
+                let requested = if is_exec { policy::EXEC_ONLY } else { ev.fmode };
+                if let Some(why) = policy.containment_denies(&d, requested) {
+                    v = Verdict {
+                        action: Action::Block,
+                        rule: format!("allow_paths: {why}"),
+                        enforceable: true,
+                    };
+                }
+            }
             (label, d, v, key, ex)
         }
         kind::CONNECT => {

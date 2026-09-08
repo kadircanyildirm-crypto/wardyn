@@ -931,6 +931,11 @@ pub struct Policy {
     fingerprint: String,
 }
 
+/// What [`Policy::containment_denies`] is passed for an **exec**, which carries
+/// no `f_mode`. Distinct from any real `FMODE_*` combination so the check can
+/// tell "this needs the exec right" from "this is a read".
+pub const EXEC_ONLY: u32 = 1 << 30;
+
 /// The default policy, embedded so `wardyn` runs out of the box with no file.
 const DEFAULT_POLICY: &str = include_str!("../../policy.yaml");
 
@@ -1211,6 +1216,70 @@ impl Policy {
     /// denies everything, including the agent's own loader.
     pub fn allow_paths(&self) -> &[AllowPath] {
         &self.allow_paths
+    }
+
+    /// Would Landlock refuse this open/exec, given the containment boundary?
+    ///
+    /// Returns the reason, or `None` when the boundary permits it — or when
+    /// there is no boundary, or when the observed path is not something this can
+    /// judge.
+    ///
+    /// ## Why this is a prediction, and a weaker one than the rest
+    ///
+    /// Every other mirror in here can be corrected: the eBPF hooks report their
+    /// own denials, so a wrong guess is overwritten by the kernel's own event.
+    /// Landlock reports nothing to wardyn — it is a different LSM, and its
+    /// refusal is invisible to our hooks. Without this the feed showed `ok` for
+    /// an open the agent had just been refused, which is the exact failure the
+    /// whole mirror exists to prevent.
+    ///
+    /// So it predicts, and it is conservative about it: a **relative** path is
+    /// not judged at all, because resolving it here would mean guessing the
+    /// agent's working directory, and a symlink is judged on the name the
+    /// syscall passed rather than the object Landlock resolved. Both can be
+    /// wrong in the permissive direction, never the alarming one — this reports
+    /// a denial only when the observed path is plainly outside every granted
+    /// hierarchy.
+    pub fn containment_denies(&self, path: &str, requested: u32) -> Option<String> {
+        if self.allow_paths.is_empty() || !path.starts_with('/') {
+            return None;
+        }
+        let p = Path::new(path);
+        let mut best: Option<&AllowPath> = None;
+        for a in &self.allow_paths {
+            let Some(root) = a.path.as_ref() else {
+                continue;
+            };
+            if p.starts_with(root) {
+                // The most specific hierarchy wins, matching Landlock: a nested
+                // grant overrides the one it sits inside.
+                let deeper = best
+                    .and_then(|b| b.path.as_ref())
+                    .is_none_or(|b| root.components().count() > b.components().count());
+                if deeper {
+                    best = Some(a);
+                }
+            }
+        }
+        let Some(a) = best else {
+            return Some("outside every allow_paths hierarchy".to_string());
+        };
+        // Inside a hierarchy, but perhaps without the right this asked for.
+        // `requested` is the access the open wanted; an exec passes `EXEC_ONLY`.
+        let need_write = requested & fmode::WRITE != 0;
+        let need_read = requested & fmode::READ != 0;
+        let need_exec = requested == EXEC_ONLY;
+        let has = |r: Right| a.rights.contains(&r);
+        if need_exec && !has(Right::Exec) {
+            return Some(format!("`{}` is granted without `exec`", a.raw));
+        }
+        if need_write && !has(Right::Write) {
+            return Some(format!("`{}` is granted without `write`", a.raw));
+        }
+        if need_read && !need_exec && !has(Right::Read) {
+            return Some(format!("`{}` is granted without `read`", a.raw));
+        }
+        None
     }
 
     /// Whether this policy has anything to re-resolve at all. A policy with no
@@ -4376,5 +4445,90 @@ files:
         assert!(Loader::offline()
             .from_str("allow_paths:\n  - { path: \"/usr\", right: [read] }\n")
             .is_err());
+    }
+
+    // ── the feed has to know about the containment boundary ─────────────────
+
+    fn contained() -> Policy {
+        Loader::offline()
+            .base(AnchorBase {
+                cwd: Some(PathBuf::from("/proj")),
+                home: Some(PathBuf::from("/home/a")),
+            })
+            .from_str(
+                r#"
+allow_paths:
+  - { path: "/usr",        rights: [read, exec] }
+  - { path: "/etc",        rights: [read] }
+  - { path: "/proj",       rights: [read, write] }
+  - { path: "/proj/bin",   rights: [read, write, exec] }
+files:
+  - { match: "**", action: allow }
+"#,
+            )
+            .expect("parses")
+    }
+
+    /// The bug this exists to fix: Landlock reports nothing to wardyn, so
+    /// without an explicit check the feed printed `ok` for an open the agent had
+    /// just been refused — the exact feed/reality disagreement the mirror is for.
+    #[test]
+    fn a_path_outside_every_hierarchy_is_reported_as_denied() {
+        let p = contained();
+        assert_eq!(
+            p.containment_denies("/home/a/.ssh/id_ed25519", fmode::READ)
+                .as_deref(),
+            Some("outside every allow_paths hierarchy")
+        );
+        assert!(p
+            .containment_denies("/proj/src/main.rs", fmode::READ)
+            .is_none());
+    }
+
+    /// Inside a hierarchy but without the right it asked for. The message names
+    /// the grant, because "denied" without saying which line to edit sends the
+    /// operator hunting.
+    #[test]
+    fn a_missing_right_inside_a_hierarchy_names_the_grant() {
+        let p = contained();
+        let why = p
+            .containment_denies("/etc/wardyn-probe", fmode::WRITE)
+            .unwrap();
+        assert!(why.contains("/etc"), "{why}");
+        assert!(why.contains("write"), "{why}");
+        // Reading it is granted, so nothing is reported.
+        assert!(p.containment_denies("/etc/hostname", fmode::READ).is_none());
+    }
+
+    /// The most specific hierarchy decides, matching Landlock: a nested grant
+    /// overrides the one it sits inside, in both directions.
+    #[test]
+    fn the_deepest_matching_hierarchy_decides() {
+        let p = contained();
+        // /proj has no `exec`, /proj/bin does.
+        assert!(p.containment_denies("/proj/bin/tool", EXEC_ONLY).is_none());
+        let why = p.containment_denies("/proj/tool", EXEC_ONLY).unwrap();
+        assert!(why.contains("exec"), "{why}");
+    }
+
+    /// Conservative where it cannot know. A relative path would have to be
+    /// resolved against the agent's working directory, which this does not have
+    /// — guessing would mean reporting denials that never happened.
+    #[test]
+    fn a_relative_path_is_not_judged() {
+        let p = contained();
+        assert!(p
+            .containment_denies("../../etc/shadow", fmode::READ)
+            .is_none());
+        assert!(p.containment_denies("secret.txt", fmode::READ).is_none());
+    }
+
+    /// A policy with no `allow_paths:` has no boundary, and must not invent one.
+    #[test]
+    fn no_containment_means_nothing_is_reported() {
+        let p = policy();
+        assert!(p
+            .containment_denies("/anything/at/all", fmode::READ)
+            .is_none());
     }
 }
