@@ -1522,10 +1522,22 @@ async fn run() -> anyhow::Result<i32> {
     // directory the agent is working in. The open descriptor is safe — appends
     // follow the inode — but the finished log can be moved aside afterwards and
     // replaced, which nobody reading it later could detect.
+    if let Some(link) = first_symlinked_component(&opts.audit_path) {
+        notices.push(format!(
+            "the audit log path goes through a symlink ({}) — records are being written to {}, \
+             not to {}. O_NOFOLLOW refuses a symlinked log file, but not a symlinked directory \
+             above it, so check that this redirection is yours",
+            link.display(),
+            audit.path(),
+            opts.audit_path.display()
+        ));
+    }
     if let Some((uid, _)) = resolve_target_identity(&opts) {
         if audit::Audit::directory_is_writable_by(&opts.audit_path, uid) {
             notices.push(format!(
-                "the audit log's directory is writable by the agent (uid {uid}) — this run's                  records are safe, but the file can be swapped for another after wardyn exits.                  Point --audit somewhere only root can write if the log has to be evidence."
+                "the audit log's directory is writable by the agent (uid {uid}) — this run's \
+                 records are safe, but the file can be swapped for another after wardyn exits. \
+                 Point --audit somewhere only root can write if the log has to be evidence."
             ));
         }
     }
@@ -2874,6 +2886,43 @@ fn parse_format_offset(format: &str, field: &str) -> Option<u32> {
     None
 }
 
+/// The first component of `path` that is a symlink, if any.
+///
+/// `O_NOFOLLOW` refuses to follow the **final** component and nothing else, so a
+/// path wardyn opens as root can still be redirected by a symlinked parent that
+/// the agent planted on an earlier run:
+///
+/// ```text
+/// $ ln -s /elsewhere proj/logs          # the agent, previously
+/// $ wardyn --audit logs/audit.jsonl ...  # root writes /elsewhere/audit.jsonl
+/// ```
+///
+/// Wardyn reported `logged to logs/audit.jsonl` either way, which is the part
+/// that matters: the record went somewhere other than where the operator was
+/// told it went, and nothing said so.
+///
+/// This walks the requested path rather than comparing against a canonical
+/// form, because the two disagree for an innocent reason — a working directory
+/// reached through a symlink — and a warning that fires on those is a warning
+/// operators learn to ignore. Only components the caller actually asked for are
+/// examined, so `wardyn-audit.jsonl` in a symlinked cwd stays quiet.
+fn first_symlinked_component(path: &std::path::Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for part in path.components() {
+        prefix.push(part);
+        // A symlink as the FINAL component is `O_NOFOLLOW`'s job and is already
+        // refused; here we only care about what leads to it.
+        if prefix == path {
+            break;
+        }
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(m) if m.file_type().is_symlink() => return Some(prefix),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The inode the kernel gives the **initial** pid namespace.
 ///
 /// `PROC_PID_INIT_INO` in `include/linux/proc_ns.h` — a fixed value, not an
@@ -3762,5 +3811,38 @@ mod tests {
             None,
             "an empty home field is not a home"
         );
+    }
+
+    // ── a redirected security record ────────────────────────────────────────
+
+    /// `O_NOFOLLOW` refuses a symlinked log FILE and nothing above it, so an
+    /// agent that plants a symlinked parent on one run redirects root's writes
+    /// on the next — and wardyn used to report the path it was asked for either
+    /// way. The redirection is the operator's call; being told about it is not.
+    #[test]
+    fn a_symlinked_parent_directory_is_spotted() {
+        let dir = std::env::temp_dir().join(format!("wardyn-fsc-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("logs")).unwrap();
+
+        assert_eq!(
+            first_symlinked_component(&dir.join("logs").join("audit.jsonl")),
+            Some(dir.join("logs")),
+            "the planted parent went unnoticed"
+        );
+        assert_eq!(
+            first_symlinked_component(&dir.join("real").join("audit.jsonl")),
+            None,
+            "an ordinary path must stay quiet — a warning that cries wolf is ignored"
+        );
+
+        // A symlink as the FINAL component is `O_NOFOLLOW`'s job, and `Audit`
+        // already refuses it. Reporting it here too would double up on one
+        // event and blur which check did the refusing.
+        std::os::unix::fs::symlink(dir.join("real/x"), dir.join("direct.jsonl")).unwrap();
+        assert_eq!(first_symlinked_component(&dir.join("direct.jsonl")), None);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

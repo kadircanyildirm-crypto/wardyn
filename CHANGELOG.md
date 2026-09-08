@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The audit log could be redirected by a symlinked parent directory, and
+  wardyn reported the path it was asked for either way.** `O_NOFOLLOW` refuses a
+  symlinked log *file* — the hole fixed in the previous release — but not a
+  symlinked directory above it, so an agent that plants `logs -> /elsewhere` on
+  one run redirects root's writes on the next. Wardyn now reports where the
+  bytes actually went, read back from the descriptor, and says so when the two
+  differ. The redirection may well be the operator's; being told about it is not
+  optional for a security record.
+
+  A `--audit` path with no directory component — including the default — was
+  never exposed to this.
+
 - **`--as-user 0` ran the agent as root while reporting that it had not.**
   `$SUDO_UID=0` was rejected, but the explicit flag was not: the drop went
   through `setuid(0)` — a successful no-op — past the `--enforce` refusal that
