@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A working containment run reported itself as observe-only.** The end-of-run
+  cross-check compares the receipt against the kernel's own counters — the one
+  check that cannot be fooled by a wrong struct offset or an LSM that failed to
+  attach. Landlock keeps no such counter, so a run whose denials were *all*
+  containment ended with:
+
+  > `WARNING: 26 denial(s) were reported to the agent but the kernel counted none
+  > — enforcement did NOT fire. Treat this run as observe-only.`
+
+  Every word of which was wrong. Containment denials are now counted apart and
+  named for what they are, and the cross-check compares only what an eBPF
+  counter could ever account for.
+
+  Found by re-recording the demo GIF, where wardyn was declaring its own
+  containment success a failure — which is the reason the recording gets redone
+  when the feed changes rather than once.
+
 ### Added
 
 - **`allow_ports:` — TCP containment, via Landlock.** The second containment

@@ -834,6 +834,41 @@ LPOLICY
     denied) pass "landlock: renaming OUT of the allowlist is refused (REFER is handled)" ;;
     *)      fail "landlock: mv moved a file out of the allowlist — REFER is not handled" ;;
   esac
+
+  # The end-of-run cross-check compares the receipt against the kernel's own
+  # counters, and Landlock keeps none — so a containment run used to end with
+  # "enforcement did NOT fire. Treat this run as observe-only." It was in the
+  # recorded demo: wardyn declaring its own containment success a failure.
+  if grep -q 'enforcement did NOT fire' "$LW/err"; then
+    fail "landlock: a working containment run reported itself as observe-only"
+  else
+    pass "landlock: containment denials are not mistaken for enforcement that never fired"
+  fi
+  # This run is observe-only, so there is no receipt and nothing to count. The
+  # line must therefore be ABSENT — printing a containment tally with no receipt
+  # behind it would be inventing a number.
+  if grep -q 'denied by Landlock containment' "$LW/err"; then
+    fail "landlock: a containment tally was printed for a run that receipts nothing"
+  else
+    pass "landlock: no containment tally without a receipt to count"
+  fi
+
+  # ...and the positive case, on its own enforcing run: the tally appears, and
+  # the observe-only warning still does not.
+  "$WARDYN" --plain --enforce --policy "$LW/policy.yaml" --audit "$LW/audit2.jsonl" \
+    --denials "$LW/denials2.jsonl" run -- cat "$LW/outside.txt" \
+    >"$LW/out2" 2>"$LW/err2" || true
+  if grep -q 'denied by Landlock containment' "$LW/err2"; then
+    pass "landlock: containment denials are counted and named under --enforce"
+  else
+    fail "landlock: containment denials vanish from the summary: $(tail -c 200 "$LW/err2")"
+  fi
+  if grep -q 'enforcement did NOT fire' "$LW/err2"; then
+    fail "landlock: an enforcing containment run still reported itself observe-only"
+  else
+    pass "landlock: an enforcing containment run is not called observe-only"
+  fi
+
   rm -rf "$LW"
 else
   skip "landlock containment (landlock not in /sys/kernel/security/lsm)"
