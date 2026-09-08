@@ -153,5 +153,8 @@ Being first to say *"use both"* is more credible than claiming to replace either
   putting an HTTP listener inside a process that runs as root, which is a
   decision worth making deliberately rather than by reflex.
 
+Overhead numbers, which a supervisor in the path of every `open` owes its users,
+are in [`PERFORMANCE.md`](./PERFORMANCE.md).
+
 See [`docs/AUDIT.md`](./AUDIT.md) for the full findings this positioning is drawn
 from, and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for how enforcement works today.

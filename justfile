@@ -40,6 +40,11 @@ test-portable:
 verify-programs:
     bin="$(cargo test --locked --release --test verifier_smoke --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "verifier_smoke") | .executable')"; sudo "$bin" --nocapture
 
+# What does wardyn cost? Startup, and marginal per-event, on this kernel.
+# Needs root (loads eBPF) and a release build. See docs/PERFORMANCE.md.
+bench reps="5":
+    sudo bash scripts/bench.sh {{ reps }}
+
 # End-to-end enforcement test: load the real eBPF and assert blocks/allows.
 # Needs root + a release build (`just build`). BPF-LSM optional (file assertions
 # self-skip without it).
