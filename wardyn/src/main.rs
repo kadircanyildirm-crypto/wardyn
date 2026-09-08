@@ -1006,13 +1006,25 @@ fn apply_privilege_drop(
             }
             // No setuid binary the agent execs can regain privilege. Pass the
             // variadic args as c_ulong so the full 64-bit registers are well-defined.
-            libc::prctl(
+            //
+            // Checked, unlike the usual treatment of this call. It is the last
+            // of the three things the drop actually is — a non-root uid, no
+            // supplementary groups, and no route back — and the only one whose
+            // failure leaves the other two looking successful. Where
+            // `allow_paths:` is set the containment closure would refuse a few
+            // instructions later anyway (Landlock requires NO_NEW_PRIVS), but
+            // most policies do not set it, and silently weaker is the one
+            // outcome this codebase does not allow itself.
+            if libc::prctl(
                 libc::PR_SET_NO_NEW_PRIVS,
                 1 as libc::c_ulong,
                 0 as libc::c_ulong,
                 0 as libc::c_ulong,
                 0 as libc::c_ulong,
-            );
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }

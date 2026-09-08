@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed `PR_SET_NO_NEW_PRIVS` was silent.** The privilege drop is three
+  things — a non-root uid, cleared supplementary groups, and no route back — and
+  only the third could fail while the other two still looked successful, leaving
+  an agent that could regain root through a setuid exec. Its return value is now
+  checked like the other two, so the spawn fails loudly instead.
+
 - **`run` could watch — and enforce against — an unrelated process.** Wardyn
   identifies the agent to the kernel by tgid *as the kernel sees it*, learned
   through an in-kernel handshake. When that handshake produced nothing, wardyn

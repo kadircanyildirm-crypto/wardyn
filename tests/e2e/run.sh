@@ -146,6 +146,13 @@ cat >"$WS/agent.sh" <<'AGENT'
 #!/usr/bin/env bash
 set -u
 id -u >"$WS/uid.txt" 2>/dev/null || echo err >"$WS/uid.txt"
+# What the agent INHERITED, captured before it does anything else. A leaked
+# descriptor to a BPF map, a landlock ruleset, or wardyn's own audit log would
+# hand the watched process the means to edit its own supervision — `ls` opens
+# only its own directory fd, so anything else here came from wardyn.
+ls -l /proc/self/fd >"$WS/fds.txt" 2>/dev/null || true
+id -G >"$WS/groups.txt" 2>/dev/null || true
+grep NoNewPrivs /proc/self/status >"$WS/nnp.txt" 2>/dev/null || true
 # blocked public v4 — denied at connect(); no real connectivity needed
 timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null || true
 # allowed loopback
@@ -394,6 +401,46 @@ if [[ -n "${SUDO_UID:-}" && "${SUDO_UID}" != "0" ]]; then
   fi
 else
   skip "privilege drop (no usable \$SUDO_UID — run via sudo to test)"
+fi
+
+# 5b) the rest of the drop, and what the agent must NOT have been handed.
+#
+# The privilege drop is the control that keeps the watched process from
+# switching off its own warden, and it is three separate things: a uid that
+# isn't root, supplementary groups that were actually cleared, and NO_NEW_PRIVS
+# so no setuid binary hands root back. Checking only the uid would pass while
+# the agent still carried gid 0.
+GROUPS_SEEN="$(cat "$WS/groups.txt" 2>/dev/null || echo '?')"
+if [[ -n "${SUDO_UID:-}" && "${SUDO_UID}" != "0" ]]; then
+  if [[ " $GROUPS_SEEN " != *" 0 "* && "$GROUPS_SEEN" != "?" ]]; then
+    pass "supplementary groups cleared (agent groups: $GROUPS_SEEN — no gid 0)"
+  else
+    fail "agent kept root's groups ($GROUPS_SEEN) — setgroups(0) did not take"
+  fi
+  if grep -q 'NoNewPrivs:[[:space:]]*1' "$WS/nnp.txt" 2>/dev/null; then
+    pass "NO_NEW_PRIVS set — the agent cannot regain privilege through a setuid exec"
+  else
+    fail "NO_NEW_PRIVS not set: $(cat "$WS/nnp.txt" 2>/dev/null || echo missing)"
+  fi
+else
+  skip "supplementary groups and NO_NEW_PRIVS (no usable \$SUDO_UID)"
+fi
+
+# A descriptor survives the privilege drop — it was opened by root, and the
+# kernel checks permission at open, not at use. So a BPF map fd reaching the
+# agent would let it delete its own WATCHED entry and run unsupervised, with
+# every hook still attached and reporting nothing. The kernel sets O_CLOEXEC on
+# bpf and landlock fds and Rust sets it on every File, which is exactly the kind
+# of guarantee that holds until someone reaches for `libc::open` directly.
+if [[ -s "$WS/fds.txt" ]]; then
+  LEAKED="$(grep -aoE 'bpf-map|bpf-prog|bpf-link|landlock[^ ]*|anon_inode:[^ ]*|[^ ]*audit\.jsonl|[^ ]*denials\.jsonl' "$WS/fds.txt" | sort -u | tr '\n' ' ')"
+  if [[ -z "$LEAKED" ]]; then
+    pass "the agent inherited no descriptor that could disable its own supervision"
+  else
+    fail "wardyn leaked descriptors to the watched agent: $LEAKED"
+  fi
+else
+  skip "inherited descriptors (agent could not read /proc/self/fd)"
 fi
 
 # 6) file/exec blocking — only when BPF-LSM is active.
