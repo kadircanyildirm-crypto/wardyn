@@ -43,6 +43,7 @@ use wardyn_common::{
 };
 use wardyn_policy::cli::{self, Format, Mode, Opts, ParseOutcome};
 use wardyn_policy::identity::AnchorBase;
+use wardyn_policy::overrides;
 use wardyn_policy::policy::{
     self, Action, DenialKey, DomainAddr, DomainRefresh, Exceptions, LifecycleOp, Loader, Policy,
     Proto, Verdict,
@@ -831,6 +832,57 @@ impl KernelStats {
 
 /// Everything the event loops need to evaluate, record, and (from the TUI)
 /// grant exceptions — bundled so signatures stay sane.
+/// Approvals that outlive the run: the store, where it lives, and the policy
+/// they were granted against.
+///
+/// `--overrides` and `--override-ttl` have been accepted since the flags were
+/// added, and did nothing at all — the store, its file handling, the
+/// fingerprinting and the expiry were all written and simply never connected to
+/// a run. An operator who passed `--overrides /var/lib/wardyn/overrides.yaml`
+/// was told nothing and got nothing.
+///
+/// The fingerprint is what keeps this honest. An approval is an exception TO a
+/// set of rules; carrying it into a policy that has since changed would widen
+/// the new one silently. Approvals stored under a different policy are simply
+/// not in force — they stay in the file, so editing a policy back restores
+/// them, but they do not apply meanwhile.
+pub(crate) struct Approvals {
+    store: overrides::OverrideStore,
+    path: PathBuf,
+    fingerprint: String,
+    policy_path: Option<String>,
+    /// Seconds a newly stored approval lasts. `0` means the operator asked for
+    /// approvals to apply for this run only: stored ones are still loaded and
+    /// honoured, new ones are not written.
+    ttl: i64,
+}
+
+impl Approvals {
+    /// The keys in force for this policy, as the userspace mirror wants them.
+    fn exceptions(&self, now: i64) -> Exceptions {
+        self.store.exceptions_for(&self.fingerprint, now)
+    }
+
+    /// Persist a newly granted approval. Expired entries are dropped on the way
+    /// out, so the file shrinks instead of growing a tail of dead approvals
+    /// nobody can read at review time.
+    fn record(&mut self, key: DenialKey) -> anyhow::Result<()> {
+        if self.ttl == 0 {
+            return Ok(());
+        }
+        let now = overrides_file::now_unix();
+        self.store.grant(
+            key,
+            &self.fingerprint,
+            self.policy_path.clone(),
+            now,
+            self.ttl,
+        );
+        self.store.prune_expired(now);
+        overrides_file::save(&self.path, &self.store)
+    }
+}
+
 pub(crate) struct RunCtx<'a> {
     pub policy: &'a Policy,
     pub audit: &'a mut Audit,
@@ -851,6 +903,9 @@ pub(crate) struct RunCtx<'a> {
     /// observe tracepoint always fires before the enforcing hook, so a short
     /// window is enough.
     pending: VecDeque<(u32, u32, String)>,
+    /// Approvals that outlive the run. `None` when the store could not be used;
+    /// the run still grants exceptions, they just do not survive it.
+    pub approvals: Option<Approvals>,
 }
 
 impl RunCtx<'_> {
@@ -1859,6 +1914,89 @@ async fn run() -> anyhow::Result<i32> {
 
     // Kept alive for the whole run so the TUI can grant exceptions into them.
     let mut kernel_maps = KernelMaps::load(&mut ebpf, &policy)?;
+
+    // Approvals granted on an earlier run, applied to the kernel before the
+    // agent starts — otherwise the operator re-answers the same prompt every
+    // session, which is how an approval mechanism trains people to approve
+    // without reading.
+    //
+    // Loaded *after* the maps, because applying an approval means removing a
+    // key from them, and *before* the spawn, so there is no window in which the
+    // agent is denied something the operator already permitted.
+    let approvals = {
+        let path = opts
+            .overrides_path
+            .clone()
+            .unwrap_or_else(overrides_file::default_path);
+        let fingerprint = overrides::fingerprint(policy.source_text());
+        match overrides_file::load(&path) {
+            Ok(mut store) => {
+                let now = overrides_file::now_unix();
+                let mut applied = 0usize;
+                let mut failed: Vec<String> = Vec::new();
+                // Collected first: `apply_exception` borrows the maps mutably
+                // while the iterator borrows the store.
+                let keys: Vec<DenialKey> = store.active_keys(&fingerprint, now).cloned().collect();
+                for key in keys {
+                    match kernel_maps.apply_exception(&key) {
+                        Ok(()) => applied += 1,
+                        // A stored key the kernel will not take is not fatal —
+                        // the policy may simply no longer carry that rule, in
+                        // which case there is nothing to except. Say so rather
+                        // than counting it as applied.
+                        Err(e) => failed.push(format!("{key} ({e:#})")),
+                    }
+                }
+                if applied > 0 {
+                    notices.push(format!(
+                        "{applied} stored approval(s) from {} are in force for this policy — \
+                         edit or delete that file to revoke them",
+                        path.display()
+                    ));
+                }
+                if !failed.is_empty() {
+                    notices.push(format!(
+                        "{} stored approval(s) could not be applied and are NOT in force: {}",
+                        failed.len(),
+                        failed.join(", ")
+                    ));
+                }
+                let stale = store.prune_expired(now);
+                if stale > 0 {
+                    notices.push(format!(
+                        "{stale} expired approval(s) dropped from {}",
+                        path.display()
+                    ));
+                }
+                if opts.override_ttl_days == 0 {
+                    notices.push(
+                        "--override-ttl 0 — approvals granted this run apply until it ends and \
+                         are not written down"
+                            .into(),
+                    );
+                }
+                Some(Approvals {
+                    store,
+                    path,
+                    fingerprint,
+                    policy_path: policy.source().path().map(|p| p.display().to_string()),
+                    ttl: overrides::ttl_secs(opts.override_ttl_days),
+                })
+            }
+            // Refusing to start over an unreadable approvals file would be the
+            // wrong trade: it costs the operator a re-prompt, not a boundary.
+            // But it must never be silent — a run that quietly forgets what was
+            // approved looks exactly like one that never had it.
+            Err(e) => {
+                notices.push(format!(
+                    "stored approvals at {} could not be read ({e:#}) — none are in force, and \
+                     approvals granted this run will not survive it",
+                    path.display()
+                ));
+                None
+            }
+        }
+    };
     let stats = ebpf
         .take_map("STATS")
         .and_then(|m| PerCpuArray::try_from(m).ok())
@@ -1949,6 +2087,7 @@ async fn run() -> anyhow::Result<i32> {
         enforce_files: opts.enforce && lsm_active && offsets_trusted,
         watched: watched_map,
         pending: VecDeque::new(),
+        approvals,
     };
     let result = if use_tui {
         tui::run(async_fd, &mut child, opts.mode.label(), &mut ctx, notices).await
@@ -2105,7 +2244,13 @@ async fn run_stream(
         ),
     };
 
-    let exceptions = Exceptions::default();
+    // Seeded from the store, not empty: an approval the operator gave yesterday
+    // was already applied to the kernel at startup, and a mirror that did not
+    // know would report `BLOCK` for opens that now succeed.
+    let exceptions = match ctx.approvals.as_ref() {
+        Some(a) => a.exceptions(overrides_file::now_unix()),
+        None => Exceptions::default(),
+    };
     let mut sweep = tokio::time::interval(std::time::Duration::from_secs(2));
     // Only armed when the policy has names to re-resolve, so a cidr-only policy
     // pays nothing for the feature.

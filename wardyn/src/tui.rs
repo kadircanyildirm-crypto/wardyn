@@ -307,6 +307,17 @@ fn grant(app: &mut App, ctx: &mut RunCtx<'_>, exceptions: &mut Exceptions, key: 
             app.granted += 1;
             app.last_denial = None;
             app.push(exception_row(&key));
+            // Written down last, and only after the kernel took it: an approval
+            // recorded for a change that did not happen would be honoured on
+            // the next run without ever having worked on this one.
+            if let Some(a) = ctx.approvals.as_mut() {
+                if let Err(e) = a.record(key.clone()) {
+                    app.push(notice_row(&format!(
+                        "exception {key} applies to this run, but could not be stored ({e:#}) — \
+                         it will be asked again next time"
+                    )));
+                }
+            }
         }
         // A failure here is an internal error, not a policy verdict: it must not
         // inflate the warn counter the operator is reading.
@@ -378,7 +389,12 @@ pub async fn run(
     for n in &notices {
         app.push(notice_row(n));
     }
-    let mut exceptions = Exceptions::default();
+    // Seeded from the store for the same reason as the plain loop: those keys
+    // were already removed from the kernel maps at startup.
+    let mut exceptions = match ctx.approvals.as_ref() {
+        Some(a) => a.exceptions(crate::overrides_file::now_unix()),
+        None => Exceptions::default(),
+    };
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     // Prune WATCHED against /proc and refresh the kernel counters every ~2s
     // (20 × 100ms ticks).

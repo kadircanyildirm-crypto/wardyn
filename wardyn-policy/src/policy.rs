@@ -928,6 +928,11 @@ pub struct Policy {
     /// Which of the three sources this came from. Set by `Loader::load`;
     /// `from_str` leaves it `Embedded`, since there is no file behind it.
     source: PolicySource,
+    /// The text this was compiled from, kept so a stored approval can be
+    /// fingerprinted against the policy it was granted under. An approval is
+    /// only meaningful for the rules it was an exception TO; carrying it into a
+    /// policy that has since changed would silently widen the new one.
+    source_text: String,
     /// Identifies this exact policy source, so a stored approval granted under
     /// it stops applying the moment the rules change. Computed here because
     /// this is the only place the source text exists.
@@ -1228,6 +1233,7 @@ impl Policy {
             domains,
             allow_paths,
             source: PolicySource::Embedded,
+            source_text: text.to_string(),
         })
     }
 
@@ -1258,6 +1264,12 @@ impl Policy {
     /// Where this policy came from.
     pub fn source(&self) -> &PolicySource {
         &self.source
+    }
+
+    /// The text this policy was compiled from — the input a stored approval is
+    /// fingerprinted against.
+    pub fn source_text(&self) -> &str {
+        &self.source_text
     }
 
     /// The Landlock hierarchies this policy grants. Empty means the policy asked
@@ -1906,6 +1918,15 @@ impl Policy {
         use std::fmt::Write as _;
         let mut s = String::new();
         let _ = writeln!(s, "policy: {}", self.summary());
+        // Stored approvals are keyed by this. An operator editing the overrides
+        // file by hand has no other way to learn it, and an approval filed under
+        // the wrong fingerprint is simply ignored — silently, since being
+        // ignored is the safe direction and there is nothing to warn about.
+        let _ = writeln!(
+            s,
+            "fingerprint: {} (stored approvals are keyed by this; it changes with the policy text)",
+            crate::overrides::fingerprint(&self.source_text)
+        );
 
         // Containment first: it is the outer boundary, and every block key below
         // only narrows what is left inside it. Reading them the other way round
