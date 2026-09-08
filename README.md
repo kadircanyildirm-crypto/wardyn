@@ -32,10 +32,11 @@ $ sudo wardyn --enforce run -- claude "refactor the auth module"
   wardyn: 3 denial(s) receipted to /tmp/wardyn-denials-40217.jsonl (WARDYN_DENIALS in the agent's env)
 ```
 
-> ⚠️ **Status: early development.** M1–M3 done: observe + policy + **kernel-level
-> enforcement** for files, execs and network (TCP + UDP, IPv4 + IPv6). M4 (demo
-> GIF, devcontainer, packaging) in progress. Not production-ready — see
-> [Roadmap](#roadmap).
+> ⚠️ **Status: early development, v0.4.0.** Kernel-level enforcement for files,
+> execs and network (TCP + UDP, IPv4 + IPv6); identity (`dev, ino`) rules;
+> Landlock containment for both the filesystem and TCP ports; stored approvals;
+> a JSON event stream. Not production-ready, and maintained by one person — see
+> [Roadmap](#roadmap) and [GOVERNANCE.md](./GOVERNANCE.md).
 
 ## Why
 
@@ -84,6 +85,48 @@ denied action is a missing audit record, not a cosmetic glitch.
 launched, and only with `--enforce`. The rest of the system is never affected —
 `wardyn --enforce run -- agent` can block the agent from `8.8.8.8` while every other
 process on the host reaches it fine.
+
+## Does it hold?
+
+Four scenarios that try to **break** wardyn rather than demonstrate it. Same
+sixteen-line policy for all four, so nothing is stopped by a rule you cannot
+see. `just stress` runs them; the write-up is in
+[docs/stress/](docs/stress/README.md).
+
+| | what it tries | result |
+|---|---|---|
+| **1** | every known way around a secret-file rule — rename, hard link, move the parent directory, symlink, `../` | **8 attacks, 8 stopped** |
+| **2** | the agent attacks the *warden*: BPF maps, `/proc/kcore`, kill it, setuid, user namespace, rewrite the policy | **15 attempts, 14 refused** |
+| **3** | 450 processes and 40,000 opens | **secret still denied; ~13,000 events dropped, and reported** |
+| **4** | git, gcc, make, python3, 300 files — does ordinary work still happen? | **15 operations, none broken** |
+
+<p align="center"><img src="docs/stress/wardyn-stress-escape.gif" width="820"
+  alt="Eight bypass attempts against a secret file, all stopped; then the same attacks against name rules, where the hard link gets through"></p>
+
+<p align="center"><sub><b>1 · escape.</b> The second half is the <b>control</b>: the same
+attacks against name rules instead of <code>(dev, ino)</code>, where the hard link goes
+straight through. Without it, “8 blocked” says nothing about what did the blocking.</sub></p>
+
+<p align="center"><img src="docs/stress/wardyn-stress-selfdefence.gif" width="820"
+  alt="Fifteen attempts to disable wardyn from inside the watched process; fourteen refused"></p>
+
+<p align="center"><sub><b>2 · self-defence.</b> The one attempt that works — appending to a
+policy file — is the weakness wardyn <a href="SECURITY.md">already warns about</a>, and the
+next line shows the secret still denied: the running policy is in kernel maps, so a file
+edit reaches the <i>next</i> run.</sub></p>
+
+<p align="center"><img src="docs/stress/wardyn-stress-load.gif" width="820"
+  alt="450 processes and 40,000 opens; the secret stays denied while 13,000 events are dropped and reported"></p>
+
+<p align="center"><sub><b>3 · load.</b> Enforcement is decided inside the syscall;
+observation goes through a ring buffer. Only one of those can be outrun — and when it is,
+wardyn says so in numbers. A <i>silent</i> drop would be the real failure.</sub></p>
+
+<p align="center"><img src="docs/stress/wardyn-stress-realwork.gif" width="820"
+  alt="git, gcc, make and python3 running normally under the same enforcing policy"></p>
+
+<p align="center"><sub><b>4 · real work.</b> A sandbox that denies everything passes every
+attack test and gets switched off on the second day.</sub></p>
 
 ## Quickstart
 
