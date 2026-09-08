@@ -35,9 +35,50 @@ impl Mode {
     }
 }
 
+/// How the live feed is rendered.
+///
+/// Separate from *what* is recorded: the audit log and the denial receipt are
+/// written identically in all three, because they are the security record and
+/// must not depend on which screen the operator happened to be looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Format {
+    /// The full-screen ratatui feed, when stdout is a terminal. The only mode
+    /// that can grant an exception, because it is the only one with a keyboard.
+    #[default]
+    Tui,
+    /// A fixed-width table, one line per event. For pipes, CI, and `less`.
+    Plain,
+    /// One JSON object per line on stdout, for a log shipper or a SIEM.
+    ///
+    /// A separate mode rather than a flag on `Plain` because the two answer to
+    /// different readers: the table is laid out for a person and may be
+    /// reformatted whenever that reads better, while this is a documented
+    /// interface with a schema version and a compatibility promise. See
+    /// `docs/EVENT_SCHEMA.md`.
+    Json,
+}
+
+impl Format {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Format::Tui => "tui",
+            Format::Plain => "plain",
+            Format::Json => "json",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Opts {
+    /// `--plain` was passed. Kept alongside `format` because it means "not the
+    /// TUI" and nothing more: it is satisfied by `--format json` too, and a
+    /// build that collapsed the two would have to pick a winner for
+    /// `--plain --format json`, which is not a conflict a user should have to
+    /// think about.
     pub plain: bool,
+    /// The rendering actually chosen, after `--plain`, `--format` and whether
+    /// stdout is a terminal have all been taken into account.
+    pub format: Format,
     pub enforce: bool,
     /// Load and check the policy, print every honesty warning, and exit without
     /// touching the kernel. Needs neither root nor eBPF, so a policy can be
@@ -75,6 +116,7 @@ pub const USAGE: &str = "wardyn — a kernel-level warden for AI coding agents\n
      --enforce         deny blocked file reads / execs / egress (default: observe)\n  \
      --dry-run         load and check the policy, print its gaps, and exit (no root, no eBPF)\n  \
      --plain           force the plain line printer (no TUI)\n  \
+     --format <fmt>    tui | plain | json  (json = one object per line, see docs/EVENT_SCHEMA.md)\n  \
      --policy <path>   policy file (default: ./policy.yaml, else embedded)\n  \
      --audit <path>    JSONL audit log (default: ./wardyn-audit.jsonl)\n  \
      --denials <path>  agent-readable denial receipt, exported as WARDYN_DENIALS (--enforce only)\n  \
@@ -93,6 +135,7 @@ pub fn parse_args() -> Result<ParseOutcome> {
 pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutcome> {
     let mut it = args.into_iter().peekable();
     let mut plain = false;
+    let mut format: Option<Format> = None;
     let mut enforce = false;
     let mut dry_run = false;
     let mut policy_path = None;
@@ -124,6 +167,17 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
             Some("--plain") => {
                 plain = true;
                 it.next();
+            }
+            Some("--format") => {
+                it.next();
+                let raw = value(&mut it, "--format", "tui, plain, or json")?;
+                let s = raw.to_string_lossy();
+                format = Some(match s.as_ref() {
+                    "tui" => Format::Tui,
+                    "plain" => Format::Plain,
+                    "json" => Format::Json,
+                    other => bail!("--format takes `tui`, `plain`, or `json`, not `{other}`"),
+                });
             }
             Some("--enforce") => {
                 enforce = true;
@@ -218,6 +272,16 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
     };
 
     Ok(ParseOutcome::Run(Box::new(Opts {
+        // `--plain` is the older spelling of `--format plain` and still means
+        // "not the TUI". With both given, `--format` wins where it is more
+        // specific — `--plain --format json` is a request for machine output,
+        // and refusing it would be pedantry about a phrasing that is not
+        // actually ambiguous. Bare `--plain` still resolves to `Plain`.
+        format: match (format, plain) {
+            (Some(f), _) => f,
+            (None, true) => Format::Plain,
+            (None, false) => Format::Tui,
+        },
         plain,
         enforce,
         dry_run,

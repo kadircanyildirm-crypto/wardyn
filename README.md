@@ -239,6 +239,29 @@ exec:                                    # glob against the executable path
 
 Ready-made presets live in [`policies/`](./policies).
 
+## Piping it somewhere
+
+`--format json` writes one object per line on stdout — every event, allow rows
+included, so a log shipper or a SIEM gets the baseline and does its own
+filtering:
+
+```console
+$ wardyn --enforce --format json run -- npm install | jq -c 'select(.enforced)'
+{"schema_version":1,"ts":"…","pid":2140,"comm":"cat","event":"open",
+ "action":"block","enforced":true,"source":"observed","detail":"/app/.env",
+ "rule":"**/.env","matched_key":"name=.env","enforceable":true,"excepted":false}
+```
+
+Two fields do the work. **`enforced`** is what the kernel actually did — count
+denials with that, never with `action == "block"`, because a `warn` and an
+unenforceable `block~` are both blocks that denied nothing. **`matched_key`** is
+the kernel key the decision fired on, which is what to aggregate by: `rule` is
+policy text and several rules can share a key.
+
+The shape is a documented interface with a version on every record, not just a
+header — see [`docs/EVENT_SCHEMA.md`](./docs/EVENT_SCHEMA.md) for the
+compatibility rules and worked `jq` recipes.
+
 ## Telling the agent
 
 A kernel denial reaches the agent as a bare `EPERM` — indistinguishable from an

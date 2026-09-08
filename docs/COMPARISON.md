@@ -83,7 +83,7 @@ one that is modest and honest.
 
 | Tool | Category | Scope | Files | Egress | Root? | userns? | Agent feedback | Audit trail |
 |---|---|---|---|---|---|---|---|---|
-| **Wardyn** | Supervisor (observe + deny + receipt) | One launched subtree | LSM, by name **or** `(dev, ino)` identity; read/write + create/delete | cgroup CIDR, v4/v6, TCP+UDP, `port:` + `proto:` | needs root to load | not required | **yes** (`WARDYN_DENIALS`) | **yes** (JSONL) |
+| **Wardyn** | Supervisor (observe + deny + receipt) | One launched subtree | LSM, by name **or** `(dev, ino)` identity; read/write + create/delete | cgroup CIDR, v4/v6, TCP+UDP, `port:` + `proto:` | needs root to load | not required | **yes** (`WARDYN_DENIALS`) | **yes** (JSONL + versioned `--format json` stream) |
 | Claude Code sandbox | Isolator | The agent it ships with | bubblewrap FS isolation | allowlisting HTTP(S) proxy | no | typically yes | n/a | limited |
 | Codex CLI sandbox | Isolator | The agent it ships with | bubblewrap + Landlock | seccomp net restriction | no | typically yes | n/a | limited |
 | Linux **Landlock** | Isolator (kernel LSM) | Inherited across fork/exec | resolved-path hierarchy, ~15 rights: **read/write/exec, remove, make** | TCP bind/connect **by port only** (no CIDR, no UDP) | **no root** | not required | no | ABI≥7 audit (node-wide) |
@@ -144,8 +144,14 @@ Being first to say *"use both"* is more credible than claiming to replace either
   objects that do not exist when the policy loads. Landlock's resolved-path
   hierarchies have neither problem, which is one more reason for the hybrid
   above.
-- **Structured JSON event stream + metrics** so Wardyn plugs into the SIEM/alerting
-  layer the node-scoped tools already own.
+- **Metrics.** The structured JSON event stream landed (`--format json`, one
+  object per line, versioned per record — see
+  [`EVENT_SCHEMA.md`](./EVENT_SCHEMA.md)), so wardyn can be shipped into the
+  SIEM layer the node-scoped tools already own. What is still missing is a
+  `--metrics-addr` exposing Prometheus counters. Every counter is derivable from
+  the stream, so this is convenience rather than capability — and it would mean
+  putting an HTTP listener inside a process that runs as root, which is a
+  decision worth making deliberately rather than by reflex.
 
 See [`docs/AUDIT.md`](./AUDIT.md) for the full findings this positioning is drawn
 from, and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for how enforcement works today.

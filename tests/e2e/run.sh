@@ -617,6 +617,72 @@ else
   fail "--dry-run did not describe the policy's kernel keys"
 fi
 
+# 9b) The JSON event stream, against a real kernel. A separate short run rather
+#     than a flag on the main one, so the plain table keeps its coverage too.
+#     What matters here is not that JSON came out — a unit test can show that —
+#     but that the stream agrees with the kernel about what was denied.
+if [[ $LSM_ACTIVE -eq 1 ]] && command -v jq >/dev/null 2>&1; then
+  JSON_WS="$(mktemp -d)"
+  chmod 777 "$JSON_WS"
+  printf 'SECRET=nope\n' >"$JSON_WS/.env"
+  printf 'fine\n' >"$JSON_WS/ok.txt"
+  chmod 644 "$JSON_WS/.env" "$JSON_WS/ok.txt"
+  [[ -n "${SUDO_UID:-}" ]] && chown -R "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$JSON_WS"
+  cat >"$JSON_WS/agent.sh" <<'JAGENT'
+cat "$JW/.env"    >/dev/null 2>&1 || true
+cat "$JW/ok.txt"  >/dev/null 2>&1 || true
+JAGENT
+  JSON_OUT="$JSON_WS/stream.jsonl"
+  ( cd "$JSON_WS" && JW="$JSON_WS" "$WARDYN" --enforce --format json --policy "$POLICY" \
+      --audit "$JSON_WS/audit.jsonl" run -- bash "$JSON_WS/agent.sh" ) \
+      >"$JSON_OUT" 2>"$JSON_WS/stderr"
+
+  # Every line is one complete JSON object. A path containing a newline would
+  # break this, which is exactly why the format is one-object-per-line.
+  if [[ -s "$JSON_OUT" ]] && jq -e . "$JSON_OUT" >/dev/null 2>&1; then
+    pass "json: every line of the stream parses as one JSON object"
+  else
+    fail "json: the stream was empty or did not parse as JSONL"
+  fi
+  # The header, and a schema version on every record including it.
+  if jq -e 'select(.wardyn == "event-stream")' "$JSON_OUT" >/dev/null 2>&1; then
+    pass "json: the stream opens with an event-stream header"
+  else
+    fail "json: no event-stream header"
+  fi
+  UNVERSIONED="$(jq -c 'select(.schema_version != 1)' "$JSON_OUT" | wc -l)"
+  if [[ "$UNVERSIONED" -eq 0 ]]; then
+    pass "json: every record carries schema_version (not just the header)"
+  else
+    fail "json: $UNVERSIONED record(s) had no schema_version — a consumer reading mid-pipe is blind"
+  fi
+  # The claim the schema doc leads with: count denials with `enforced`, and the
+  # count has to match what the kernel itself reported at exit.
+  STREAM_DENIED="$(jq -c 'select(.enforced == true)' "$JSON_OUT" | wc -l)"
+  KERNEL_FILE="$(sed -n 's/.*kernel denials — \([0-9]*\) file.*/\1/p' "$JSON_WS/stderr" | head -1)"
+  if [[ "$STREAM_DENIED" -ge 1 && "$STREAM_DENIED" == "${KERNEL_FILE:-x}" ]]; then
+    pass "json: enforced==true count ($STREAM_DENIED) matches the kernel's own denial counter"
+  else
+    fail "json: stream said $STREAM_DENIED denial(s), the kernel counted ${KERNEL_FILE:-none}"
+  fi
+  # matched_key is the field the doc says to aggregate by, and it must name the
+  # key that fired — not the policy text, which is in `rule`.
+  if jq -e 'select(.enforced == true and .matched_key == "name=.env")' "$JSON_OUT" >/dev/null 2>&1; then
+    pass "json: matched_key names the kernel key the denial fired on"
+  else
+    fail "json: no denial carried matched_key=name=.env"
+  fi
+  # The allow rows are the reason this is not just the audit log on stdout.
+  if jq -e 'select(.action == "allow" and .event == "open")' "$JSON_OUT" >/dev/null 2>&1; then
+    pass "json: observations are streamed too, not only violations"
+  else
+    fail "json: the stream carried no allow rows — it is just the audit log"
+  fi
+  rm -rf "$JSON_WS"
+else
+  skip "json event stream (needs BPF-LSM and jq)"
+fi
+
 # 10) CONTROL: the same agent, the same fixtures, the same wardyn — but a policy
 #     with the `path:` rules stripped out. Every bypass the identity rules closed
 #     must reopen. Without this, an identity assertion that passed because some

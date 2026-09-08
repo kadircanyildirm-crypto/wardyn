@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--format json`: a structured event stream, and a schema to hold it to.**
+  One JSON object per line on stdout — **every** event, allow rows included,
+  because a SIEM wants the baseline and the audit log deliberately holds only
+  violations. Documented in [`docs/EVENT_SCHEMA.md`](docs/EVENT_SCHEMA.md) as a
+  versioned interface with explicit compatibility rules.
+
+  ```console
+  $ wardyn --enforce --format json run -- npm install | jq -c 'select(.enforced)'
+  ```
+
+  `schema_version` rides on **every record**, not on a header. An audit log is
+  appended to across runs and read with `grep`, `tail -f` and `jq -c`, so a
+  consumer routinely holds one line with no idea what came before it; a header
+  is correct exactly once per file and useless downstream of a pipe.
+
+  Two fields carry the meaning the tool has always had and never exposed
+  machine-readably. **`enforced`** is what the kernel did, as distinct from
+  `action`, which is what the policy says — they differ for a `warn`, for an
+  unenforceable `block~`, and for every row in observe mode, and the doc says in
+  as many words to count denials with the former. **`matched_key`** is the
+  kernel key the decision fired on (`name=.aws/credentials`, `ip=1.1.1.1:25`),
+  which is the right thing to aggregate by: `rule` is policy text and several
+  rules can share a key. It is `null` for a warn, which denies nothing and so
+  matches no key.
+
+  The stream and the audit log share one record builder, so the fields they have
+  in common cannot drift; a test asserts a log line is byte-identical to what
+  that builder produces. `Plain` and `Json` also share one output loop — the
+  signal handling, the periodic prune and the post-exit drain are where an event
+  goes missing, and a second copy of them would be a second place for that.
+
+  Proven against a real kernel: an e2e run asserts the stream parses as JSONL,
+  that every record is versioned, that `matched_key` names the key that fired,
+  that allow rows are present — and that the count of `enforced == true` records
+  **equals the kernel's own denial counter**, which is the claim the whole
+  format rests on.
+
+  `--plain` still means what it did. `--format` wins where both are given, since
+  `--plain --format json` is a request for machine output and not an ambiguity.
+
 ### Changed
 
 - **A `match:` glob keeps its last two literal segments as the kernel key.**
