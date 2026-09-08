@@ -639,6 +639,7 @@ impl PathRule {
     }
 }
 
+#[derive(Clone)]
 enum NetMatch {
     V4Cidr(Ipv4Net),
     V4Ip(Ipv4Addr),
@@ -646,6 +647,7 @@ enum NetMatch {
     V6Ip(Ipv6Addr),
 }
 
+#[derive(Clone)]
 struct NetRule {
     label: String,
     which: NetMatch,
@@ -656,6 +658,15 @@ struct NetRule {
     /// tries in all, consulted most-specific first.
     proto: Option<Proto>,
     action: Action,
+    /// Where this rule sat in the policy file.
+    ///
+    /// Precedence within a tier is longest-prefix first, ties to the earliest
+    /// rule — and "earliest" used to mean "earlier in `self.network`". Domain
+    /// rules now live in a separate collection because their addresses move, so
+    /// position has to travel with the rule instead of being implied by which
+    /// vector it is in. Two rules that resolve to the same `/32` still resolve
+    /// their tie exactly as they did.
+    order: usize,
 }
 
 impl NetRule {
@@ -688,6 +699,147 @@ impl NetRule {
     }
 }
 
+/// One `domain:` rule as written, kept as a *spec* rather than as the addresses
+/// it happened to resolve to at load.
+#[derive(Clone, Debug)]
+struct DomainSpec {
+    domain: String,
+    port: Option<u16>,
+    proto: Option<Proto>,
+    action: Action,
+    label: String,
+    order: usize,
+}
+
+/// One address a `domain:` rule currently covers, as the caller needs it to
+/// address a kernel trie.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainAddr {
+    pub ip: IpAddr,
+    pub port: Option<u16>,
+    pub proto: Option<Proto>,
+    pub action: Action,
+    /// The name it came from, for the feed row.
+    pub domain: String,
+}
+
+/// What changed when the domain rules were re-resolved.
+///
+/// Empty in all three fields means the answer did not move, which is the common
+/// case and the one the caller should do nothing about.
+#[derive(Default, Debug)]
+pub struct DomainRefresh {
+    pub added: Vec<DomainAddr>,
+    pub removed: Vec<DomainAddr>,
+    /// Names that resolved to nothing this time. Reported rather than swallowed:
+    /// a rule that stops resolving stops enforcing, and the operator has to hear
+    /// that from the feed instead of finding it in an audit log afterwards.
+    pub failed: Vec<String>,
+}
+
+impl DomainRefresh {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// The `domain:` rules and the addresses they currently point at.
+///
+/// Separate from `Policy::network`, and behind a lock, because a name is not an
+/// address: CDN-fronted hosts rotate within minutes, so a rule frozen at load
+/// stops meaning what it says inside one agent session. An allowlisted domain
+/// starts hitting the deny-all catch-all — which users experience as wardyn
+/// being flaky, and flakiness is how a security tool gets switched off.
+#[derive(Default)]
+struct DomainSet {
+    specs: Vec<DomainSpec>,
+    /// Rules expanded from `specs` at the last resolution. Read on every
+    /// connect the mirror evaluates, written by the refresh timer, so a
+    /// read-biased lock is the right shape.
+    live: std::sync::RwLock<Vec<NetRule>>,
+}
+
+impl DomainSet {
+    fn snapshot(&self) -> Vec<NetRule> {
+        self.live.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Expand every spec through `resolve`, replacing what is live.
+    ///
+    /// Replaces rather than accumulates. Keeping every address a name has ever
+    /// had would make an `allow` steadily more permissive than the operator
+    /// wrote — the policy would drift open on its own, which is not a direction
+    /// a security tool may drift in without being told to.
+    fn refresh(&self, resolve: Resolver<'_>) -> DomainRefresh {
+        let mut next = Vec::new();
+        let mut failed = Vec::new();
+        for spec in &self.specs {
+            let ips = resolve(&spec.domain);
+            if ips.is_empty() {
+                failed.push(spec.domain.clone());
+                continue;
+            }
+            for ip in ips {
+                next.push(NetRule {
+                    label: spec.label.clone(),
+                    which: match ip {
+                        IpAddr::V4(v4) => NetMatch::V4Ip(v4),
+                        IpAddr::V6(v6) => NetMatch::V6Ip(v6),
+                    },
+                    port: spec.port,
+                    proto: spec.proto,
+                    action: spec.action,
+                    order: spec.order,
+                });
+            }
+        }
+
+        let before = self.snapshot();
+        let key = |r: &NetRule| (addr_of(r), r.port, r.proto, r.action);
+        let had: Vec<_> = before.iter().map(key).collect();
+        let has: Vec<_> = next.iter().map(key).collect();
+
+        let mut out = DomainRefresh {
+            failed,
+            ..Default::default()
+        };
+        for (r, k) in next.iter().zip(&has) {
+            if !had.contains(k) {
+                out.added.push(as_domain_addr(r));
+            }
+        }
+        for (r, k) in before.iter().zip(&had) {
+            if !has.contains(k) {
+                out.removed.push(as_domain_addr(r));
+            }
+        }
+        if let Ok(mut g) = self.live.write() {
+            *g = next;
+        }
+        out
+    }
+}
+
+/// The single address a domain-derived rule names. Domain rules are always host
+/// rules, so this is never a prefix.
+fn addr_of(r: &NetRule) -> Option<IpAddr> {
+    match &r.which {
+        NetMatch::V4Ip(a) => Some(IpAddr::V4(*a)),
+        NetMatch::V6Ip(a) => Some(IpAddr::V6(*a)),
+        _ => None,
+    }
+}
+
+fn as_domain_addr(r: &NetRule) -> DomainAddr {
+    DomainAddr {
+        ip: addr_of(r).expect("domain rules are host rules"),
+        port: r.port,
+        proto: r.proto,
+        action: r.action,
+        domain: r.label.clone(),
+    }
+}
+
 pub struct Policy {
     default_action: Action,
     files: Vec<PathRule>,
@@ -716,6 +868,8 @@ pub struct Policy {
     /// `domain:` rules that resolved to nothing at load time — they enforce
     /// nothing at all, so startup says so instead of leaving a silent hole.
     unresolved_domains: Vec<String>,
+    /// The `domain:` rules, and the addresses they point at right now.
+    domains: DomainSet,
     /// Identifies this exact policy source, so a stored approval granted under
     /// it stops applying the moment the rules change. Computed here because
     /// this is the only place the source text exists.
@@ -812,7 +966,10 @@ impl Policy {
         // order.
         let mut network = Vec::new();
         let mut unresolved_domains = Vec::new();
-        for r in raw.network {
+        let mut domain_specs: Vec<DomainSpec> = Vec::new();
+        // Every rule's position in the file, static or domain-derived, so a
+        // precedence tie resolves the same way after the two are split apart.
+        for (order, r) in raw.network.into_iter().enumerate() {
             let suffix = match (r.proto, r.port) {
                 (Some(t), Some(p)) => format!(" {} port {p}", t.as_str()),
                 (Some(t), None) => format!(" {}", t.as_str()),
@@ -837,26 +994,23 @@ impl Policy {
                         port: r.port,
                         proto: r.proto,
                         action: r.action,
+                        order,
                     });
                 }
+                // Kept as a spec, not as the addresses it happens to resolve
+                // to right now — those are re-resolved for the life of the run.
                 (None, Some(domain)) => {
-                    let ips = resolve(domain);
-                    if ips.is_empty() {
+                    if resolve(domain).is_empty() {
                         unresolved_domains.push(domain.clone());
                     }
-                    for ip in ips {
-                        let which = match ip {
-                            IpAddr::V4(v4) => NetMatch::V4Ip(v4),
-                            IpAddr::V6(v6) => NetMatch::V6Ip(v6),
-                        };
-                        network.push(NetRule {
-                            label: format!("domain:{domain}{suffix}"),
-                            which,
-                            port: r.port,
-                            proto: r.proto,
-                            action: r.action,
-                        });
-                    }
+                    domain_specs.push(DomainSpec {
+                        domain: domain.clone(),
+                        port: r.port,
+                        proto: r.proto,
+                        action: r.action,
+                        label: format!("domain:{domain}{suffix}"),
+                        order,
+                    });
                 }
                 // `port:` on its own means "this port, anywhere" — the most
                 // useful port rule there is ("never SMTP"). It covers BOTH
@@ -883,6 +1037,7 @@ impl Policy {
                             port: r.port,
                             proto: r.proto,
                             action: r.action,
+                            order,
                         });
                     }
                 }
@@ -929,6 +1084,15 @@ impl Policy {
             }
         }
 
+        // The first resolution happens here, through the same path every later
+        // one takes — so the load-time set and a refreshed set can never be
+        // built differently.
+        let domains = DomainSet {
+            specs: domain_specs,
+            ..Default::default()
+        };
+        domains.refresh(resolve);
+
         Ok(Policy {
             fingerprint: crate::overrides::fingerprint(text),
             default_action: raw.default_action,
@@ -943,14 +1107,45 @@ impl Policy {
             anchors,
             unresolved_anchors,
             unresolved_domains,
+            domains,
         })
+    }
+
+    /// Every network rule — the static ones and whatever the `domain:` rules
+    /// resolve to right now — in policy order.
+    ///
+    /// Cloned rather than borrowed: the domain half lives behind a lock that a
+    /// refresh may take at any moment, and holding a read guard across the
+    /// callers (which populate kernel maps and format explanations) would let a
+    /// slow one block the resolver. These callers run at load and on refresh,
+    /// never per event.
+    fn all_net_rules(&self) -> Vec<NetRule> {
+        let mut all = self.network.clone();
+        all.extend(self.domains.snapshot());
+        all.sort_by_key(|r| r.order);
+        all
+    }
+
+    /// Re-resolve every `domain:` rule and report what moved.
+    ///
+    /// The caller applies the difference to the kernel tries; the userspace
+    /// mirror picks it up on its own, because both read the same live set. An
+    /// empty result means the answer did not move, which is the common case.
+    pub fn refresh_domains(&self, resolve: Resolver<'_>) -> DomainRefresh {
+        self.domains.refresh(resolve)
+    }
+
+    /// Whether this policy has anything to re-resolve at all. A policy with no
+    /// `domain:` rules should not pay for a timer.
+    pub fn has_domain_specs(&self) -> bool {
+        !self.domains.specs.is_empty()
     }
 
     pub fn summary(&self) -> String {
         format!(
             "{} file rule(s), {} network rule(s), {} exec rule(s), default={}",
             self.files.len(),
-            self.network.len(),
+            self.all_net_rules().len(),
             self.exec.len(),
             self.default_action.as_str()
         )
@@ -967,7 +1162,7 @@ impl Policy {
     /// that only on a little-endian host. Reversed so earlier policy rules win
     /// on identical keys (LPM `insert` overwrites on collision).
     pub fn net_entries(&self) -> Vec<(u32, u32, u32)> {
-        self.network
+        self.all_net_rules()
             .iter()
             .rev()
             // A rule that names a port or a protocol lives in one of the three
@@ -997,7 +1192,7 @@ impl Policy {
     /// the rule constrained, so two rules for different ports can never match
     /// each other and, within one port, the more specific address still wins.
     pub fn port_entries(&self) -> Vec<(u32, PortKey4, u32)> {
-        self.network
+        self.all_net_rules()
             .iter()
             .rev()
             .filter_map(|r| {
@@ -1018,7 +1213,7 @@ impl Policy {
 
     /// Same, for IPv6.
     pub fn port_entries6(&self) -> Vec<(u32, PortKey6, u32)> {
-        self.network
+        self.all_net_rules()
             .iter()
             .rev()
             .filter_map(|r| {
@@ -1040,12 +1235,14 @@ impl Policy {
     /// Whether any rule names a port — i.e. whether the kernel needs to consult
     /// the port tries at all.
     pub fn has_port_rules(&self) -> bool {
-        self.network.iter().any(|r| r.tier() == (false, true))
+        self.all_net_rules()
+            .iter()
+            .any(|r| r.tier() == (false, true))
     }
 
     /// Whether any rule names a protocol, for the same reason.
     pub fn has_proto_rules(&self) -> bool {
-        self.network.iter().any(|r| r.proto.is_some())
+        self.all_net_rules().iter().any(|r| r.proto.is_some())
     }
 
     /// Rules naming a protocol AND a port, for `NET_PROTO_PORT_RULES`.
@@ -1055,7 +1252,7 @@ impl Policy {
     /// field is ever a don't-care, and the address keeps exactly the meaning it
     /// has in the tries with no protocol at all.
     pub fn proto_port_entries(&self) -> Vec<(u32, ProtoPortKey4, u32)> {
-        self.network
+        self.all_net_rules()
             .iter()
             .rev()
             .filter_map(|r| {
@@ -1076,7 +1273,7 @@ impl Policy {
 
     /// Same, for IPv6.
     pub fn proto_port_entries6(&self) -> Vec<(u32, ProtoPortKey6, u32)> {
-        self.network
+        self.all_net_rules()
             .iter()
             .rev()
             .filter_map(|r| {
@@ -1097,7 +1294,7 @@ impl Policy {
 
     /// Rules naming a protocol but no port, for `NET_PROTO_RULES`.
     pub fn proto_entries(&self) -> Vec<(u32, ProtoKey4, u32)> {
-        self.network
+        self.all_net_rules()
             .iter()
             .rev()
             .filter(|r| r.port.is_none())
@@ -1119,7 +1316,7 @@ impl Policy {
 
     /// Same, for IPv6.
     pub fn proto_entries6(&self) -> Vec<(u32, ProtoKey6, u32)> {
-        self.network
+        self.all_net_rules()
             .iter()
             .rev()
             .filter(|r| r.port.is_none())
@@ -1142,7 +1339,7 @@ impl Policy {
     /// IPv6 network rules as `(prefix_len, address bytes (network order), action
     /// code)` for the v6 LPM trie.
     pub fn net_entries6(&self) -> Vec<(u32, [u8; 16], u32)> {
-        self.network
+        self.all_net_rules()
             .iter()
             .rev()
             .filter(|r| r.port.is_none())
@@ -1440,7 +1637,7 @@ impl Policy {
     /// is in force. Surfaced at startup so the hole is never silent.
     pub fn net_coverage_gaps(&self) -> Vec<String> {
         let has_block_all = |v6: bool| {
-            self.network.iter().any(|r| {
+            self.all_net_rules().iter().any(|r| {
                 // A port-qualified `0.0.0.0/0` denies one port, not all egress.
                 r.action == Action::Block
                     && r.port.is_none()
@@ -1485,14 +1682,16 @@ impl Policy {
         for pat in &self.unresolved_domains {
             out.push(format!(
                 "network rule `domain: {pat}` resolved to no addresses — it enforces NOTHING. \
-                 Domain rules are resolved once, at load: prefer an explicit `cidr:`."
+                 It is re-resolved every minute and will start enforcing if the name comes \
+                 back — but prefer an explicit `cidr:` for anything security-critical."
             ));
         }
         if !self.unresolved_domains.is_empty() || self.has_domain_rules() {
             out.push(
-                "`domain:` rules freeze the addresses DNS returned at startup: a CDN that answers \
-                 with a different address later is not covered by an allow, and not caught by a \
-                 block. Use `cidr:` where the answer can move."
+                "`domain:` rules are re-resolved every 60s, so a CDN that moves is followed \
+                 within a minute — but only between refreshes, and only for names the system \
+                 resolver answers the same way the agent's does. A `block` by name is still \
+                 defeated by anyone who controls the name. Use `cidr:` where it has to be sound."
                     .to_string(),
             );
         }
@@ -1500,7 +1699,7 @@ impl Policy {
     }
 
     fn has_domain_rules(&self) -> bool {
-        self.network.iter().any(|r| r.label.starts_with("domain:"))
+        self.has_domain_specs()
     }
 
     /// A full, plain-language account of what this policy will actually do in
@@ -1561,9 +1760,10 @@ impl Policy {
         }
         // Deduplicated: a bare `port:`/`proto:` rule is compiled into one entry
         // per address family, and a rule listed twice reads as two rules.
+        let all = self.all_net_rules();
         let blocked = |tier: (bool, bool)| -> Vec<&str> {
             let mut out: Vec<&str> = Vec::new();
-            for r in &self.network {
+            for r in &all {
                 if r.action == Action::Block && r.tier() == tier && !out.contains(&r.label.as_str())
                 {
                     out.push(&r.label);
@@ -1829,13 +2029,25 @@ impl Policy {
         dport: u16,
         proto: Option<Proto>,
     ) -> Verdict {
+        // One read guard for the whole match rather than a merged copy per
+        // connect: this runs on every connect the mirror evaluates, and
+        // cloning the rule set here would put an allocation on that path. The
+        // guard is held only for this verdict; the refresh timer's write is a
+        // once-a-minute event that waits behind it.
+        let guard = self.domains.live.read().ok();
+        let live: &[NetRule] = guard.as_ref().map(|g| g.as_slice()).unwrap_or(&[]);
+
         for tier in [(true, true), (false, true), (true, false), (false, false)] {
             // An unknown protocol matches no protocol rule.
             if tier.0 && proto.is_none() {
                 continue;
             }
             let mut best: Option<(&NetRule, u8)> = None;
-            for r in &self.network {
+            // Static rules and the live domain rules are two collections, so
+            // the chain is not in policy order — the tie-break reads `order`
+            // instead of relying on iteration position, which is why the field
+            // exists.
+            for r in self.network.iter().chain(live.iter()) {
                 if r.tier() != tier || !r.port_matches(dport) {
                     continue;
                 }
@@ -1845,10 +2057,14 @@ impl Policy {
                 let Some(plen) = prefix_of(r) else {
                     continue;
                 };
-                // Strictly-greater keeps the earliest rule on a prefix-length
-                // tie, matching the kernel trie (the entry lists insert the
-                // earliest rule last, and LPM `insert` overwrites on collision).
-                if best.is_none_or(|(_, bp)| plen > bp) {
+                // Longest prefix wins; a tie keeps the earliest rule, matching
+                // the kernel trie (the entry lists insert the earliest rule
+                // last, and LPM `insert` overwrites on collision).
+                let better = match best {
+                    None => true,
+                    Some((b, bp)) => plen > bp || (plen == bp && r.order < b.order),
+                };
+                if better {
                     best = Some((r, plen));
                 }
             }
@@ -3775,6 +3991,182 @@ files:
         assert!(
             !text.contains("name=shadow "),
             "the bare key must be gone: {text}"
+        );
+    }
+
+    // ── domain rules are re-resolved, not frozen ────────────────────────────
+
+    /// A resolver whose answer can be changed between calls, the way a CDN's
+    /// answer changes between minutes.
+    fn moving_resolver<'a>(
+        answers: &'a std::cell::RefCell<Vec<&'static str>>,
+    ) -> impl Fn(&str) -> Vec<IpAddr> + 'a {
+        move |_domain: &str| {
+            answers
+                .borrow()
+                .iter()
+                .map(|a| a.parse().expect("test address"))
+                .collect()
+        }
+    }
+
+    /// The bug this exists to fix: a `domain:` allow was frozen at load, so when
+    /// the name started answering with a different address the agent's
+    /// legitimate traffic hit the deny-all catch-all instead.
+    #[test]
+    fn a_domain_allow_follows_the_name_when_its_address_moves() {
+        let answers = std::cell::RefCell::new(vec!["93.184.216.34"]);
+        let p = Loader::offline()
+            .resolver(&moving_resolver(&answers))
+            .from_str(
+                r#"
+network:
+  - { domain: "cdn.example", action: allow }
+  - { cidr: "0.0.0.0/0",     action: block }
+"#,
+            )
+            .expect("parses");
+
+        let old: Ipv4Addr = "93.184.216.34".parse().unwrap();
+        let new: Ipv4Addr = "93.184.216.99".parse().unwrap();
+        assert_eq!(p.eval_connect(old, 443).action, Action::Allow);
+        assert_eq!(p.eval_connect(new, 443).action, Action::Block);
+
+        // The name starts answering with a different address.
+        *answers.borrow_mut() = vec!["93.184.216.99"];
+        let refresh = p.refresh_domains(&moving_resolver(&answers));
+
+        assert_eq!(refresh.added.len(), 1, "{refresh:?}");
+        assert_eq!(refresh.added[0].ip, IpAddr::V4(new));
+        assert_eq!(refresh.removed.len(), 1, "{refresh:?}");
+        assert_eq!(refresh.removed[0].ip, IpAddr::V4(old));
+
+        // The mirror follows immediately — it and the kernel read one set.
+        assert_eq!(p.eval_connect(new, 443).action, Action::Allow);
+        assert_eq!(
+            p.eval_connect(old, 443).action,
+            Action::Block,
+            "an address the name no longer answers with must stop being allowed"
+        );
+    }
+
+    /// Replacing rather than accumulating is the whole reason the old address
+    /// stops being allowed above. Stated as its own test because the opposite
+    /// choice is tempting — it would never break a working agent — and it would
+    /// let an `allow` drift steadily more permissive than what was written.
+    #[test]
+    fn a_refresh_replaces_the_address_set_rather_than_growing_it() {
+        let answers = std::cell::RefCell::new(vec!["10.0.0.1", "10.0.0.2"]);
+        let p = Loader::offline()
+            .resolver(&moving_resolver(&answers))
+            .from_str("network:\n  - { domain: \"x.example\", action: allow }\n")
+            .expect("parses");
+        assert_eq!(p.net_entries().len(), 2);
+
+        *answers.borrow_mut() = vec!["10.0.0.3"];
+        p.refresh_domains(&moving_resolver(&answers));
+        let entries = p.net_entries();
+        assert_eq!(entries.len(), 1, "the set was grown, not replaced");
+        assert_eq!(entries[0].1, u32::from_ne_bytes([10, 0, 0, 3]));
+    }
+
+    /// A name that stops resolving stops enforcing, and that has to reach the
+    /// operator. Reported as a failure rather than silently leaving the last
+    /// good answer in place — which would be a rule claiming coverage it no
+    /// longer has.
+    #[test]
+    fn a_name_that_stops_resolving_is_reported_and_stops_covering() {
+        let answers = std::cell::RefCell::new(vec!["10.0.0.1"]);
+        let p = Loader::offline()
+            .resolver(&moving_resolver(&answers))
+            .from_str(
+                r#"
+network:
+  - { domain: "gone.example", action: block }
+  - { cidr: "0.0.0.0/0",      action: allow }
+"#,
+            )
+            .expect("parses");
+        let ip: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        assert_eq!(p.eval_connect(ip, 443).action, Action::Block);
+
+        answers.borrow_mut().clear();
+        let refresh = p.refresh_domains(&moving_resolver(&answers));
+        assert_eq!(refresh.failed, vec!["gone.example".to_string()]);
+        assert_eq!(refresh.removed.len(), 1);
+        assert_eq!(p.eval_connect(ip, 443).action, Action::Allow);
+    }
+
+    /// An unchanged answer must produce no rows, or a policy with a stable
+    /// domain would print a notice every minute for the life of the run.
+    #[test]
+    fn a_refresh_that_changes_nothing_reports_nothing() {
+        let answers = std::cell::RefCell::new(vec!["10.0.0.1"]);
+        let p = Loader::offline()
+            .resolver(&moving_resolver(&answers))
+            .from_str("network:\n  - { domain: \"stable.example\", action: allow }\n")
+            .expect("parses");
+        let refresh = p.refresh_domains(&moving_resolver(&answers));
+        assert!(refresh.is_empty(), "{refresh:?}");
+    }
+
+    /// Precedence has to survive the split: domain rules live in their own
+    /// collection now, so a tie with a `cidr:` rule on the same prefix can no
+    /// longer be decided by position in one vector.
+    #[test]
+    fn a_domain_rule_keeps_its_policy_position_against_a_tying_cidr() {
+        let answers = std::cell::RefCell::new(vec!["10.0.0.7"]);
+        // The domain rule is written FIRST, so on a /32 tie it wins.
+        let first = Loader::offline()
+            .resolver(&moving_resolver(&answers))
+            .from_str(
+                r#"
+network:
+  - { domain: "x.example",   action: allow }
+  - { cidr: "10.0.0.7/32",   action: block }
+"#,
+            )
+            .expect("parses");
+        let ip: Ipv4Addr = "10.0.0.7".parse().unwrap();
+        assert_eq!(first.eval_connect(ip, 443).action, Action::Allow);
+
+        // Reversed, the cidr rule is first and wins the same tie.
+        let second = Loader::offline()
+            .resolver(&moving_resolver(&answers))
+            .from_str(
+                r#"
+network:
+  - { cidr: "10.0.0.7/32",   action: block }
+  - { domain: "x.example",   action: allow }
+"#,
+            )
+            .expect("parses");
+        assert_eq!(second.eval_connect(ip, 443).action, Action::Block);
+    }
+
+    /// A `domain:` rule that also names a port or protocol keeps them across a
+    /// refresh — those decide which of the four kernel tries the address lands
+    /// in, and losing them would file it in the wrong one.
+    #[test]
+    fn a_refreshed_domain_rule_keeps_its_port_and_protocol() {
+        let answers = std::cell::RefCell::new(vec!["10.0.0.1"]);
+        let p = Loader::offline()
+            .resolver(&moving_resolver(&answers))
+            .from_str(
+                "network:\n  - { domain: \"d.example\", port: 443, proto: tcp, action: allow }\n",
+            )
+            .expect("parses");
+        assert!(p.net_entries().is_empty(), "not an address-tier rule");
+        assert_eq!(p.proto_port_entries().len(), 1);
+
+        *answers.borrow_mut() = vec!["10.0.0.2"];
+        let refresh = p.refresh_domains(&moving_resolver(&answers));
+        assert_eq!(refresh.added[0].port, Some(443));
+        assert_eq!(refresh.added[0].proto, Some(Proto::Tcp));
+        assert_eq!(
+            p.proto_port_entries().len(),
+            1,
+            "still in the proto+port trie"
         );
     }
 }

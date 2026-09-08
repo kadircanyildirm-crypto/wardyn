@@ -226,7 +226,7 @@ files:
   - { match: "**/*.sqlite",  action: block, access: delete }
   - { match: "**",           action: allow }
 
-network:                                 # cidr, or domain (resolved at load)
+network:                                 # cidr, or domain (re-resolved every 60s)
   - { cidr: "127.0.0.0/8",   action: allow }
   - { domain: "github.com",  action: allow }
   - { port: 25,              action: block }   # never SMTP — beats any rule above

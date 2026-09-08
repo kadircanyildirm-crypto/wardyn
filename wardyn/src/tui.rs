@@ -383,6 +383,13 @@ pub async fn run(
     // Prune WATCHED against /proc and refresh the kernel counters every ~2s
     // (20 × 100ms ticks).
     let mut sweeps: u32 = 0;
+    // And re-resolve `domain:` rules on the same 100ms tick, counted out to
+    // `DOMAIN_REFRESH`. Counting ticks rather than adding a second timer keeps
+    // the redraw loop single-source: a `select!` arm that fires independently
+    // would draw a frame from a branch that has no other reason to.
+    let domain_every: u32 = (crate::DOMAIN_REFRESH.as_millis() / 100).max(1) as u32;
+    let has_domains = ctx.policy.has_domain_specs();
+    let mut domain_ticks: u32 = 0;
     let mut quit = false;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -404,6 +411,15 @@ pub async fn run(
                     }
                     if let Some(s) = ctx.stats.as_ref() {
                         app.stats = s.snapshot();
+                    }
+                }
+                if has_domains {
+                    domain_ticks += 1;
+                    if domain_ticks >= domain_every {
+                        domain_ticks = 0;
+                        for d in crate::refresh_domains(ctx) {
+                            app.push(d);
+                        }
                     }
                 }
                 while event::poll(Duration::ZERO)? {

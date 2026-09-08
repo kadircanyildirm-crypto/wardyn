@@ -26,7 +26,7 @@ mod tui;
 
 use std::collections::VecDeque;
 use std::io::IsTerminal as _;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context as _};
@@ -43,7 +43,8 @@ use wardyn_common::{
 use wardyn_policy::cli::{self, Format, Mode, Opts, ParseOutcome};
 use wardyn_policy::identity::AnchorBase;
 use wardyn_policy::policy::{
-    self, Action, DenialKey, Exceptions, LifecycleOp, Loader, Policy, Proto, Verdict,
+    self, Action, DenialKey, DomainAddr, DomainRefresh, Exceptions, LifecycleOp, Loader, Policy,
+    Proto, Verdict,
 };
 
 use crate::audit::Audit;
@@ -447,6 +448,117 @@ impl KernelMaps {
             dir_inodes,
             exec_inodes,
         })
+    }
+
+    /// Apply a domain re-resolution to the live tries.
+    ///
+    /// Domain rules are always **host** rules, so every key here is a `/32` or
+    /// `/128` in whichever tier the rule's `port:`/`proto:` puts it — the same
+    /// four tries the policy compiles into, addressed the same way.
+    ///
+    /// Removals go first. An address that moved from one tier to another (a
+    /// rule edited between runs cannot happen, but a name resolving to an
+    /// address another rule also names can) must not have its removal undo the
+    /// addition that just replaced it.
+    pub(crate) fn apply_domain_refresh(&mut self, refresh: &DomainRefresh) -> anyhow::Result<()> {
+        for a in &refresh.removed {
+            self.domain_key(a, /* remove */ true)?;
+        }
+        for a in &refresh.added {
+            self.domain_key(a, false)?;
+        }
+        Ok(())
+    }
+
+    /// Insert or remove one domain-derived host address, in the tier its
+    /// `port:`/`proto:` selects.
+    fn domain_key(&mut self, a: &DomainAddr, remove: bool) -> anyhow::Result<()> {
+        let act = a.action.code();
+        match (a.ip, a.proto, a.port) {
+            (IpAddr::V4(ip), None, None) => {
+                let k = Key::new(32, u32::from_ne_bytes(ip.octets()));
+                if remove {
+                    self.net4.remove(&k).ok();
+                } else {
+                    self.net4.insert(&k, act, 0)?;
+                }
+            }
+            (IpAddr::V6(ip), None, None) => {
+                let k = Key::new(128, Ip6Key(ip.octets()));
+                if remove {
+                    self.net6.remove(&k).ok();
+                } else {
+                    self.net6.insert(&k, act, 0)?;
+                }
+            }
+            (IpAddr::V4(ip), None, Some(port)) => {
+                let k = Key::new(
+                    PORT_BITS + 32,
+                    PortKey4Pod::from(PortKey4::new(port, ip.octets())),
+                );
+                if remove {
+                    self.port4.remove(&k).ok();
+                } else {
+                    self.port4.insert(&k, act, 0)?;
+                }
+            }
+            (IpAddr::V6(ip), None, Some(port)) => {
+                let k = Key::new(
+                    PORT_BITS + 128,
+                    PortKey6Pod::from(PortKey6::new(port, ip.octets())),
+                );
+                if remove {
+                    self.port6.remove(&k).ok();
+                } else {
+                    self.port6.insert(&k, act, 0)?;
+                }
+            }
+            (IpAddr::V4(ip), Some(pr), None) => {
+                let k = Key::new(
+                    PROTO_BITS + 32,
+                    ProtoKey4Pod::from(ProtoKey4::new(pr.number(), ip.octets())),
+                );
+                if remove {
+                    self.proto4.remove(&k).ok();
+                } else {
+                    self.proto4.insert(&k, act, 0)?;
+                }
+            }
+            (IpAddr::V6(ip), Some(pr), None) => {
+                let k = Key::new(
+                    PROTO_BITS + 128,
+                    ProtoKey6Pod::from(ProtoKey6::new(pr.number(), ip.octets())),
+                );
+                if remove {
+                    self.proto6.remove(&k).ok();
+                } else {
+                    self.proto6.insert(&k, act, 0)?;
+                }
+            }
+            (IpAddr::V4(ip), Some(pr), Some(port)) => {
+                let k = Key::new(
+                    PROTO_BITS + PORT_BITS + 32,
+                    ProtoPortKey4Pod::from(ProtoPortKey4::new(pr.number(), port, ip.octets())),
+                );
+                if remove {
+                    self.proto_port4.remove(&k).ok();
+                } else {
+                    self.proto_port4.insert(&k, act, 0)?;
+                }
+            }
+            (IpAddr::V6(ip), Some(pr), Some(port)) => {
+                let k = Key::new(
+                    PROTO_BITS + PORT_BITS + 128,
+                    ProtoPortKey6Pod::from(ProtoPortKey6::new(pr.number(), port, ip.octets())),
+                );
+                if remove {
+                    self.proto_port6.remove(&k).ok();
+                } else {
+                    self.proto_port6.insert(&k, act, 0)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Make the kernel stop denying `key` for the rest of this run. File/exec
@@ -1734,6 +1846,10 @@ async fn run_stream(
 
     let exceptions = Exceptions::default();
     let mut sweep = tokio::time::interval(std::time::Duration::from_secs(2));
+    // Only armed when the policy has names to re-resolve, so a cidr-only policy
+    // pays nothing for the feature.
+    let mut domains = tokio::time::interval(DOMAIN_REFRESH);
+    let has_domains = ctx.policy.has_domain_specs();
     // One Ctrl-C future for the whole loop: recreating it every iteration drops
     // any signal that arrives in the gap between iterations.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -1754,6 +1870,13 @@ async fn run_stream(
             _ = sweep.tick() => {
                 if let Some(m) = ctx.watched.as_mut() {
                     prune_watched(m);
+                }
+            }
+            _ = domains.tick(), if has_domains => {
+                for d in refresh_domains(ctx) {
+                    if open {
+                        open = emit(&mut out, format, enforce, &d);
+                    }
                 }
             }
             guard = async_fd.readable_mut() => {
@@ -2024,6 +2147,65 @@ pub(crate) fn drain(
         }
         sink(d);
     }
+}
+
+/// How often `domain:` rules are re-resolved.
+///
+/// A minute is short enough that a CDN rotation is corrected before an agent
+/// notices, and long enough that a policy allowlisting a handful of names is not
+/// a visible source of DNS traffic. Nothing depends on the exact value: a stale
+/// entry fails in the direction the policy already chose, and the feed says when
+/// one moves.
+pub(crate) const DOMAIN_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Re-resolve the `domain:` rules and push the difference into the kernel.
+///
+/// Returns feed rows describing what moved — nothing when the answer did not,
+/// which is the ordinary case. Both front-ends call this from their own timer,
+/// so the TUI and the stream cannot drift on how a rotation is handled.
+///
+/// Failures are rows too. A name that stops resolving stops enforcing, and an
+/// operator has to hear that while it is happening rather than reconstruct it
+/// from an audit log afterwards — which is what the old `log::warn!` amounted
+/// to, since the logger is not even initialised under the TUI.
+pub(crate) fn refresh_domains(ctx: &mut RunCtx<'_>) -> Vec<Desc> {
+    let refresh = ctx.policy.refresh_domains(&policy::system_resolver);
+    if refresh.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    if let Err(e) = ctx.maps.apply_domain_refresh(&refresh) {
+        // The userspace mirror has already taken the new answer, so leaving
+        // this silent would put the feed and the kernel into exactly the
+        // disagreement the mirror exists to prevent.
+        rows.push(notice_row(&format!(
+            "domain re-resolution could not be applied to the kernel ({e:#}) — the feed may now              disagree with what is enforced"
+        )));
+        return rows;
+    }
+    for a in &refresh.added {
+        rows.push(notice_row(&format!(
+            "{} now also resolves to {} — {} it",
+            a.domain,
+            a.ip,
+            match a.action {
+                Action::Block => "the kernel now blocks",
+                _ => "the kernel now allows",
+            }
+        )));
+    }
+    for a in &refresh.removed {
+        rows.push(notice_row(&format!(
+            "{} no longer resolves to {} — the kernel no longer covers it",
+            a.domain, a.ip
+        )));
+    }
+    for d in &refresh.failed {
+        rows.push(notice_row(&format!(
+            "domain `{d}` resolved to nothing — that rule is enforcing NOTHING until it resolves              again. Use `cidr:` for anything security-critical."
+        )));
+    }
+    rows
 }
 
 /// For a kernel `DENY_*` event, the `(observation kind, key)` pair a predicted
