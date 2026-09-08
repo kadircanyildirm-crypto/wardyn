@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--as-user 0` ran the agent as root while reporting that it had not.**
+  `$SUDO_UID=0` was rejected, but the explicit flag was not: the drop went
+  through `setuid(0)` — a successful no-op — past the `--enforce` refusal that
+  exists to stop a root child, and printed *"the agent runs as uid=0 gid=0, not
+  root"*. It was `--keep-root` without the warning, spelled as its opposite.
+  Root is now refused as a target identity however it is requested, and the
+  refusal names what was asked for.
+
+- **A `~` rule could silently anchor to root's home.** `--as-user <uid>` for a
+  uid with no `/etc/passwd` entry fell back to `$HOME`, which under `sudo` is
+  root's — so `path: ~/.ssh` pinned `/root/.ssh` and protected the wrong
+  directory while reading as correct. When the agent's identity is known, `~`
+  now resolves from that identity or not at all; unresolved rules were already
+  reported.
+
+- **One odd line in `/etc/passwd` ended the home lookup instead of skipping an
+  entry.** An NIS compat line (`+::::::`) has an empty uid field, so a single
+  one above the target user unanchored every `~` rule on that machine.
+
 - **A failed `PR_SET_NO_NEW_PRIVS` was silent.** The privilege drop is three
   things — a non-root uid, cleared supplementary groups, and no route back — and
   only the third could fail while the other two still looked successful, leaving
