@@ -77,12 +77,21 @@ def read_policy(policy: str | None, wardyn: str) -> dict:
         return {"error": str(e), "keys": []}
 
     keys, fingerprint, summary = [], None, None
+    # Whether this policy asks for Landlock containment. The page draws a hull
+    # for it either way, but at two very different opacities — a hull drawn as
+    # active for a policy that has none would be the page lying about the
+    # boundary, which is the one thing it exists not to do.
+    contained, ports = False, None
     for line in out.stdout.splitlines():
         s = line.strip()
         if s.startswith("policy:"):
             summary = s[len("policy:"):].strip()
         elif s.startswith("fingerprint:"):
             fingerprint = s.split()[1]
+        elif "contained by Landlock" in s and "reaches ONLY" in s:
+            contained = True
+        elif "contained by Landlock" in s and "TCP is confined" in s:
+            ports = s.split("confined to:", 1)[1].strip() if "confined to:" in s else "yes"
         # `  file  name=.env    denies opening ANY file named `.env`` and friends
         elif ("  " in s) and ("=" in s.split()[1] if len(s.split()) > 1 else False):
             parts = s.split(None, 2)
@@ -93,6 +102,8 @@ def read_policy(policy: str | None, wardyn: str) -> dict:
         "keys": keys,
         "fingerprint": fingerprint,
         "summary": summary,
+        "contained": contained,
+        "ports": ports,
         "stderr": out.stderr[-2000:] if out.returncode else "",
     }
 

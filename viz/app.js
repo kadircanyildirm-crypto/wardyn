@@ -7,16 +7,19 @@
 //
 // The world, from the top down:
 //
-//   y = +6    USERSPACE   one pillar per watched pid, grown by its own traffic
+//   y = +6    USERSPACE   one tower per program, grown by its own traffic
 //   y =  0    the syscall boundary, a grid plane
 //   y = -4    HOOKS       the tracepoint (observes) and the LSM/cgroup hook
 //                         (decides) — kept apart, because that distinction is
 //                         the one wardyn refuses to blur
 //   y = -9    MAPS        one tile per kernel block key, lit when it fires
 //
-// A syscall is a particle. It falls from its pillar, crosses the boundary, and
+// A syscall is a particle. It falls from its tower, crosses the boundary, and
 // either passes the hook plane and continues down (allowed) or is turned around
 // at it and thrown back up in red (denied).
+//
+// The tour is a scripted camera and a card, nothing more: it points at the
+// live scene and explains what is already there. It never fakes an event.
 
 import * as THREE from "./vendor/three.module.min.js";
 
@@ -32,7 +35,7 @@ const COL = {
   ground:  0x05070B,
 };
 
-const Y_USER = 6.0;   // pillar bases
+const Y_USER = 6.0;   // tower bases
 const Y_BOUND = 0.0;  // syscall boundary
 const Y_HOOK = -4.0;  // where a verdict is returned
 const Y_MAP = -9.0;   // the block-key lattice
@@ -41,14 +44,12 @@ const Y_MAP = -9.0;   // the block-key lattice
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(COL.ground);
-scene.fog = new THREE.Fog(COL.ground, 26, 62);
+scene.fog = new THREE.Fog(COL.ground, 30, 70);
 
 const camera = new THREE.PerspectiveCamera(46, innerWidth / innerHeight, 0.1, 200);
-camera.position.set(15.5, 7.5, 18.5);
-camera.lookAt(0, -1.5, 0);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
 $("scene").appendChild(renderer.domElement);
 
@@ -60,20 +61,37 @@ const under = new THREE.PointLight(COL.signal, 18, 30, 2);
 under.position.set(0, Y_HOOK - 1.2, 0);
 scene.add(under);
 
+// ── focus / dimming ────────────────────────────────────────────────────────
+//
+// Every drawn thing belongs to a group. The tour asks for one or two groups to
+// be in focus; everything else fades to a fraction of its normal brightness,
+// and fades back when the tour moves on. Particles are never dimmed — they are
+// the data.
+
+const dimmables = [];   // { mat, base, group, prop }
+function dimmable(mat, group, prop) {
+  prop = prop || "opacity";
+  mat.transparent = true;
+  dimmables.push({ mat, base: mat[prop], group, prop });
+}
+let focus = null;   // null = everything at full brightness
+function inFocus(group) { return !focus || focus.includes(group); }
+
 // ── the two planes that define the world ───────────────────────────────────
 
-function plane(y, size, div, color, opacity) {
+function plane(y, size, div, color, opacity, group) {
   const g = new THREE.GridHelper(size, div, color, color);
   g.position.y = y;
   g.material.transparent = true;
   g.material.opacity = opacity;
   scene.add(g);
+  dimmable(g.material, group);
   return g;
 }
 
 // The syscall boundary: brighter, because it is the line the whole tool is about.
-plane(Y_BOUND, 30, 30, COL.wireHot, 0.42);
-plane(Y_MAP - 0.02, 30, 15, COL.wire, 0.3);
+plane(Y_BOUND, 30, 30, COL.wireHot, 0.42, "boundary");
+plane(Y_MAP - 0.02, 30, 15, COL.wire, 0.3, "tiles");
 
 // A faint slab under the boundary so "kernel" reads as a solid region.
 const slab = new THREE.Mesh(
@@ -82,10 +100,11 @@ const slab = new THREE.Mesh(
 );
 slab.position.y = Y_BOUND - 0.05;
 scene.add(slab);
+dimmable(slab.material, "boundary");
 
 // ── the hook plane: two discs, observer and decider ────────────────────────
 
-function disc(radius, y, color, opacity) {
+function disc(radius, y, color, opacity, group) {
   const m = new THREE.Mesh(
     new THREE.RingGeometry(radius * 0.62, radius, 64),
     new THREE.MeshBasicMaterial({ color, transparent: true, opacity, side: THREE.DoubleSide })
@@ -93,11 +112,72 @@ function disc(radius, y, color, opacity) {
   m.rotation.x = -Math.PI / 2;
   m.position.y = y;
   scene.add(m);
+  dimmable(m.material, group);
   return m;
 }
 
-const traceRing = disc(7.2, Y_HOOK + 1.7, COL.observe, 0.3);   // sees, cannot deny
-const hookRing = disc(6.0, Y_HOOK, COL.signal, 0.42);          // decides
+const traceRing = disc(7.2, Y_HOOK + 1.7, COL.observe, 0.3, "trace");   // sees, cannot deny
+const hookRing = disc(6.0, Y_HOOK, COL.signal, 0.42, "hook");           // decides
+
+// ── the EVENTS ring buffer ─────────────────────────────────────────────────
+//
+// A torus between the hook and the maps: the path a *report* takes to
+// userspace, as opposed to the verdict, which never leaves the syscall. It
+// flashes red when events are lost — wardyn's own drops, or this page's
+// coalescing — because a drop that nobody sees is the failure this whole thing
+// is built to avoid.
+
+const ringBuf = new THREE.Mesh(
+  new THREE.TorusGeometry(9.6, 0.14, 10, 96),
+  new THREE.MeshBasicMaterial({ color: COL.observe, transparent: true, opacity: 0.26 })
+);
+ringBuf.rotation.x = Math.PI / 2;
+ringBuf.position.y = Y_HOOK - 2.3;
+scene.add(ringBuf);
+dimmable(ringBuf.material, "ringbuf");
+let ringBufHot = 0;
+function ringBufFlash() { ringBufHot = 1; }
+
+// ── the Landlock hull ──────────────────────────────────────────────────────
+//
+// `allow_paths:` is a second boundary, and a different kind: an allowlist,
+// enforced by Landlock rather than eBPF, inherited by every descendant and
+// impossible to undo. Drawn as a dashed hull around userspace. Whether it is
+// ACTIVE comes from `--dry-run`, and the hull is drawn faint and labelled "not
+// in this policy" when it is not — a hull shown as active for a policy without
+// one would be the page lying about the boundary.
+
+const hullBox = new THREE.BoxGeometry(24, 8.6, 24);
+const hullEdges = new THREE.LineSegments(
+  new THREE.EdgesGeometry(hullBox),
+  new THREE.LineDashedMaterial({ color: COL.signal, dashSize: 0.5, gapSize: 0.32, transparent: true, opacity: 0.1 })
+);
+hullEdges.computeLineDistances();
+hullEdges.position.y = Y_USER + 3.1;
+scene.add(hullEdges);
+dimmable(hullEdges.material, "hull");
+const hullFill = new THREE.Mesh(
+  hullBox,
+  new THREE.MeshBasicMaterial({ color: COL.signal, transparent: true, opacity: 0.0, side: THREE.BackSide })
+);
+hullFill.position.y = Y_USER + 3.1;
+scene.add(hullFill);
+dimmable(hullFill.material, "hull");
+let hullActive = false;
+let hullLabel = null;
+function setHull(active, ports) {
+  hullActive = !!active;
+  hullEdges.material.opacity = hullActive ? 0.55 : 0.1;
+  hullFill.material.opacity = hullActive ? 0.035 : 0.0;
+  const d = dimmables.find((x) => x.mat === hullEdges.material); if (d) d.base = hullEdges.material.opacity;
+  const f = dimmables.find((x) => x.mat === hullFill.material); if (f) f.base = hullFill.material.opacity;
+  const text = hullActive
+    ? "LANDLOCK CONTAINMENT · ACTIVE" + (ports ? " · TCP " + ports : "")
+    : "LANDLOCK CONTAINMENT · not in this policy";
+  if (!hullLabel) hullLabel = makeLabel(text, 0, Y_USER + 7.9, 0, "hull");
+  hullLabel.el.textContent = text;
+  hullLabel.el.classList.toggle("off", !hullActive);
+}
 
 // ── userspace towers, one per PROGRAM ──────────────────────────────────────
 //
@@ -106,21 +186,20 @@ const hookRing = disc(6.0, Y_HOOK, COL.signal, 0.42);          // decides
 // with the kernel hidden somewhere behind it. Grouping by `comm` is bounded by
 // how many distinct programs the agent actually runs, which is the thing worth
 // looking at anyway: bash, cat, gcc, node.
-//
-// The live pid count is kept per program and shown on the label, so nothing
-// about the process tree is lost by not drawing each one.
 
 const towerGeo = new THREE.BoxGeometry(1.05, 1, 1.05);
 const towerMat = new THREE.MeshStandardMaterial({
   color: 0x18222F, emissive: COL.wireHot, emissiveIntensity: 0.22,
-  roughness: 0.8, metalness: 0.08,
+  roughness: 0.8, metalness: 0.08, transparent: true, opacity: 1,
 });
 const towerHot = new THREE.MeshStandardMaterial({
   color: 0x241C22, emissive: COL.deny, emissiveIntensity: 0.5,
-  roughness: 0.8, metalness: 0.08,
+  roughness: 0.8, metalness: 0.08, transparent: true, opacity: 1,
 });
+dimmable(towerMat, "towers");
+dimmable(towerHot, "towers");
 
-const progs = new Map();   // comm -> { mesh, x, z, n, denies, pids:Set, label }
+const progs = new Map();   // comm -> { mesh, x, z, n, denies, pids:Set, label, h }
 let progSlot = 0;
 
 function progPos(slot) {
@@ -138,7 +217,7 @@ function pidFor(ev) {
     const mesh = new THREE.Mesh(towerGeo, towerMat);
     mesh.position.set(x, Y_USER, z);
     scene.add(mesh);
-    p = { mesh, x, z, n: 0, denies: 0, pids: new Set(), label: null };
+    p = { mesh, x, z, n: 0, denies: 0, pids: new Set(), label: null, h: 1 };
     progs.set(name, p);
     p.label = makeLabel(name, x, Y_USER, z);
   }
@@ -149,12 +228,11 @@ function pidFor(ev) {
     p.mesh.material = towerHot;
   }
   const h = Math.min(0.7 + Math.log2(p.n + 1) * 0.42, 4.2);
+  p.h = h;
   p.mesh.scale.y = h;
   p.mesh.position.y = Y_USER + h / 2 - 0.5;
   if (p.label) {
-    p.label.el.textContent = p.pids.size > 1
-      ? name + " ×" + p.pids.size
-      : name;
+    p.label.el.textContent = p.pids.size > 1 ? name + " ×" + p.pids.size : name;
     p.label.el.classList.toggle("hot", p.denies > 0);
     p.label.v.y = Y_USER + h + 0.5;
   }
@@ -175,14 +253,14 @@ function buildKeys(keys) {
   keys.forEach((k, i) => {
     const gx = (i % cols) - (cols - 1) / 2;
     const gz = Math.floor(i / cols) - (cols - 1) / 2;
-    const mesh = new THREE.Mesh(
-      new THREE.BoxGeometry(1.7, 0.22, 1.7),
-      new THREE.MeshStandardMaterial({
-        color: 0x1B2A3A, emissive: COL.wireHot, emissiveIntensity: 1.1, roughness: 0.85,
-      })
-    );
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x1B2A3A, emissive: COL.wireHot, emissiveIntensity: 1.1, roughness: 0.85,
+      transparent: true, opacity: 1,
+    });
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.22, 1.7), mat);
     mesh.position.set(gx * 2.0, Y_MAP, gz * 2.0);
     scene.add(mesh);
+    dimmable(mat, "tiles");
     tiles.set(k.key, mesh);
 
     const row = document.createElement("span");
@@ -200,9 +278,6 @@ function buildKeys(keys) {
 
 function fireKey(matched) {
   if (!matched) return;
-  // `matched_key` arrives as `name=.env`, `ino=…`, `dir=…`; the dry-run keys use
-  // the same shape, so a direct hit is the common case and a suffix match covers
-  // the rest rather than inventing a mapping.
   let mesh = tiles.get(matched);
   if (!mesh) {
     for (const [k, m] of tiles) {
@@ -223,19 +298,30 @@ function fireKey(matched) {
 
 const labels = [];
 let labelsOn = true;
-function makeLabel(text, x, y, z) {
+function makeLabel(text, x, y, z, cls) {
   const el = document.createElement("div");
-  el.className = "lbl";
+  el.className = "lbl" + (cls ? " " + cls : "");
   el.textContent = text;
   document.body.appendChild(el);
-  const rec = { el, v: new THREE.Vector3(x, y, z) };
+  const rec = { el, v: new THREE.Vector3(x, y, z), ttl: null };
   labels.push(rec);
   return rec;
 }
+// A label that lives briefly and removes itself — the receipt flying back.
+function flashLabel(text, x, y, z, cls, ttl) {
+  const rec = makeLabel(text, x, y, z, cls);
+  rec.ttl = ttl;
+  return rec;
+}
 
-function placeLabels() {
-  for (const l of labels) {
-    if (!labelsOn) { l.el.style.display = "none"; continue; }
+function placeLabels(dt) {
+  for (let i = labels.length - 1; i >= 0; i--) {
+    const l = labels[i];
+    if (l.ttl != null) {
+      l.ttl -= dt;
+      if (l.ttl <= 0) { l.el.remove(); labels.splice(i, 1); continue; }
+    }
+    if (!labelsOn && !l.el.classList.contains("receipt")) { l.el.style.display = "none"; continue; }
     const p = l.v.clone().project(camera);
     const vis = p.z < 1;
     l.el.style.display = vis ? "block" : "none";
@@ -281,7 +367,7 @@ function spawn(ev) {
   const denied = ev.action === "block";
   const observed = ev.source === "observed";
 
-  if (!free.length) { coalesced += 1; return; }
+  if (!free.length) { coalesced += 1; ringBufFlash(); return; }
   const idx = free.pop();
   const mesh = pool[idx];
   mesh.material = denied ? MAT.deny : (observed ? MAT.observe : MAT.allow);
@@ -289,7 +375,7 @@ function spawn(ev) {
   mesh.position.set(p.x, Y_USER + 0.4, p.z);
 
   live.push({
-    idx, mesh, x: p.x, z: p.z, t: 0, denied,
+    idx, mesh, x: p.x, z: p.z, t: 0, denied, prog: p, receipted: false,
     bottom: denied ? Y_HOOK : Y_MAP - 1.6,
   });
   if (denied) flash(hookRing, COL.deny);
@@ -339,9 +425,10 @@ function renderRow(ev) {
   while (rows.children.length > 14) rows.removeChild(rows.lastChild);
 }
 
+let lastDenied = null;   // the most recent real denial, for the tour's status line
 function onEvent(ev) {
   nEv++;
-  if (ev.action === "block") { nDn++; fireKey(ev.matched_key); } else { nOk++; }
+  if (ev.action === "block") { nDn++; fireKey(ev.matched_key); lastDenied = ev; } else { nOk++; }
   if (ev.source === "kernel") nKn++;
   $("c-ev").textContent = nEv;
   $("c-ok").textContent = nOk;
@@ -351,6 +438,7 @@ function onEvent(ev) {
   addRow(ev);
 }
 
+let policyInfo = null;
 const es = new EventSource("/stream");
 es.onopen = () => { $("dot").classList.add("on"); $("livetxt").textContent = "STREAMING"; };
 es.onerror = () => { $("dot").classList.remove("on"); $("livetxt").textContent = "STREAM CLOSED"; };
@@ -362,9 +450,13 @@ es.onmessage = (m) => {
   else if (d.kind === "meta") {
     $("target").textContent = "enforcing=" + d.meta.enforcing + " · schema v" + d.meta.schema_version;
   } else if (d.kind === "boot") {
+    policyInfo = d.policy || null;
     if (d.policy) {
       buildKeys(d.policy.keys);
       if (d.policy.summary) $("target").textContent = d.policy.summary;
+      setHull(d.policy.contained, d.policy.ports);
+    } else {
+      setHull(false, null);
     }
     (d.notices || []).forEach(notice);
   }
@@ -375,23 +467,211 @@ function notice(text) {
   const t = text.replace(/^wardyn:\s*/, "");
   if (seenNotices.has(t)) return;
   seenNotices.add(t);
+  if (/dropped by a full ring buffer/i.test(t)) ringBufFlash();
   const box = $("notice");
   if (box.textContent === "—") box.textContent = "";
   const p = document.createElement("div");
-  p.textContent = "· " + t;
   if (/WARNING|refus|could not|dropped/i.test(t)) {
     const b = document.createElement("b");
     b.textContent = "· " + t;
-    p.textContent = "";
     p.appendChild(b);
+  } else {
+    p.textContent = "· " + t;
   }
   box.insertBefore(p, box.firstChild);
   while (box.children.length > 14) box.removeChild(box.lastChild);
 }
 
-// ── controls ───────────────────────────────────────────────────────────────
+// ── camera ─────────────────────────────────────────────────────────────────
+//
+// Two regimes. Orbit: the default, a slow turn the viewer can grab. Tour: a
+// scripted flight between keyframes, eased, that the viewer can also grab —
+// dragging during the tour pauses it rather than fighting it.
 
 let spin = true;
+let theta = 0.72, phi = 0.46, dist = 31;
+const camPos = new THREE.Vector3(18, 10, 22);
+const camLook = new THREE.Vector3(0, -2, 0);
+const flight = { on: false, from: null, to: null, t: 0, dur: 2.4 };
+
+function orbitTarget() {
+  return {
+    pos: new THREE.Vector3(
+      Math.cos(theta) * Math.cos(phi) * dist,
+      Math.sin(phi) * dist + 1.5,
+      Math.sin(theta) * Math.cos(phi) * dist
+    ),
+    look: new THREE.Vector3(0, -2.2, 0),
+  };
+}
+function flyTo(pos, look, dur) {
+  flight.on = true;
+  flight.from = { pos: camPos.clone(), look: camLook.clone() };
+  flight.to = { pos: new THREE.Vector3(...pos), look: new THREE.Vector3(...look) };
+  flight.t = 0;
+  flight.dur = dur || 2.4;
+}
+const ease = (u) => (u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2);
+function orbitFromCamera() {
+  theta = Math.atan2(camPos.z, camPos.x);
+  dist = Math.max(11, Math.min(48, camPos.length()));
+  phi = Math.max(-0.15, Math.min(1.32, Math.asin(Math.max(-1, Math.min(1, (camPos.y - 1.5) / dist)))));
+}
+
+// ── the tour ───────────────────────────────────────────────────────────────
+//
+// Every chapter names a camera keyframe, the groups to keep in focus, and a
+// caption. The `status` hook lets a chapter report something live — the last
+// real denial, whether containment is actually on — so the card never states
+// more than the run has shown.
+
+const TOUR = [
+  {
+    title: "An agent with a shell",
+    body: "Every tower is a program the agent has run; the count on it is live pids. Wardyn launched the whole tree <em>dropped to a normal user</em>, with <code>NO_NEW_PRIVS</code> set — it cannot get root back, not through <code>sudo</code>, not through a setuid binary.",
+    cam: [[0, 17, 27], [0, 4.5, 0]], focus: ["towers"], hold: 9,
+    status: () => `${progs.size} program(s) seen so far · ${nEv} event(s)`,
+  },
+  {
+    title: "The boundary",
+    body: "Every <code>open</code>, <code>exec</code> and <code>connect</code> crosses this plane. Past it the agent has no say: it cannot see wardyn, unload it, or race it. Wardyn's programs are attached to the kernel's <em>own</em> hooks — not wrapped around the process from outside.",
+    cam: [[23, 2.2, 7], [0, 0.4, 0]], focus: ["boundary", "towers"], hold: 9,
+  },
+  {
+    title: "Seeing is not deciding",
+    body: "The blue ring is the tracepoint: <code>sys_enter_openat</code>, <code>execve</code>, <code>connect</code>. It reports every call — the allow rows too — so the feed shows what the agent actually did, not only what went wrong. It has <em>no verdict to give</em>, and wardyn never lets it pretend otherwise.",
+    cam: [[9.5, 0.2, 12], [0, Y_HOOK + 1.7, 0]], focus: ["trace"], hold: 10,
+    status: () => `${nEv - nKn} observed row(s) · the blue particles`,
+  },
+  {
+    title: "The verdict, inside the syscall",
+    body: "The amber ring is the LSM hook — <code>file_open</code>, <code>bprm_check_security</code>, <code>inode_unlink</code> — and <code>cgroup/connect4</code> for egress. The kernel calls it <em>while deciding</em> the operation; what it returns is the answer. <code>-EPERM</code> before the descriptor exists, before a packet is built.",
+    cam: [[7.5, -3.2, 9], [0, Y_HOOK, 0]], focus: ["hook"], hold: 10,
+    status: () => `${nKn} verdict(s) reported by the kernel itself so far`,
+  },
+  {
+    title: "Identity, not names",
+    body: "These tiles are the keys sitting in the BPF maps <em>right now</em>, read from <code>--dry-run</code>. A <code>path:</code> rule keys on <code>(dev, ino)</code> — the object, not what it is called. Rename the file, hard-link it into the project, move the whole directory: the inode is unchanged, and so is the verdict.",
+    cam: [[7, -5.6, 9.5], [0, Y_MAP + 0.3, 0]], focus: ["tiles"], hold: 10,
+    hud: ["card-keys"],
+    status: () => policyInfo && policyInfo.keys ? `${policyInfo.keys.length} key(s) loaded — ${policyInfo.keys.filter(k => k.key.startsWith("ino=")).length} by inode` : "",
+  },
+  {
+    title: "A denial",
+    body: "Watch for red. A call falls, reaches the amber ring, and is <em>turned around</em> — thrown back to the tower it came from. Nothing to unwind, nothing to kill: the open simply never happened. The tower turns red too, so a program that has been refused stays marked.",
+    cam: [[13, 3.5, 13], [0, -0.5, 0]], focus: ["hook", "towers"], hold: 11,
+    status: () => lastDenied
+      ? `last real denial: <b>${lastDenied.comm}</b> → ${lastDenied.detail}${lastDenied.matched_key ? " · key " + lastDenied.matched_key : ""}`
+      : "<b class=no>no denial yet in this run — the policy has not been crossed</b>",
+  },
+  {
+    title: "The agent is told why",
+    body: "A bare <code>EPERM</code> teaches an agent nothing, so it retries, or reaches for <code>sudo</code>, or codes around the block. Wardyn hands it a <em>receipt</em> — <code>WARDYN_DENIALS</code> in its environment — naming the rule that fired, so it reports to its operator instead of flailing.",
+    cam: [[10, 9.5, 14.5], [0, 6.2, 0]], focus: ["towers"], hold: 9,
+    status: () => `${nDn} denial(s) receipted so far`,
+  },
+  {
+    title: "What can be outrun, and what cannot",
+    body: "The verdict is decided in the syscall. The <em>report</em> travels this ring to userspace, and a ring can fill. This page has a particle pool that can fill too. Both count what they dropped instead of hiding it — a clean log that means nothing is the real failure.",
+    cam: [[14.5, -5.5, 10.5], [0, -6.4, 0]], focus: ["ringbuf", "hook"], hold: 10,
+    hud: ["co-wrap", "card-notice"],
+    status: () => coalesced ? `this page coalesced <b>${coalesced}</b> event(s) it could not draw` : "nothing dropped yet — the run is keeping up",
+  },
+  {
+    title: "Containment",
+    body: "<code>allow_paths:</code> draws a second boundary, of a different kind. Landlock — not eBPF — confines the agent to the hierarchies the policy lists and nothing else: unprivileged, inherited by every descendant, impossible to undo. <code>allow_ports:</code> does the same for TCP.",
+    cam: [[21, 13, 21], [0, 5.5, 0]], focus: ["hull", "towers"], hold: 10,
+    status: () => policyInfo && policyInfo.contained
+      ? `<b>active</b> in this policy` + (policyInfo.ports ? ` · TCP confined to ${policyInfo.ports}` : "")
+      : "<b class=no>not in this policy</b> — the hull is drawn faint, because it is not there",
+  },
+  {
+    title: "Measured, not claimed",
+    body: "Eight bypass attempts stopped, out of eight. Fourteen attacks on the warden itself refused, out of fifteen — the one that worked changed nothing. About fifteen microseconds per open. Thirteen thousand events dropped under forty thousand opens, every one of them <em>counted</em>, while the boundary held. The recordings are in <code>docs/stress/</code>.",
+    cam: [[18, 10, 22], [0, -2.2, 0]], focus: null, hold: 12,
+  },
+];
+
+const tour = { on: false, i: -1, t: 0, paused: false };
+const tourEl = $("tour");
+
+function tourGo(i) {
+  if (i < 0 || i >= TOUR.length) { tourEnd(); return; }
+  tour.on = true; tour.i = i; tour.t = 0; tour.paused = false;
+  const c = TOUR[i];
+  flyTo(c.cam[0], c.cam[1], 2.4);
+  focus = c.focus;
+  spin = false; $("b-spin").setAttribute("aria-pressed", "false");
+
+  $("tour-k").textContent = `CHAPTER ${i + 1} / ${TOUR.length}`;
+  $("tour-title").textContent = c.title;
+  $("tour-body").innerHTML = c.body;
+  $("tour-status").innerHTML = ""; statusLast = ""; statusClock = 1;
+  $("t-pause").textContent = "❙❙ pause";
+  tourEl.classList.add("on");
+
+  document.querySelectorAll(".st").forEach((el) => {
+    const g = el.dataset.g;
+    el.classList.toggle("on", !!(c.focus && c.focus.includes(g)));
+    el.classList.toggle("off", !!(c.focus && !c.focus.includes(g)));
+  });
+  document.querySelectorAll(".card, .ctr").forEach((el) => el.classList.remove("hl"));
+  (c.hud || []).forEach((id) => { const el = $(id); if (el) el.classList.add("hl"); });
+
+  const dots = $("tour-dots");
+  dots.innerHTML = "";
+  TOUR.forEach((_, k) => {
+    const d = document.createElement("i");
+    if (k < i) d.className = "done"; else if (k === i) d.className = "now";
+    dots.appendChild(d);
+  });
+}
+
+function tourEnd() {
+  tour.on = false; tour.i = -1;
+  focus = null;
+  tourEl.classList.remove("on");
+  document.querySelectorAll(".st").forEach((el) => el.classList.remove("on", "off"));
+  document.querySelectorAll(".card, .ctr").forEach((el) => el.classList.remove("hl"));
+  flight.on = false;
+  spin = true; $("b-spin").setAttribute("aria-pressed", "true");
+  orbitFromCamera();   // pick the orbit up from here rather than snapping
+}
+
+let statusClock = 0, statusLast = "";
+function tourTick(dt) {
+  if (!tour.on) return;
+  const c = TOUR[tour.i];
+  statusClock += dt;
+  if (c.status && statusClock > 0.25) {
+    statusClock = 0;
+    const txt = c.status() || "";
+    if (txt !== statusLast) { statusLast = txt; $("tour-status").innerHTML = txt; }
+  }
+  if (tour.paused) return;
+  tour.t += dt;
+  $("tour-bar").style.width = Math.min(100, (tour.t / c.hold) * 100) + "%";
+  if (tour.t >= c.hold) tourGo(tour.i + 1);
+}
+
+$("b-tour").onclick = () => tourGo(0);
+$("t-next").onclick = () => tourGo(tour.i + 1);
+$("t-prev").onclick = () => tourGo(Math.max(0, tour.i - 1));
+$("t-exit").onclick = tourEnd;
+$("t-pause").onclick = () => {
+  tour.paused = !tour.paused;
+  $("t-pause").textContent = tour.paused ? "▶ resume" : "❙❙ pause";
+};
+addEventListener("keydown", (e) => {
+  if (!tour.on) { if (e.key === "t" || e.key === "T") tourGo(0); return; }
+  if (e.key === "ArrowRight") tourGo(tour.i + 1);
+  else if (e.key === "ArrowLeft") tourGo(Math.max(0, tour.i - 1));
+  else if (e.key === " ") { e.preventDefault(); $("t-pause").click(); }
+  else if (e.key === "Escape") tourEnd();
+});
+
+// ── controls ───────────────────────────────────────────────────────────────
+
 $("b-spin").onclick = (e) => {
   spin = !spin;
   e.currentTarget.setAttribute("aria-pressed", String(spin));
@@ -403,12 +683,14 @@ $("b-labels").onclick = (e) => {
 $("b-clear").onclick = () => { rows.innerHTML = ""; };
 
 // Drag to orbit, wheel to dolly — enough to inspect the scene without pulling in
-// a controls module.
-let drag = null, theta = 0.72, phi = 0.46, dist = 31;
+// a controls module. Grabbing the scene mid-tour pauses the tour.
+let drag = null;
 renderer.domElement.addEventListener("pointerdown", (e) => {
   drag = { x: e.clientX, y: e.clientY };
+  if (tour.on) { tour.paused = true; $("t-pause").textContent = "▶ resume"; flight.on = false; }
   spin = false;
   $("b-spin").setAttribute("aria-pressed", "false");
+  orbitFromCamera();   // continue from the current camera so a grab does not jump
 });
 addEventListener("pointerup", () => { drag = null; });
 addEventListener("pointermove", (e) => {
@@ -419,6 +701,7 @@ addEventListener("pointermove", (e) => {
 });
 renderer.domElement.addEventListener("wheel", (e) => {
   e.preventDefault();
+  if (flight.on) { flight.on = false; orbitFromCamera(); }
   dist = Math.max(11, Math.min(48, dist + e.deltaY * 0.02));
 }, { passive: false });
 
@@ -436,13 +719,28 @@ function tick() {
   requestAnimationFrame(tick);
   const dt = Math.min(clock.getDelta(), 0.05);
 
-  if (spin) theta += dt * 0.085;
-  camera.position.set(
-    Math.cos(theta) * Math.cos(phi) * dist,
-    Math.sin(phi) * dist + 1.5,
-    Math.sin(theta) * Math.cos(phi) * dist
-  );
-  camera.lookAt(0, -2.2, 0);
+  // camera
+  if (flight.on) {
+    flight.t += dt;
+    const u = ease(Math.min(1, flight.t / flight.dur));
+    camPos.lerpVectors(flight.from.pos, flight.to.pos, u);
+    camLook.lerpVectors(flight.from.look, flight.to.look, u);
+    if (flight.t >= flight.dur) flight.on = false;
+  } else if (!tour.on || drag) {
+    if (spin) theta += dt * 0.085;
+    const o = orbitTarget();
+    const k = 1 - Math.exp(-dt * 3.2);
+    camPos.lerp(o.pos, k);
+    camLook.lerp(o.look, k);
+  }
+  camera.position.copy(camPos);
+  camera.lookAt(camLook);
+
+  // focus dimming
+  for (const d of dimmables) {
+    const target = inFocus(d.group) ? d.base : d.base * 0.16;
+    d.mat[d.prop] += (target - d.mat[d.prop]) * Math.min(1, dt * 4);
+  }
 
   // particles
   for (let i = live.length - 1; i >= 0; i--) {
@@ -452,7 +750,6 @@ function tick() {
     if (!p.denied) {
       y = Y_USER + 0.4 - p.t * 9.0;
       if (y < p.bottom) { release(i); continue; }
-      p.mesh.material.opacity = 0.95;
     } else {
       // down to the hook, then thrown back — the turn IS the denial
       const fall = (Y_USER + 0.4 - Y_HOOK) / 9.0;
@@ -461,6 +758,11 @@ function tick() {
       } else {
         const u = p.t - fall;
         y = Y_HOOK + u * 7.0;
+        // the moment it re-enters userspace, the receipt lands on its tower
+        if (!p.receipted && y >= Y_USER) {
+          p.receipted = true;
+          flashLabel("-EPERM · receipt", p.x, Y_USER + p.prog.h + 1.2, p.z, "receipt", 1.7);
+        }
         if (y > Y_USER + 3) { release(i); continue; }
       }
     }
@@ -471,12 +773,19 @@ function tick() {
   for (let i = ringPulse.length - 1; i >= 0; i--) {
     const r = ringPulse[i];
     r.t += dt;
-    r.ring.material.opacity = r.base + Math.max(0, 0.5 - r.t * 1.4);
+    const base = r.ring.userData.dim || (r.ring.userData.dim = dimmables.find((x) => x.mat === r.ring.material));
+    const rest = base ? (inFocus(base.group) ? base.base : base.base * 0.16) : r.base;
+    r.ring.material.opacity = rest + Math.max(0, 0.5 - r.t * 1.4);
     if (r.t > 0.45) {
-      r.ring.material.opacity = r.base;
       r.ring.material.color.setHex(r.ring === hookRing ? COL.signal : COL.observe);
       ringPulse.splice(i, 1);
     }
+  }
+
+  // the ring buffer cools from red back to blue
+  if (ringBufHot > 0) {
+    ringBufHot = Math.max(0, ringBufHot - dt * 0.9);
+    ringBuf.material.color.setHex(ringBufHot > 0.02 ? COL.deny : COL.observe);
   }
 
   // fired map tiles cool off
@@ -492,7 +801,13 @@ function tick() {
     $("c-co").textContent = coalesced;
     $("co-wrap").style.display = "";
   }
-  placeLabels();
+  tourTick(dt);
+  placeLabels(dt);
   renderer.render(scene, camera);
 }
 tick();
+
+// The tour starts itself once, a beat after the stream has had a chance to
+// populate the scene — a tour of an empty world explains nothing. `T` or the
+// button replays it.
+setTimeout(() => { if (!tour.on) tourGo(0); }, 2600);

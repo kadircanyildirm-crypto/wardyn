@@ -12,6 +12,7 @@
     --panel:   #0C121B;
     --panel-2: #101823;
     --wire:    #1E2A38;
+    --wireHot: #33465C;
     --ink:     #C3CFDD;
     --dim:     #6D7E92;
     --faint:   #47576B;
@@ -19,7 +20,6 @@
     --deny:    #F0575D;
     --allow:   #47D18E;
     --observe: #5AB0E8;
-    --wireHot: #33465C;
     --mono: "IBM Plex Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
   }
   * { box-sizing: border-box; }
@@ -30,6 +30,12 @@
   }
   #scene { position: fixed; inset: 0; }
   canvas { display: block; }
+
+  /* a soft vignette so the HUD reads over the scene's brighter corners */
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(5,7,11,.72) 100%);
+  }
 
   .hud { position: fixed; pointer-events: none; }
   .hud > * { pointer-events: auto; }
@@ -50,19 +56,34 @@
   #dot.on { background: var(--allow); box-shadow: 0 0 10px var(--allow); }
 
   /* top-right: counters */
-  #counters { top: 0; right: 0; padding: 14px 16px; display: flex; gap: 1px; background: var(--wire); }
-  .ctr { background: var(--panel); padding: 0; }
-  #counters { background: none; gap: 10px; }
-  .ctr { border: 1px solid var(--wire); background: var(--panel); padding: 8px 13px; min-width: 78px; }
+  #counters { top: 0; right: 0; padding: 14px 16px; display: flex; gap: 10px; }
+  .ctr {
+    border: 1px solid var(--wire); background: var(--panel); padding: 8px 13px; min-width: 78px;
+    transition: border-color .4s, box-shadow .4s;
+  }
   .ctr .k { display: block; font-size: 9px; letter-spacing: 0.14em; color: var(--faint); }
   .ctr .v { display: block; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
   .ctr.deny .v { color: var(--deny); }
   .ctr.allow .v { color: var(--allow); }
 
+  /* the four strata, named once and left alone */
+  #strata {
+    top: 40%; left: 0; transform: translateY(-50%);
+    padding: 0 16px; display: flex; flex-direction: column; gap: 9px;
+    max-width: 250px; transition: opacity .5s;
+  }
+  .st { display: grid; grid-template-columns: 9px 1fr; gap: 9px; align-items: start; transition: opacity .4s; }
+  .st i { width: 9px; height: 9px; margin-top: 3px; border-radius: 1px; opacity: .9; }
+  .st b { font-size: 9.5px; letter-spacing: 0.14em; color: var(--dim); font-weight: 600; display: block; }
+  .st span { grid-column: 2; font-size: 10px; color: var(--faint); line-height: 1.35; display: block; margin-top: 1px; }
+  .st.on b { color: var(--ink); }
+  .st.off { opacity: .35; }
+
   /* bottom-left: the live feed */
   #feed {
     bottom: 0; left: 0; width: min(560px, 46vw);
     padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 6px;
+    transition: opacity .5s;
   }
   #feed h2 { margin: 0; font-size: 9px; letter-spacing: 0.16em; color: var(--faint); font-weight: 600; }
   #rows { display: flex; flex-direction: column; gap: 1px; max-height: 26vh; overflow: hidden; }
@@ -87,9 +108,14 @@
   #side {
     bottom: 0; right: 0; padding: 14px 16px 16px;
     width: min(330px, 32vw); display: flex; flex-direction: column; gap: 10px;
+    transition: opacity .5s;
   }
-  .card { border: 1px solid var(--wire); background: var(--panel); padding: 11px 12px; }
+  .card {
+    border: 1px solid var(--wire); background: var(--panel); padding: 11px 12px;
+    transition: border-color .4s, box-shadow .4s;
+  }
   .card h2 { margin: 0 0 7px; font-size: 9px; letter-spacing: 0.16em; color: var(--faint); font-weight: 600; }
+  .card.hl, .ctr.hl { border-color: var(--signal); box-shadow: 0 0 0 1px var(--signal), 0 0 24px -6px var(--signal); }
   #keys { display: flex; flex-direction: column; gap: 2px; max-height: 22vh; overflow-y: auto; }
   .key { font-size: 10.5px; color: var(--dim); display: grid; grid-template-columns: 2.6em 1fr; gap: 7px; }
   .key .ax { color: var(--faint); }
@@ -108,17 +134,48 @@
   button:hover { border-color: var(--signal); color: var(--signal); }
   button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
   button[aria-pressed="true"] { color: var(--signal); border-color: var(--signal); }
+  button.primary { background: var(--signal); border-color: var(--signal); color: var(--void); font-weight: 600; }
+  button.primary:hover { background: #ffc978; border-color: #ffc978; color: var(--void); }
 
-  /* the four strata, named once and left alone */
-  #strata {
-    top: 40%; left: 0; transform: translateY(-50%);
-    padding: 0 16px; display: flex; flex-direction: column; gap: 9px;
-    max-width: 250px;
+  /* the tour — one card, bottom centre, above everything */
+  #tour {
+    left: 50%; bottom: 26px; transform: translateX(-50%);
+    width: min(640px, 80vw); z-index: 5;
+    opacity: 0; transition: opacity .45s, transform .45s;
+    pointer-events: none;
   }
-  .st { display: grid; grid-template-columns: 9px 1fr; gap: 9px; align-items: start; }
-  .st i { width: 9px; height: 9px; margin-top: 3px; border-radius: 1px; opacity: .9; }
-  .st b { font-size: 9.5px; letter-spacing: 0.14em; color: var(--dim); font-weight: 600; display: block; }
-  .st span { grid-column: 2; font-size: 10px; color: var(--faint); line-height: 1.35; display: block; margin-top: 1px; }
+  #tour.on { opacity: 1; pointer-events: auto; }
+  .tour-card {
+    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    border: 1px solid var(--wireHot);
+    border-left: 3px solid var(--signal);
+    padding: 16px 20px 14px;
+    backdrop-filter: blur(6px);
+    box-shadow: 0 18px 48px -18px rgba(0,0,0,.9);
+  }
+  .tour-k {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 9.5px; letter-spacing: 0.16em; color: var(--signal); font-weight: 600;
+  }
+  .tour-k .kbd { color: var(--faint); letter-spacing: 0.08em; font-weight: 400; }
+  .tour-card h3 {
+    margin: 6px 0 6px; font-size: 16px; font-weight: 700; letter-spacing: -0.015em;
+    color: var(--ink); line-height: 1.25;
+  }
+  .tour-card p { margin: 0; font-size: 12.5px; line-height: 1.55; color: var(--dim); }
+  .tour-card p code { color: var(--ink); background: color-mix(in srgb, var(--wire) 60%, transparent); padding: 0 4px; }
+  .tour-card p em { color: var(--signal); font-style: normal; }
+  .tour-status { margin-top: 8px; font-size: 10.5px; color: var(--faint); min-height: 1.2em; }
+  .tour-status b { color: var(--allow); font-weight: 600; }
+  .tour-status b.no { color: var(--faint); }
+  .tour-bar { height: 2px; background: var(--wire); margin-top: 12px; position: relative; overflow: hidden; }
+  .tour-bar i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--signal); }
+  .tour-nav { display: flex; gap: 6px; margin-top: 10px; align-items: center; }
+  .tour-nav .sp { flex: 1; }
+  .tour-dots { display: flex; gap: 4px; }
+  .tour-dots i { width: 14px; height: 2px; background: var(--wire); display: block; }
+  .tour-dots i.done { background: var(--signal); opacity: .5; }
+  .tour-dots i.now { background: var(--signal); }
 
   /* the world labels drawn over the canvas */
   .lbl {
@@ -126,14 +183,29 @@
     color: var(--dim); pointer-events: none; text-transform: uppercase;
     transform: translate(-50%, -100%); white-space: nowrap;
     text-shadow: 0 0 6px var(--void), 0 0 6px var(--void);
+    transition: opacity .3s;
   }
   .lbl.hot { color: var(--deny); }
+  .lbl.receipt {
+    color: var(--deny); text-transform: none; letter-spacing: 0.04em; font-size: 10.5px;
+    animation: receipt 1.6s ease-out forwards;
+  }
+  @keyframes receipt {
+    0%   { opacity: 0; transform: translate(-50%, -100%) translateY(6px); }
+    15%  { opacity: 1; }
+    100% { opacity: 0; transform: translate(-50%, -100%) translateY(-26px); }
+  }
+  .lbl.hull { color: var(--signal); letter-spacing: 0.14em; }
+  .lbl.hull.off { color: var(--faint); }
 
-  @media (prefers-reduced-motion: reduce) { .row { animation: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    .row, .lbl.receipt { animation: none; }
+  }
 </style>
 </head>
 <body>
   <div id="scene"></div>
+  <div id="vignette"></div>
 
   <div class="hud" id="brand">
     <div class="t">wardyn · <b>kernel view</b></div>
@@ -150,11 +222,11 @@
   </div>
 
   <div class="hud" id="strata">
-    <div class="st"><i style="background:var(--dim)"></i><b>USERSPACE</b><span>one tower per program, grown by its own traffic</span></div>
-    <div class="st"><i style="background:var(--wireHot)"></i><b>SYSCALL BOUNDARY</b><span>past here the agent has no say</span></div>
-    <div class="st"><i style="background:var(--observe)"></i><b>TRACEPOINT</b><span>observes — cannot deny</span></div>
-    <div class="st"><i style="background:var(--signal)"></i><b>LSM / CGROUP HOOK</b><span>returns the verdict, inside the syscall</span></div>
-    <div class="st"><i style="background:var(--deny)"></i><b>BLOCK KEYS</b><span>lights up when its key is the one that fired</span></div>
+    <div class="st" data-g="towers"><i style="background:var(--dim)"></i><b>USERSPACE</b><span>one tower per program, grown by its own traffic</span></div>
+    <div class="st" data-g="boundary"><i style="background:var(--wireHot)"></i><b>SYSCALL BOUNDARY</b><span>past here the agent has no say</span></div>
+    <div class="st" data-g="trace"><i style="background:var(--observe)"></i><b>TRACEPOINT</b><span>observes — cannot deny</span></div>
+    <div class="st" data-g="hook"><i style="background:var(--signal)"></i><b>LSM / CGROUP HOOK</b><span>returns the verdict, inside the syscall</span></div>
+    <div class="st" data-g="tiles"><i style="background:var(--deny)"></i><b>BLOCK KEYS</b><span>lights up when its key is the one that fired</span></div>
   </div>
 
   <div class="hud" id="feed">
@@ -163,18 +235,37 @@
   </div>
 
   <div class="hud" id="side">
-    <div class="card">
+    <div class="card" id="card-keys">
       <h2>KERNEL BLOCK KEYS</h2>
       <div id="keys"><span class="key"><span class="ax">—</span><span>reading policy…</span></span></div>
     </div>
-    <div class="card">
+    <div class="card" id="card-notice">
       <h2>STARTUP NOTICES</h2>
       <div id="notice">—</div>
     </div>
     <div id="ctrls">
+      <button id="b-tour" class="primary">▶ tour</button>
       <button id="b-spin" aria-pressed="true">auto-orbit</button>
       <button id="b-labels" aria-pressed="true">labels</button>
       <button id="b-clear">clear feed</button>
+    </div>
+  </div>
+
+  <div class="hud" id="tour" aria-live="polite">
+    <div class="tour-card">
+      <div class="tour-k"><span id="tour-k">CHAPTER 1 / 10</span><span class="kbd">← → step · space pause · esc exit</span></div>
+      <h3 id="tour-title"></h3>
+      <p id="tour-body"></p>
+      <div class="tour-status" id="tour-status"></div>
+      <div class="tour-bar"><i id="tour-bar"></i></div>
+      <div class="tour-nav">
+        <button id="t-prev">◀ prev</button>
+        <button id="t-pause">❙❙ pause</button>
+        <button id="t-next">next ▶</button>
+        <span class="sp"></span>
+        <div class="tour-dots" id="tour-dots"></div>
+        <button id="t-exit">✕</button>
+      </div>
     </div>
   </div>
 
