@@ -6,3 +6,6 @@
 *.o
 typescript
 *.jsonl
+
+# the viz server's bytecode cache
+viz/__pycache__/
