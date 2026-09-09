@@ -86,3 +86,25 @@ on the README; if it's over, shrink it losslessly:
 ```bash
 gifsicle -O3 --colors 128 docs/wardyn-demo.gif -o docs/wardyn-demo.gif
 ```
+
+## The explainer GIF
+
+`docs/wardyn-inside-the-syscall.gif` is not a terminal recording, and not a
+screen recording either. `scripts/record-explainer.js` opens
+`docs/inside-the-syscall.html` in a headless Chrome with a **virtual clock**:
+`performance.now`, `setTimeout`, `requestAnimationFrame` and every CSS
+animation advance only when the script says, exactly 50 ms at a time, and one
+screenshot is taken per step. Screen capture of a browser gives ten-ish real
+frames a second whatever it claims, plus encoder noise on every frame; this
+gives a true 20 fps and byte-identical still regions, which is why the file is
+a quarter of a megabyte. Needs Google Chrome and ffmpeg on `PATH`, then:
+
+```bash
+npm i --no-save --no-package-lock playwright gifsicle
+node scripts/record-explainer.js docs/inside-the-syscall.html docs/wardyn-inside-the-syscall.gif
+```
+
+The frame is measured from the page (transport row to the bottom of the
+diagram), so a layout change does not silently crop a box; re-record whenever
+§ 1 of the page changes. Any of the page's other traces can be recorded by
+naming it as a third argument (`net`, `landlock`, `load`, …).
