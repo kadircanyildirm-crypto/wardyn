@@ -9,3 +9,4 @@ typescript
 
 # the viz server's bytecode cache
 viz/__pycache__/
+node_modules/

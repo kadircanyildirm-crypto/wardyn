@@ -414,6 +414,18 @@ the run only.
 
 ## How it works
 
+<p align="center"><img src="docs/wardyn-inside-the-syscall.gif" width="820"
+  alt="One openat() followed from the agent into the kernel: tracepoint, WATCHED map, BPF-LSM file_open, -EPERM, and the receipt coming back up"></p>
+
+<p align="center"><sub><b>One syscall, followed down.</b> The agent asks for
+<code>~/.ssh/id_ed25519</code>. The pulse is that single <code>openat()</code>: past the tracepoint
+that can only watch, through the <code>WATCHED</code> check, into <code>lsm/file_open</code>, where
+<code>BLOCK_INODES</code> hits and the call returns <code>-EPERM</code> before a descriptor exists —
+then the receipt goes back up to the agent. It is one of eleven traces in
+<a href="docs/inside-the-syscall.html">docs/inside-the-syscall.html</a>, a self-contained page that
+also plays the startup order, the rule→kernel-key compiler and the limits. Save the file and open
+it in a browser; every box in the diagram is clickable.</sub></p>
+
 ```
    wardyn run -- <agent>
           │  spawn + watch (WATCHED map, sched_process_fork follows the subtree)

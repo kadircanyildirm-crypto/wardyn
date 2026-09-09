@@ -86,3 +86,20 @@ on the README; if it's over, shrink it losslessly:
 ```bash
 gifsicle -O3 --colors 128 docs/wardyn-demo.gif -o docs/wardyn-demo.gif
 ```
+
+## The explainer GIF
+
+`docs/wardyn-inside-the-syscall.gif` is not a terminal recording. It is
+`docs/inside-the-syscall.html` playing its default trace in a headless Chrome,
+captured by `scripts/record-explainer.js` (Playwright → webm → ffmpeg →
+gifsicle). Needs Google Chrome and ffmpeg on `PATH`, then:
+
+```bash
+npm i --no-save --no-package-lock playwright gifsicle
+node scripts/record-explainer.js docs/inside-the-syscall.html docs/wardyn-inside-the-syscall.gif
+```
+
+The frame is measured from the page (transport row to the bottom of the
+diagram), so a layout change does not silently crop a box; re-record whenever
+§ 1 of the page changes. Any of the page's other traces can be recorded by
+naming it as a third argument (`net`, `landlock`, `load`, …).
