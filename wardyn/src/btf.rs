@@ -48,6 +48,17 @@ pub struct IdentityOffsets {
     pub dentry_inode: u32,
 }
 
+/// The offsets needed to read a thread group's live count at exit, so a leader
+/// that exits before its workers does not unwatch a still-running process.
+#[derive(Debug, Clone, Copy)]
+pub struct LifecycleOffsets {
+    /// `offsetof(task_struct, signal)`.
+    pub task_signal: u32,
+    /// `offsetof(signal_struct, live)` — an `atomic_t`, i.e. an `int` at that
+    /// offset, so it is read as a `u32`.
+    pub signal_live: u32,
+}
+
 /// Everything resolved from the running kernel's BTF in one pass.
 #[derive(Debug, Clone, Copy)]
 pub struct KernelOffsets {
@@ -56,6 +67,9 @@ pub struct KernelOffsets {
     /// matching still works; identity rules are reported as unavailable rather
     /// than quietly enforcing nothing.
     pub identity: Option<IdentityOffsets>,
+    /// `None` when the kernel's BTF did not yield `task_struct.signal` /
+    /// `signal_struct.live`. Exit eviction then keeps its legacy behaviour.
+    pub lifecycle: Option<LifecycleOffsets>,
 }
 
 /// Resolve the kernel struct offsets from `/sys/kernel/btf/vmlinux`.
@@ -127,7 +141,24 @@ pub fn resolve_offsets() -> Result<KernelOffsets, String> {
         .all(|&v| v < 8192)
     });
 
-    Ok(KernelOffsets { lsm, identity })
+    // Lifecycle is optional too. `signal_struct.live` sits well past 0 in every
+    // layout, and `task_struct.signal` is a pointer field far from the start, so
+    // both are required to be non-zero and bounded before they are trusted.
+    let lifecycle = (|| {
+        Some(LifecycleOffsets {
+            task_signal: btf.member_offset("task_struct", "signal")?,
+            signal_live: btf.member_offset("signal_struct", "live")?,
+        })
+    })()
+    .filter(|l| {
+        l.task_signal != 0 && l.task_signal < 65536 && l.signal_live != 0 && l.signal_live < 8192
+    });
+
+    Ok(KernelOffsets {
+        lsm,
+        identity,
+        lifecycle,
+    })
 }
 
 const BTF_MAGIC: u16 = 0xeb9f;
