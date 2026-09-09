@@ -211,7 +211,8 @@ button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
 }
 .step-no { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--signal); letter-spacing: 0.1em; font-variant-numeric: tabular-nums; }
 .step-title { font-family: var(--mono); font-size: 15px; font-weight: 600; margin: 5px 0 8px; color: var(--ink); line-height: 1.3; }
-.step-body { margin: 0; font-size: 14px; color: var(--ink-dim); min-height: 5.6em; }
+/* tall enough for the longest step of any trace, so the panels below never jump */
+.step-body { margin: 0; font-size: 14px; color: var(--ink-dim); min-height: 7.75em; }
 .step-body code { font-size: .92em; color: var(--ink); background: color-mix(in srgb, var(--wire) 34%, transparent); padding: 1px 4px; }
 .maps { display: flex; flex-direction: column; gap: 3px; }
 .map-row {

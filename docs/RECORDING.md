@@ -89,10 +89,15 @@ gifsicle -O3 --colors 128 docs/wardyn-demo.gif -o docs/wardyn-demo.gif
 
 ## The explainer GIF
 
-`docs/wardyn-inside-the-syscall.gif` is not a terminal recording. It is
-`docs/inside-the-syscall.html` playing its default trace in a headless Chrome,
-captured by `scripts/record-explainer.js` (Playwright → webm → ffmpeg →
-gifsicle). Needs Google Chrome and ffmpeg on `PATH`, then:
+`docs/wardyn-inside-the-syscall.gif` is not a terminal recording, and not a
+screen recording either. `scripts/record-explainer.js` opens
+`docs/inside-the-syscall.html` in a headless Chrome with a **virtual clock**:
+`performance.now`, `setTimeout`, `requestAnimationFrame` and every CSS
+animation advance only when the script says, exactly 50 ms at a time, and one
+screenshot is taken per step. Screen capture of a browser gives ten-ish real
+frames a second whatever it claims, plus encoder noise on every frame; this
+gives a true 20 fps and byte-identical still regions, which is why the file is
+a quarter of a megabyte. Needs Google Chrome and ffmpeg on `PATH`, then:
 
 ```bash
 npm i --no-save --no-package-lock playwright gifsicle
