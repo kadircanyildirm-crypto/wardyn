@@ -53,11 +53,11 @@ For the process subtree you launch (`wardyn run -- <cmd>`, followed across `fork
 
 | Axis | Observe | Enforce (`--enforce`) | eBPF hook |
 |---|---|---|---|
-| **exec** — programs run | ✅ path + comm | ⛔ deny blocked binaries, by name **or identity** | `tracepoint/execve` + LSM `bprm_check_security` |
-| **file** — files opened | ✅ path + access | ⛔ deny secret reads (`.env`, `.ssh/*`), by name **or identity**, and per read/write | `tracepoint/openat` + LSM `file_open` |
+| **exec** — programs run | ✅ path + comm | ⛔ deny blocked binaries, by name **or identity** | `tracepoint/execve·execveat` + LSM `bprm_check_security` |
+| **file** — files opened | ✅ path + access | ⛔ deny secret reads (`.env`, `.ssh/*`), by name **or identity**, and per read/write | `tracepoint/openat·openat2` + LSM `file_open` |
 | **filesystem containment** | — | ⛔ the agent reaches only `allow_paths:`, nothing else | Landlock (no privilege needed) |
-| **file** — files created or deleted | ⛔ only when refused (no tracepoint) | ⛔ deny `rm`, `rmdir`, `mv` and file creation, by name **or identity** | LSM `inode_unlink` / `inode_rmdir` / `inode_rename` / `inode_create` / `inode_mkdir` |
-| **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs (TCP + UDP, IPv4/IPv6) | `tracepoint/connect` + `cgroup/connect4·6` + `sendmsg4·6` |
+| **file** — names created or removed | ⛔ only when refused (no tracepoint) | ⛔ deny `rm`, `rmdir`, `mv`, `ln`, `ln -s` and file creation, by name **or identity** | LSM `inode_unlink` / `inode_rmdir` / `inode_rename` / `inode_create` / `inode_mkdir` / `inode_link` / `inode_symlink` |
+| **network** — egress | ✅ dest ip:port | ⛔ deny blocked CIDRs (TCP + UDP, IPv4/IPv6) | `tracepoint/connect·sendto` + `cgroup/connect4·6` + `sendmsg4·6` |
 | **TCP containment** | — | ⛔ the agent reaches only `allow_ports:`, in or out | Landlock ABI 4 (no privilege needed) |
 
 **Rules match names or identities.** A `match:` rule is a glob over the path —
@@ -172,23 +172,27 @@ sudo ./target/release/wardyn --enforce run -- bash scripts/demo.sh
 ```
 
 Renders a live TUI when attached to a terminal; pipe it (or pass `--plain`) for a
-plain table. `--policy <file>`, `--audit <file>` and `--denials <file>` override
-the defaults. The watched agent is run as your non-root user by default (via
+plain table. `--policy <file>`, `--audit <file>`, `--denials <file>` and
+`--overrides <file>` override the defaults; `wardyn --help` lists the rest. The
+watched agent is run as your non-root user by default (via
 `$SUDO_UID`, so it can't disable its own warden); use `--as-user uid[:gid]` to
 choose, or `--keep-root` to keep it as root.
 
 In the TUI, `q` quits — **and stops the agent with it.** Wardyn's enforcement
 lives in programs this process owns, so leaving the agent running after wardyn
 exits would hand it the unsupervised shell the tool exists to prevent, silently,
-at the moment you pressed a key. Under `--enforce`, `a` grants an approve-once
-exception for the last denial (with a y/n confirm that names the true scope).
+at the moment you pressed a key. Under `--enforce`, `a` grants an exception for
+the last denial (with a y/n confirm that names the true scope); it is stored for
+the policy it was granted against — see [Telling the agent](#telling-the-agent).
 Wardyn exits with the agent's own exit status.
 
 ## Policy
 
-[`policy.yaml`](./policy.yaml) — three rule lists; `default_action` is the
-fallback. Actions: `allow | warn | block`. Matching order differs per axis, and
-saying "first match wins" everywhere would be wrong:
+[`policy.yaml`](./policy.yaml) — three rule lists (`files`, `network`, `exec`),
+two containment keys (`allow_paths`, `allow_ports` — below), and a
+`default_action` fallback for the lists. Actions: `allow | warn | block`.
+Matching order differs per axis, and saying "first match wins" everywhere would
+be wrong:
 
 | Axis | Order |
 |---|---|
@@ -234,7 +238,7 @@ take an **`access:`**, which picks the operation the rule covers across two axes
 | `access:` | matched when | hook |
 | --- | --- | --- |
 | `any` (default), `read`, `write` | the file is **opened** | `file_open` |
-| `create` | a name **comes into existence** | `inode_create`, `inode_mkdir`, and a rename's destination |
+| `create` | a name **comes into existence** | `inode_create`, `inode_mkdir`, `inode_link`, `inode_symlink`, and a rename's destination |
 | `delete` | a name is **removed** | `inode_unlink`, `inode_rmdir`, and a rename's source |
 | `all` | every one of the above | all of them |
 
@@ -409,8 +413,15 @@ the most recent denial. The confirm prompt states the **real blast radius** —
 bare names and addresses, and wardyn won't pretend an exception is narrower
 than it is. On `y` the kernel map and the feed's mirror update together, and an
 `exception` record lands in the agent's receipt: *you may retry*. Deny →
-report → approve → retry, without restarting the agent. Exceptions last for
-the run only.
+report → approve → retry, without restarting the agent.
+
+An approval outlives the run. It is stored — default
+`/var/lib/wardyn/overrides.yaml`, outside the watched tree's reach — under a
+fingerprint of the policy text, for `--override-ttl` days (default 30). The next
+run of the *same* policy starts with it in force; edit the rules and every
+approval granted against the old text is out of force until the text is put
+back, because an exception to one set of rules must not widen the next.
+`--override-ttl 0` keeps exceptions to the run.
 
 ## How it works
 
@@ -428,38 +439,61 @@ it in a browser; every box in the diagram is clickable.</sub></p>
 
 ```
    wardyn run -- <agent>
-          │  spawn + watch (WATCHED map, sched_process_fork follows the subtree)
+          │  hooks attached, maps filled, WATCHED seeded — only then: drop
+          │  privileges, apply Landlock (allow_paths · allow_ports), exec
           ▼
-  ┌───────────────────────────── watched process tree ─────────────────────────┐
-  │      exec                    file open                    connect           │
-  └────────┬────────────────────────┬───────────────────────────┬──────────────┘
-           ▼                         ▼                           ▼
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │  KERNEL (eBPF)                                                           │
-  │   observe:  tp/execve          tp/openat          tp/connect  ──────┐    │
-  │   enforce:  LSM bprm_check      LSM file_open      cgroup/connect4   │    │
-  │             └─ -EPERM ─┘        └─ -EPERM ─┘       └─ deny ─┘        │    │
-  │        ▲ compiled policy (basenames · dirs · CIDR LPM-trie)         │    │
-  └────────┼────────────────────────────────────────────────────── ring│buf ─┘
-           │ maps                                                       ▼
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │  USERSPACE   policy.yaml ─▶ allow / warn / block                         │
-  │              └─▶ live coloured TUI      └─▶ JSONL audit log              │
-  └─────────────────────────────────────────────────────────────────────────┘
+  ┌──────────────── watched process tree · children adopted in-kernel ─────────────────┐
+  │              exec · open · create · delete · rename · link · connect               │
+  └──────────────────────────────────────────┬─────────────────────────────────────────┘
+                                             ▼
+  ┌────────────────────────────────────────────────────────────────────────────────────┐
+  │ KERNEL                                                                             │
+  │           exec              open             create · delete    egress             │
+  │ observe   tp/execve         tp/openat        —                  tp/connect         │
+  │           tp/execveat       tp/openat2                          tp/sendto          │
+  │ enforce   LSM bprm_check    LSM file_open    LSM inode_unlink   cgroup/connect4·6  │
+  │           → -EPERM          → -EPERM         rmdir · rename     cgroup/sendmsg4·6  │
+  │                                              create · mkdir     → deny             │
+  │                                              link · symlink                        │
+  │                                              → -EPERM                              │
+  │                                                                                    │
+  │ boundary   Landlock — allow_paths (filesystem) · allow_ports (TCP) → -EACCES       │
+  │ maps       WATCHED · BLOCK_{NAMES,DIRS,PAIRS,INODES} · NET_RULES (4 LPM tiers)     │
+  │ ring       every observed call · every kernel denial, with the key it hit          │
+  └────────────────────────────────────────────────────────────────────────────────────┘
+         ▲ keys                                                                events ▼
+  ┌────────────────────────────────────────────────────────────────────────────────────┐
+  │ USERSPACE                                                                          │
+  │ policy.yaml + stored approvals ─▶ kernel keys      (--dry-run prints them)         │
+  │ events ─▶ TUI · --plain · --format json ─▶ JSONL audit log                         │
+  │        ─▶ WARDYN_DENIALS: the agent's receipt, kernel denials only                 │
+  └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Observation** — tracepoints on `execve` / `openat` / `connect` stream a
-  structured event per action into a ring buffer; userspace evaluates the policy,
-  colours the feed, and writes the audit log.
-- **Scoping** — `WATCHED` is seeded with the launched pid; a `sched_process_fork`
-  hook adopts children in-kernel, so the whole subtree is followed race-free.
-  Thread ids are evicted as their threads die, and a failed insert is counted —
-  a full watch set would otherwise mean new children running unwatched.
+- **Order** — the hooks are attached and the maps filled before the agent
+  exists, and `WATCHED` is seeded so the fork hook adopts the child inside
+  `clone()`. Only then, in the child: drop to the invoking user, `no_new_privs`,
+  Landlock, `exec`. There is no moment it runs unwatched.
+- **Observation** — tracepoints on `execve`/`execveat`, `openat`/`openat2` and
+  `connect`/`sendto` stream a structured event per action into a ring buffer;
+  userspace evaluates the policy, colours the feed, and writes the audit log. A
+  tracepoint can watch; it cannot deny.
+- **Scoping** — `WATCHED` is keyed by the kernel's own tgid; a
+  `sched_process_fork` hook adopts children in-kernel, so the whole subtree is
+  followed race-free. Thread ids are evicted as their threads die, and a failed
+  insert is counted — a full watch set would otherwise mean new children running
+  unwatched.
 - **Enforcement** — separate programs deny inline: `cgroup/connect4·6` +
   `sendmsg4·6` return *deny* for blocked egress (TCP connect and UDP sendmsg, IPv4
   & IPv6); BPF-LSM `file_open` / `bprm_check_security` return `-EPERM` for blocked
-  reads / execs. All gated on `WATCHED` + an `enforce` flag.
-- **Reporting** — each of those hooks emits its own event naming the key it
+  reads / execs, and `inode_unlink` / `rmdir` / `rename` / `create` / `mkdir` /
+  `link` / `symlink` do the same for the `delete` / `create` axis. All gated on
+  `WATCHED` + an `enforce` flag.
+- **Containment** — `allow_paths:` and `allow_ports:` are Landlock rulesets the
+  child applies to itself before `exec`: no eBPF, no privilege, inherited by
+  every descendant, irreversible. Their denials are `-EACCES`, and they are
+  counted apart, because Landlock keeps no counter for the end-of-run cross-check.
+- **Reporting** — each deciding hook emits its own event naming the key it
   matched, so the feed, the audit log and the receipt state what the kernel did
   rather than what userspace guessed from the observed path.
 
@@ -523,6 +557,13 @@ Full design, hook map, and the eBPF-verifier war stories are in
   Copying a *blocked binary* to a new name still runs it — a copy is a different
   object with a different name, and unlike a secret there is no read to deny;
   see [`SECURITY.md`](./SECURITY.md).
+
+All six are done. What is *not* done is listed rather than implied:
+[`docs/AUDIT.md`](./docs/AUDIT.md) carries every finding with a status
+(98 closed · 10 deliberately open · 4 open · 1 rejected), and the
+deliberately-open ones — io_uring, AF_UNIX and loopback delegation, raw-socket
+egress, the dentry-name read racing a rename — are the limits
+[SECURITY.md](./SECURITY.md) states, not gaps waiting for a milestone.
 
 ## What it costs
 
