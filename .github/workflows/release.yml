@@ -58,7 +58,7 @@ jobs:
       # via the action's `targets:` input (which would install it for the wrong
       # toolchain and fail the build with a confusing "can't find crate `std`").
       - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # nightly
         with:
           components: rust-src
 
