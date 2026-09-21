@@ -1078,6 +1078,69 @@ else
   skip "stored approvals (needs BPF-LSM to show the kernel actually stopped denying)"
 fi
 
+# ── the pthread_exit / leader-eviction escape ────────────────────────────────
+# A group leader that calls pthread_exit() while a worker thread keeps running
+# used to unwatch the still-live process: the worker (and its children) then
+# read blocked secrets with nothing in the feed. On a bare host the /proc sweep
+# masked it; INSIDE A PID NAMESPACE (containers, WSL2 — a headline use case) the
+# sweep is off, so the group-dead eBPF path is the only thing that closes it.
+# We run wardyn under `unshare --pid --fork` precisely so that namespace path is
+# what gets tested, not the sweep.
+if [[ $LSM_ACTIVE -eq 1 ]] && command -v gcc >/dev/null 2>&1 \
+   && command -v unshare >/dev/null 2>&1 && unshare --pid --fork true 2>/dev/null; then
+  PT="$(mktemp -d)"
+  cat >"$PT/escape.c" <<'C'
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdio.h>
+static char *secret;
+static void *worker(void *a) {
+    (void)a; sleep(2);
+    int fd = open(secret, O_RDONLY);
+    if (fd >= 0) { printf("LEAKED\n"); close(fd); } else printf("denied\n");
+    fflush(stdout);
+    _exit(0);
+}
+int main(int c, char **v) {
+    if (c < 2) return 2;
+    secret = v[1];
+    pthread_t t; pthread_create(&t, 0, worker, 0);
+    pthread_exit(0);   /* leader leaves; the process lives on the worker */
+}
+C
+  if gcc -O2 -o "$PT/escape" "$PT/escape.c" -lpthread 2>"$PT/cc.log"; then
+    printf 'SECRET_API_KEY=sk-pthread-not-real\n' >"$PT/secret.key"
+    cat >"$PT/pol.yaml" <<YAML
+default_action: allow
+files:
+  - { path: "$PT/secret.key", action: block, access: all }
+network: []
+exec:
+  - { match: "**", action: allow }
+YAML
+    # unshare so wardyn sees a pid namespace (ns_mismatch → /proc sweep off →
+    # only the group-dead path can contain this).
+    unshare --pid --fork --mount-proc \
+      "$WARDYN" --enforce --plain --policy "$PT/pol.yaml" \
+      --audit "$PT/audit.jsonl" --denials "$PT/den.jsonl" \
+      run -- "$PT/escape" "$PT/secret.key" >"$PT/out.log" 2>&1 || true
+    if grep -q LEAKED "$PT/out.log"; then
+      fail "pthread_exit escape: worker read the secret after the leader exited"
+    elif grep -q denied "$PT/out.log"; then
+      pass "pthread_exit escape closed: worker denied inside a pid namespace"
+    else
+      skip "pthread_exit escape: agent produced no verdict (env issue: $(head -c 120 "$PT/out.log"))"
+    fi
+  else
+    skip "pthread_exit escape: could not compile the fixture ($(head -c 120 "$PT/cc.log"))"
+  fi
+  rm -rf "$PT"
+else
+  skip "pthread_exit escape (needs BPF-LSM, gcc, and a usable pid namespace)"
+fi
+
 # ── summary ─────────────────────────────────────────────────────────────────
 echo
 if [[ $FAIL -gt 0 ]]; then
