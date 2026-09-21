@@ -263,7 +263,7 @@ default_action: allow
 files:
   # `match:` — a glob over names. Covers files that do not exist yet.
   - { match: "**/.env",      action: block }   # any file named .env
-  - { match: "**/.ssh/**",   action: block }   # anything under a dir named .ssh, at any depth
+  - { match: "**/.ssh/**",   action: block }   # anything up to 64 levels under a dir named .ssh
   - { match: "/etc/shadow",  action: block }   # `shadow` under `etc` — not every `shadow`
   # `path:` — one object, pinned by (dev, ino) at load. `mv` and `ln` do not
   # shake it off. `~` is the AGENT's home; a bare name is relative to where

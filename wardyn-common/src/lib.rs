@@ -289,7 +289,16 @@ pub mod stat {
 /// How many ancestor directories the LSM `file_open` hook walks when matching
 /// `BLOCK_DIRS`. Bounded so the verifier accepts the loop; userspace mirrors the
 /// same bound so the feed never claims a denial from deeper than the hook looks.
-pub const MAX_DIR_WALK: usize = 16;
+///
+/// **This bound is a real limit on what a directory rule covers**, not an
+/// implementation detail: a file buried more than this many levels below the
+/// named directory is NOT denied. Red-teaming found the tool claiming "any
+/// depth" for these rules while the walk stopped at 16 — a silent escape. The
+/// bound is now stated wherever a directory rule is described (`--dry-run`,
+/// the approve-once blast radius, README), so the number and the guarantee
+/// cannot drift apart again. Raising it costs one unrolled iteration per level
+/// in two hooks; 64 is what the verifier accepts with room to spare.
+pub const MAX_DIR_WALK: usize = 64;
 
 /// The verdict the policy engine reached for this event.
 pub mod action {
