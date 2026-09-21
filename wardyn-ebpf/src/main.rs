@@ -19,9 +19,9 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user,
-        bpf_probe_read_user_str_bytes,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
+        bpf_get_current_uid_gid, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
+        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{cgroup_sock_addr, lsm, map, tracepoint},
     maps::{lpm_trie::Key, Array, HashMap, LpmTrie, PerCpuArray, RingBuf},
@@ -238,6 +238,14 @@ const CFG_PROTO_RULES_ON: u32 = 22;
 /// Set when the policy compiled at least one two-component key. Skips a
 /// 80-byte hash lookup per ancestor level for the policies that have none.
 const CFG_PAIRS_ON: u32 = 23;
+/// Thread-group liveness, so a group leader that exits while its worker threads
+/// keep running does not unwatch a still-live process (the `pthread_exit`
+/// escape). `offsetof(task_struct, signal)` and `offsetof(signal_struct,
+/// live)`, resolved from BTF by userspace; `CFG_GROUP_DEAD_ON` is set only when
+/// both resolved, so a kernel that hides them keeps the legacy eviction path.
+const CFG_TASK_SIGNAL_OFF: u32 = 24;
+const CFG_SIGNAL_LIVE_OFF: u32 = 25;
+const CFG_GROUP_DEAD_ON: u32 = 26;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
 // personality(persona) — persona is the 1st arg, same slot as execve's filename.
@@ -1650,27 +1658,54 @@ fn handle_fork(ctx: &TracePointContext) -> Result<(), i64> {
 /// Drop a process from WATCHED when it exits, so the set can't grow unbounded
 /// and a reused pid can't be wrongly treated as still-watched.
 ///
-/// `sched_process_exit` fires per-thread, while WATCHED is keyed by tgid:
+/// `sched_process_exit` fires per-thread, while WATCHED is keyed by tgid. The
+/// hard case is a group *leader* that exits while worker threads keep running
+/// (`pthread_exit()` from `main`): the process is still alive, so evicting its
+/// tgid there is a silent, unprivileged full escape.
 ///
-/// - **Thread exit** (`tid != tgid`) always removes the *tid* key. Thread
-///   creations transiently insert their tid (see `handle_fork`), and leaving
-///   them behind both leaks toward the map cap — at which point new children
-///   escape enforcement entirely — and aliases a future process that happens to
-///   be given that pid number. Removing by tid is safe: pid numbers are unique
-///   across threads and processes, so this can only ever remove that thread's
-///   own entry.
-/// - **Leader exit** (`tid == tgid`) is the ambiguous one: a leader can exit via
-///   `pthread_exit()` while worker threads keep running, so evicting there would
-///   silently unwatch a live process. When userspace can prune WATCHED against
-///   `/proc` itself (no pid-namespace mismatch), it sets `CFG_DEFER_EVICT` and we
-///   leave removal to that sweep, which only drops a tgid once the whole thread
-///   group is gone. Under a pid namespace we keep leader-exit eviction as the
-///   best available signal.
+/// **Preferred path (`CFG_GROUP_DEAD_ON`).** When userspace resolved the
+/// `task_struct.signal` / `signal_struct.live` offsets from BTF, we read the
+/// thread group's live count directly. `live <= 1` means this is the last
+/// thread of the group — the whole process is gone — so the tgid is evicted;
+/// this is true whether or not the exiting thread is the leader, so a leader
+/// that left early no longer strands the tgid. While other threads remain
+/// (`live > 1`) we only clean up a worker's transient tid and keep the tgid
+/// watched. This holds even inside a pid namespace, where the userspace
+/// `/proc` sweep cannot (it sees namespace-local pids, not the init-ns tgids
+/// the map is keyed by).
+///
+/// **Legacy path.** With the offsets unavailable, fall back to the original
+/// behaviour: a worker exit (`tid != tgid`) removes its tid; a leader exit
+/// evicts the tgid unless `CFG_DEFER_EVICT` left it to the userspace sweep
+/// (which is only armed when pids are comparable, i.e. no namespace mismatch).
 #[tracepoint]
 pub fn wardyn_exit(_ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;
+
+    if cfg(CFG_GROUP_DEAD_ON) != 0 {
+        let task = unsafe { bpf_get_current_task() } as *const u8;
+        if let Ok(signal) = read_ptr(task, cfg(CFG_TASK_SIGNAL_OFF) as usize) {
+            if let Ok(live) = read_u32(signal, cfg(CFG_SIGNAL_LIVE_OFF) as usize) {
+                // `signal->live` is decremented in `do_exit()` *before* the
+                // `sched_process_exit` tracepoint fires, so here it already
+                // holds the count of threads that will remain. `0` means this
+                // was the last one — the whole group is gone.
+                if live == 0 {
+                    let _ = WATCHED.remove(&tgid);
+                } else if tid != tgid {
+                    // A worker left; the process lives on. Drop only its tid.
+                    let _ = WATCHED.remove(&tid);
+                }
+                // Leader leaving early with workers still alive: keep the tgid.
+                return 0;
+            }
+        }
+        // A read failed (should not happen once offsets are published): fall
+        // through to the legacy path rather than leak or wrongly evict.
+    }
+
     if tid != tgid {
         let _ = WATCHED.remove(&tid);
         return 0;

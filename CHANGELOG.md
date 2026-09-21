@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pthread_exit()` from a group leader escaped enforcement inside a pid
+  namespace — the tool's own headline use case (containers, WSL2).** A watched
+  process that spawned a worker thread and then let its *leader* thread exit
+  kept running on the worker, but `wardyn_exit` evicted the tgid on leader exit.
+  The `/proc` sweep that was supposed to defer that eviction is turned off under
+  a pid namespace (it sees namespace-local pids, not the init-ns tgids `WATCHED`
+  is keyed by), so inside a container the process was silently unwatched: the
+  worker and its children then read blocked secrets, ran blocked binaries and
+  dialed blocked hosts with **nothing in the feed, audit log or receipt**. A
+  ~10-line C program, no privilege required.
+
+  Found by red-teaming the built tool in the BPF-LSM lab, not by reading the
+  code — an earlier audit had marked this "closed" because the bare-host case
+  was handled, and the namespace gap hid behind that. Reproduced: an 18-byte
+  secret read after `pthread_exit`, zero enforced rows.
+
+  Fixed by evicting on *thread-group death* instead of leader exit:
+  `wardyn_exit` now reads `task_struct.signal → signal_struct.live` (offsets
+  resolved from the running kernel's BTF, like the LSM offsets) and drops the
+  tgid only when the last thread of the group is gone (`live == 0`), keeping it
+  while any thread — worker or leader — is still alive. This holds inside a
+  namespace, where the sweep cannot. A kernel whose BTF hides those fields keeps
+  the previous behaviour. An e2e assertion runs the exact escape under
+  `unshare --pid` so the namespace path is what CI tests.
+
 ### Added
 
 - **A stress suite: four scenarios that try to break wardyn, each recorded

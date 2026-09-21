@@ -259,6 +259,9 @@ const CFG_PORT_RULES_ON: u32 = 20;
 const CFG_LIFECYCLE_ON: u32 = 21;
 const CFG_PROTO_RULES_ON: u32 = 22;
 const CFG_PAIRS_ON: u32 = 23;
+const CFG_TASK_SIGNAL_OFF: u32 = 24;
+const CFG_SIGNAL_LIVE_OFF: u32 = 25;
+const CFG_GROUP_DEAD_ON: u32 = 26;
 
 /// Feed rows that carry an operator/diagnostic message rather than a syscall.
 const KIND_NOTICE: u32 = u32::MAX;
@@ -1903,6 +1906,23 @@ async fn run() -> anyhow::Result<i32> {
                     None => notices.push(
                         "this kernel's BTF does not expose the inode fields; identity (dev,ino) \
                          rules cannot be enforced — name rules still are."
+                            .to_string(),
+                    ),
+                }
+                // Thread-group liveness for exit eviction: with these, a leader
+                // that exits before its workers no longer unwatches a live
+                // process (the `pthread_exit` escape), and it holds inside a pid
+                // namespace where the /proc sweep cannot help.
+                match o.lifecycle {
+                    Some(l) => {
+                        config.set(CFG_TASK_SIGNAL_OFF, l.task_signal, 0)?;
+                        config.set(CFG_SIGNAL_LIVE_OFF, l.signal_live, 0)?;
+                        config.set(CFG_GROUP_DEAD_ON, 1, 0)?;
+                    }
+                    None => notices.push(
+                        "this kernel's BTF does not expose task_struct.signal / \
+                         signal_struct.live; a process that exits its group leader while worker \
+                         threads run may be unwatched early — exit eviction uses the legacy path."
                             .to_string(),
                     ),
                 }
