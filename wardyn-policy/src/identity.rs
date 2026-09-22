@@ -27,7 +27,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use wardyn_common::InodeKey;
+use wardyn_common::{InodeKey, MAX_DIR_WALK};
 
 /// Convert a `stat(2)` `st_dev` (glibc's 64-bit `dev_t`) into the kernel's
 /// internal `super_block->s_dev` encoding, which is what the eBPF hooks read.
@@ -101,10 +101,17 @@ impl Anchor {
     /// visible without being told.
     pub fn blast_radius(&self) -> String {
         let (maj, min) = split_dev(self.key.dev);
+        // The directory case is bounded on purpose: the ancestor walk stops at
+        // MAX_DIR_WALK, so a file buried deeper than that is NOT covered.
+        // "ANY file under the directory" over-promised exactly where it
+        // mattered, so the bound is named — from the constant, so the sentence
+        // cannot drift away from the walk.
         let object = match (self.exec, self.kind) {
-            (true, _) => "the program",
-            (false, AnchorKind::Dir) => "ANY file under the directory",
-            (false, AnchorKind::File) => "the file",
+            (true, _) => "the program".to_string(),
+            (false, AnchorKind::Dir) => {
+                format!("any file up to {MAX_DIR_WALK} levels under the directory")
+            }
+            (false, AnchorKind::File) => "the file".to_string(),
         };
         let what = if self.exec {
             "executing".to_string()

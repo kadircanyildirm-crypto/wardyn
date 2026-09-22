@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A directory rule claimed "any depth" while the kernel walked 16 ancestors,
+  so a secret buried deeper was read with nothing in the feed.** `--dry-run`
+  printed *"denies opening ANY file under a directory named `vault` (any
+  depth)"*, the approve-once blast radius said *"ANY file under the
+  directory"*, and README said "at any depth" — all false past the walk bound.
+  A red-team run put a secret 20 directories below the named one and read it:
+  zero enforced rows, no warning. The `path:` (identity) form of a directory
+  rule had the same hole, so the documented "sound alternative" was not sound
+  either.
+
+  Two changes, because the bound and the claim are separate problems. The walk
+  is raised from 16 to **64** ancestors — the verifier accepts it with room to
+  spare (all 21 programs load), and a typical open pays nothing extra since the
+  loop still stops at the filesystem root. And every place that describes a
+  directory rule now names the bound, interpolated from `MAX_DIR_WALK` so the
+  sentence cannot drift from the walk again: `--dry-run`, the blast radius the
+  approve-once prompt shows, SECURITY.md and README. A file deeper than the
+  bound is still not covered — that is now *stated* rather than discovered.
+
+  An e2e assertion pins both halves: a secret 20 levels down is denied, and
+  `--dry-run` must state a bound rather than claim "any depth".
+
+  (Two other limits probed in the same run were already honest and are
+  unchanged: a filename longer than `NAME_LEN` is reported by `--dry-run` as
+  *"flagged but NEVER denied … name too long"*, and a path longer than
+  `PATH_LEN` is still enforced, because the LSM matches dentries rather than
+  the syscall's path string.)
+
 - **`pthread_exit()` from a group leader escaped enforcement inside a pid
   namespace — the tool's own headline use case (containers, WSL2).** A watched
   process that spawned a worker thread and then let its *leader* thread exit

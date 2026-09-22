@@ -94,8 +94,12 @@ Out of scope (known limitations, documented, not vulnerabilities):
 - **`match:` rules are name-based, and a name comes off with one `mv`.** The LSM
   matcher keys a glob rule on its last two literal segments — `(parent, name)`
   when the parent is literal, the bare name when it is not — and on the names of
-  its ancestor directories (a bounded walk, so a `**/dir/**` rule does cover the
-  whole subtree). Two segments is still a suffix match: `/etc/shadow` denies
+  its ancestor directories. That ancestor walk is **bounded at 64 levels**: a
+  `**/dir/**` rule covers files up to 64 directories below `dir`, and a file
+  buried deeper is *not* denied. The bound applies to `path:` directory rules
+  too, and `--dry-run` prints it rather than claiming the whole subtree — it
+  used to say "any depth", which red-teaming showed was false past the walk.
+  Two segments is still a suffix match: `/etc/shadow` denies
   `etc/shadow` at any depth, and `--dry-run` says so.
   That stops *accidental and naive* access, and is **bypassable** by renaming or
   hard-linking the target before opening it: a rule that does not name

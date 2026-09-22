@@ -25,7 +25,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use wardyn_common::{
     fmode, proto as ipproto, InodeKey, PortKey4, PortKey6, ProtoKey4, ProtoKey6, ProtoPortKey4,
-    ProtoPortKey6, NAME_LEN, PORT_BITS, PROTO_BITS,
+    ProtoPortKey6, MAX_DIR_WALK, NAME_LEN, PORT_BITS, PROTO_BITS,
 };
 
 use crate::identity::{self, Anchor, AnchorBase, AnchorKind, ResolveOutcome, UnresolvedAnchor};
@@ -387,7 +387,8 @@ impl DenialKey {
                 )
             }
             DenialKey::DirInode { dev, ino } => format!(
-                "opening ANY file under ONE directory — {} — under any name",
+                "opening any file up to {MAX_DIR_WALK} levels under ONE directory — {} — under \
+                 any name",
                 dev_ino(*dev, *ino)
             ),
             DenialKey::ExecInode { dev, ino } => format!(
@@ -429,7 +430,7 @@ impl DenialKey {
                 format!("ONE file — {} — under any name", dev_ino(*dev, *ino))
             }
             DenialKey::DirInode { dev, ino } => format!(
-                "ANY file under ONE directory — {} — under any name",
+                "any file up to {MAX_DIR_WALK} levels under ONE directory — {} — under any name",
                 dev_ino(*dev, *ino)
             ),
             // The lifecycle hooks only ever match the four file keys above, so
@@ -2018,7 +2019,8 @@ impl Policy {
         for (d, &mask) in &self.kern_dirs {
             let _ = writeln!(
                 s,
-                "  file  dir={d:<25} denies {} ANY file under a directory named `{d}` (any depth)",
+                "  file  dir={d:<25} denies {} any file up to {MAX_DIR_WALK} levels under a \
+                 directory named `{d}`",
                 mask_verbs(mask)
             );
         }
@@ -2036,7 +2038,8 @@ impl Policy {
             let key = format!("dir={p}/{n}");
             let _ = writeln!(
                 s,
-                "  file  {key:<29} denies {} ANY file under a dir named `{n}` that sits in `{p}` (any depth)",
+                "  file  {key:<29} denies {} any file up to {MAX_DIR_WALK} levels under a dir \
+                 named `{n}` that sits in `{p}`",
                 mask_verbs(mask)
             );
         }
@@ -2380,11 +2383,11 @@ impl Policy {
     }
 }
 
-/// How many ancestor directories the LSM hook walks when matching `BLOCK_DIRS`.
-/// The kernel program must stay a bounded loop for the verifier; userspace
-/// mirrors the same bound so the feed cannot claim a denial from a deeper
-/// ancestor than the hook actually inspects.
-pub const MAX_DIR_WALK: usize = 16;
+// `MAX_DIR_WALK` is re-exported from `wardyn_common` (imported at the top of
+// this file) rather than defined here. It used to be a second `const` with its
+// own value, which is the bug that shape invites: the kernel bound could be
+// raised and this mirror left behind, and the feed would then predict denials
+// from ancestors the hook never inspects. One definition, two readers.
 
 fn eval_path(rules: &[PathRule], path: &str, default: Action) -> Verdict {
     for r in rules {

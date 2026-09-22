@@ -1141,6 +1141,60 @@ else
   skip "pthread_exit escape (needs BPF-LSM, gcc, and a usable pid namespace)"
 fi
 
+# ── the directory rule's depth bound, stated and enforced ───────────────────
+# A dir rule walks a bounded number of ancestors. That bound is a real limit on
+# what the rule covers, so two things have to hold together: a file inside the
+# bound is denied, and `--dry-run` states the bound instead of promising "any
+# depth" (which it used to, while the walk stopped at 16 — a silent escape a
+# red-team run found by burying a secret 20 levels down).
+if [[ $LSM_ACTIVE -eq 1 ]]; then
+  DW="$(mktemp -d)"
+  deep="$DW/vault"; mkdir -p "$deep"
+  for _ in $(seq 1 20); do deep="$deep/d"; done
+  mkdir -p "$deep"
+  printf 'SECRET_API_KEY=sk-depth-not-real\n' >"$deep/secret.key"
+  # The whole chain must be traversable by the dropped agent, or the read would
+  # fail on permissions and the assertion would pass without wardyn doing
+  # anything — a green light for an unenforced rule.
+  chmod 755 "$DW"; chmod -R a+rX "$DW/vault"
+  cat >"$DW/pol.yaml" <<YAML
+default_action: allow
+files:
+  - { match: "**/vault/**", action: block }
+network: []
+exec:
+  - { match: "**", action: allow }
+YAML
+  # The verdict goes in a FILE, not in the command line: wardyn echoes the
+  # command it is watching, so a sentinel word in the command would be matched
+  # by the grep below and the assertion would report on its own argv.
+  cat >"$DW/agent.sh" <<'AGENT'
+if cat "$1" >/dev/null 2>&1; then echo readable >"$2"; else echo refused >"$2"; fi
+AGENT
+  # The dropped agent can traverse the 755 directory but may not create a file
+  # in it, so the verdict file exists and is writable before it runs.
+  : >"$DW/verdict"; chmod 666 "$DW/verdict"
+  "$WARDYN" --enforce --plain --policy "$DW/pol.yaml" --audit "$DW/audit.jsonl" \
+    run -- sh "$DW/agent.sh" "$deep/secret.key" "$DW/verdict" >"$DW/out.log" 2>&1 || true
+  case "$(cat "$DW/verdict" 2>/dev/null)" in
+    refused) pass "dir rule: a secret 20 levels below the named directory is denied" ;;
+    readable) fail "dir rule: a secret 20 levels down was readable (walk bound too small?)" ;;
+    *) skip "dir rule depth: agent produced no verdict ($(head -c 120 "$DW/out.log"))" ;;
+  esac
+  # and the reported bound must not over-promise
+  "$WARDYN" --dry-run --policy "$DW/pol.yaml" >"$DW/dry.log" 2>&1 || true
+  if grep -q "any depth" "$DW/dry.log"; then
+    fail "--dry-run still claims a dir rule covers 'any depth' — the walk is bounded"
+  elif grep -qE "up to [0-9]+ levels under" "$DW/dry.log"; then
+    pass "--dry-run states the dir rule's real depth bound"
+  else
+    fail "--dry-run says nothing about the dir rule's depth bound: $(grep -m1 dir= "$DW/dry.log")"
+  fi
+  rm -rf "$DW"
+else
+  skip "dir-rule depth bound (needs BPF-LSM)"
+fi
+
 # ── summary ─────────────────────────────────────────────────────────────────
 echo
 if [[ $FAIL -gt 0 ]]; then
