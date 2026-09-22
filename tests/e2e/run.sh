@@ -1195,6 +1195,51 @@ else
   skip "dir-rule depth bound (needs BPF-LSM)"
 fi
 
+# ── a name rule a symlink redirects is NOT reported as enforced ─────────────
+# The hooks key on the dentry the kernel resolved; the mirror matched a string.
+# A symlink between the two (`/usr/bin/nc` -> `nc.openbsd`, or a link *named*
+# `.env`) means the rule does not fire — which is a documented limit of name
+# rules. What is not permitted is claiming otherwise: the row used to read
+# `BLOCK`, the record `"enforced": true`, and a line went into the agent's
+# receipt for an open that had just returned the bytes.
+if [[ $LSM_ACTIVE -eq 1 ]]; then
+  SL="$(mktemp -d)"; chmod 755 "$SL"
+  printf 'SECRET_API_KEY=sk-symlink-not-real\n' >"$SL/real.txt"; chmod 644 "$SL/real.txt"
+  ln -s real.txt "$SL/.env"
+  cat >"$SL/pol.yaml" <<YAML
+default_action: allow
+files:
+  - { match: "**/.env", action: block }
+network: []
+exec:
+  - { match: "**", action: allow }
+YAML
+  : >"$SL/verdict"; chmod 666 "$SL/verdict"
+  cat >"$SL/agent.sh" <<'AGENT'
+if cat "$1" >/dev/null 2>&1; then echo readable >"$2"; else echo refused >"$2"; fi
+AGENT
+  "$WARDYN" --enforce --format json --policy "$SL/pol.yaml" --audit "$SL/audit.jsonl" \
+    --denials "$SL/den.jsonl" run -- sh "$SL/agent.sh" "$SL/.env" "$SL/verdict" \
+    >"$SL/stream.json" 2>"$SL/err.log" || true
+  # Whichever way the kernel went, the record must not claim an enforced denial
+  # the kernel's own counter does not back.
+  if grep -a "$SL/.env" "$SL/audit.jsonl" 2>/dev/null | grep -q '"enforced":true'; then
+    fail "symlink: a redirected name rule was recorded as an enforced denial"
+  else
+    pass "symlink: a redirected name rule is not claimed as enforced"
+  fi
+  # Line 1 is the receipt's header, and it quotes the agent's own command line —
+  # which names the file. Only the records after it are denials.
+  if tail -n +2 "$SL/den.jsonl" 2>/dev/null | grep -aq '"event"'; then
+    fail "symlink: the agent was receipted a denial the kernel did not make"
+  else
+    pass "symlink: nothing receipted for a denial that did not happen"
+  fi
+  rm -rf "$SL"
+else
+  skip "symlink-redirected name rule (needs BPF-LSM)"
+fi
+
 # ── summary ─────────────────────────────────────────────────────────────────
 echo
 if [[ $FAIL -gt 0 ]]; then

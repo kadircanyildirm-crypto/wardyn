@@ -28,7 +28,7 @@ mod tui;
 use std::collections::VecDeque;
 use std::io::IsTerminal as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _};
 use aya::maps::lpm_trie::{Key, LpmTrie};
@@ -2327,6 +2327,20 @@ fn report_kernel_stats(s: &StatSnapshot, enforce: bool, claimed: u64, contained:
                 "wardyn: WARNING: {claimed} denial(s) were reported to the agent but the kernel \
                  counted none — enforcement did NOT fire. Treat this run as observe-only."
             );
+        } else if claimed > s.denials() {
+            // The all-or-nothing form above only catches a run where nothing
+            // fired at all. A run where *most* denials were real hid the odd
+            // fictional one behind them: a symlinked binary produced a receipted
+            // `exec` denial that never happened while four other denials did,
+            // and the totals (5 claimed, 4 counted) went unremarked. Any surplus
+            // is now named, because one invented denial is the same failure as
+            // a hundred — the agent is told it was stopped when it was not.
+            eprintln!(
+                "wardyn: WARNING: {claimed} denial(s) were reported to the agent but the kernel \
+                 counted {} — {} of them did not actually fire. Trust the kernel's count.",
+                s.denials(),
+                claimed - s.denials()
+            );
         }
     }
 }
@@ -3015,14 +3029,20 @@ pub(crate) fn describe(
                 });
             };
             let kd = if enforce_files {
-                if is_exec {
+                let pred = if is_exec {
                     policy.kernel_exec_denial(&d)
                 } else {
                     // `ev.fmode` is what the syscall's flags asked for, so a rule
                     // that only covers reads does not predict a denial for a
                     // write-only open the kernel will let through.
                     policy.kernel_file_denial(&d, ev.fmode)
-                }
+                };
+                // The mirror matched a *string*; the hooks key on the dentry the
+                // kernel resolved. Where a symlink separates the two, the
+                // prediction is fiction — see `path_is_redirected`. Checked only
+                // here, on the rare path where we are about to claim a denial,
+                // so an ordinary allow still costs no syscall.
+                pred.filter(|_| !path_is_redirected(&d, ev.pid))
             } else {
                 None
             };
@@ -3183,6 +3203,69 @@ fn parse_format_offset(format: &str, field: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// Whether the path the mirror just matched sends the kernel's hooks at a
+/// **different object** than the string describes — i.e. a symlink stands
+/// between the name we matched and the dentry the hook will see.
+///
+/// The LSM hooks act on the dentry the kernel resolved, never on the string the
+/// syscall was handed. `/usr/bin/nc` is a symlink to `nc.openbsd` on Debian and
+/// Ubuntu, so a `**/nc` rule compiles to the key `nc`, the mirror matches the
+/// observed string, and `bprm_check_security` — looking at a dentry named
+/// `nc.openbsd` — never fires. The row said `BLOCK`, the record said
+/// `enforced: true`, and a line went into the agent's receipt, for an exec that
+/// had just succeeded. The same shape hits `file_open`: a symlink *named*
+/// `.env` pointing at `other.txt` reads straight through a `**/.env` rule.
+///
+/// This reports only what it can *demonstrate*. Refusing to predict whenever
+/// the check is merely inconclusive was tried first and is much worse than it
+/// sounds: the observed path is usually relative to the agent's directory, the
+/// agent is usually something as short-lived as `cat`, and by the time the
+/// event is drained `/proc/<pid>/cwd` is gone — so every ordinary denial lost
+/// its path and the feed fell back to naming a bare kernel key. The kernel's
+/// counters, not this function, are what decide whether enforcement happened;
+/// a redirection we could not see leaves a surplus that the exit cross-check
+/// now names.
+fn path_is_redirected(path: &str, pid: u32) -> bool {
+    let p = Path::new(path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        // Relative to the AGENT's directory. Ask the kernel while the process is
+        // still there; otherwise assume it is the one wardyn launched it in,
+        // which is the same directory unless the agent chdir'd.
+        match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+            Ok(cwd) => cwd.join(p),
+            Err(_) => match std::env::current_dir() {
+                Ok(cwd) => cwd.join(p),
+                Err(_) => return false,
+            },
+        }
+    };
+    // Unresolvable (gone, or not the directory we guessed): nothing shown, so
+    // nothing claimed about it.
+    let Ok(real) = std::fs::canonicalize(&abs) else {
+        return false;
+    };
+    real != lexical_normalize(&abs)
+}
+
+/// `.` and `..` removed textually, without touching the filesystem. Compared
+/// against `canonicalize`, this is what makes a symlink visible: the two agree
+/// exactly when no component was a link (and when no `..` crossed one).
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The first component of `path` that is a symlink, if any.
