@@ -104,9 +104,16 @@ Out of scope (known limitations, documented, not vulnerabilities):
   That stops *accidental and naive* access, and is **bypassable** by renaming or
   hard-linking the target before opening it: a rule that does not name
   `access: delete` permits the `mv`, and `link()` is only consulted for the name
-  it creates, never the object it aliases. Write a `path:` rule alongside it for
-  anything that matters: those are pinned to `(dev, ino)` at load and follow the
-  object through renames and hard links, so the bypass buys nothing.
+  it creates, never the object it aliases. **A symlink defeats it from the other
+  direction**, and needs no preparation at all: the hooks key on the dentry the
+  kernel resolved, so `**/nc` does not cover `/usr/bin/nc` where that is a link
+  to `nc.openbsd` — as it is on Debian and Ubuntu — and a link *named* `.env`
+  pointing elsewhere reads straight through `**/.env`. Wardyn does not claim
+  otherwise: a redirected rule renders `block~` and is never receipted (it used
+  to render `BLOCK` and was, which is the bug that made this paragraph). Write a
+  `path:` rule alongside it for anything that matters: those are pinned to
+  `(dev, ino)` at load — resolving the symlink as they go — and follow the object
+  through renames and hard links, so the bypass buys nothing.
 
 - **What identity matching still does not cover.**
   - **Objects that do not exist when the policy loads** cannot be pinned. A `path:`
