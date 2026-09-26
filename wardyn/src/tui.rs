@@ -342,6 +342,8 @@ fn exception_row(key: &DenialKey) -> Desc {
         excepted: true,
         kernel: false,
         notice: false,
+        // The operator granted this, not the agent: it belongs to no task.
+        task: None,
     }
 }
 

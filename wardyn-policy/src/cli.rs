@@ -96,6 +96,13 @@ pub struct Opts {
     pub override_ttl_days: u32,
     pub keep_root: bool,
     pub as_user: Option<String>,
+    /// Record which unit of agent work each event came from, read from
+    /// `WARDYN_TASK` in the environment at exec. Off by default: it costs a
+    /// bounded walk of the environment on every exec.
+    ///
+    /// The agent sets the variable, so this is attribution and never authority:
+    /// wardyn records the value and never matches a rule on it.
+    pub tasks: bool,
     pub mode: Mode,
 }
 
@@ -123,6 +130,8 @@ pub const USAGE: &str = "wardyn — a kernel-level warden for AI coding agents\n
      --overrides <path>  stored approvals (default: /var/lib/wardyn/overrides.yaml)\n  \
      --override-ttl <days>  how long a stored approval lasts (default: 30, 0 disables storing)\n  \
      --as-user <spec>  run the agent as uid[:gid] instead of root (default: $SUDO_UID)\n  \
+     --tasks           record $WARDYN_TASK (set by the agent around each tool call)\n  \
+     on every event, so a denial names the work that caused it\n  \
      --keep-root       do NOT drop the agent's privileges (unsafe under --enforce)\n  \
      -h, --help        print this help\n  \
      -V, --version     print version";
@@ -145,6 +154,7 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
     let mut override_ttl_days = crate::overrides::DEFAULT_TTL_DAYS;
     let mut keep_root = false;
     let mut as_user = None;
+    let mut tasks = false;
 
     // An option's value must not itself look like an option: `wardyn --audit
     // --enforce run -- x` silently consumed `--enforce` as the audit path and
@@ -231,6 +241,10 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
                         .into_owned(),
                 );
             }
+            Some("--tasks") => {
+                tasks = true;
+                it.next();
+            }
             _ => break,
         }
     }
@@ -292,6 +306,7 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
         override_ttl_days,
         keep_root,
         as_user,
+        tasks,
         mode,
     })))
 }

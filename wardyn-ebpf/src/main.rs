@@ -29,9 +29,13 @@ use aya_ebpf::{
 };
 use wardyn_common::{
     action, fmode, kind, meta, stat, Event, InodeKey, Ip6Key, NameKey, PairKey, PortKey4, PortKey6,
-    ProtoKey4, ProtoKey6, ProtoPortKey4, ProtoPortKey6, COMM_LEN, MAX_DIR_WALK, NAME_LEN, PATH_LEN,
-    PORT_BITS, PROTO_BITS,
+    ProtoKey4, ProtoKey6, ProtoPortKey4, ProtoPortKey6, COMM_LEN, MAX_DIR_WALK, MAX_ENV_SCAN,
+    NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS, TASK_LEN, TASK_VAR,
 };
+
+/// `TASK_VAR.len()` as a constant usable for array sizes.
+const TASK_VAR_LEN: usize = 12;
+const _: () = assert!(TASK_VAR.len() == TASK_VAR_LEN);
 
 /// The kernel refuses GPL-only helpers (`bpf_probe_read_kernel`, which every
 /// matcher here depends on) unless the object carries a GPL-compatible license
@@ -62,6 +66,15 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 /// `STATS[WATCH_FULL]` makes any remaining saturation loud.
 #[map]
 static WATCHED: HashMap<u32, u8> = HashMap::with_max_entries(65536, 0);
+
+/// tgid → the unit of agent work that process belongs to, captured from its
+/// environment at `execve` and inherited by everything it forks.
+///
+/// Userspace reads this to label an event; nothing in the kernel ever *matches*
+/// on it. The agent sets the variable, so this is attribution — evidence about
+/// an agent making mistakes, never about one telling lies.
+#[map]
+static TASKS: HashMap<u32, [u8; TASK_LEN]> = HashMap::with_max_entries(4096, 0);
 
 /// Config: [0] watch_all, [1] enforce, [2] net_default (action code),
 /// [3] pid-ns handshake nonce (userspace→kernel), [4] learned init-ns tgid
@@ -246,8 +259,16 @@ const CFG_PAIRS_ON: u32 = 23;
 const CFG_TASK_SIGNAL_OFF: u32 = 24;
 const CFG_SIGNAL_LIVE_OFF: u32 = 25;
 const CFG_GROUP_DEAD_ON: u32 = 26;
+/// Scan `execve`'s environment for [`TASK_VAR`] and remember it per process, so
+/// a denial can name the unit of *agent* work it came from. Off unless the
+/// operator asked: it costs a bounded walk of the environment on every exec.
+const CFG_TASKS_ON: u32 = 27;
 
 const EXECVE_FILENAME_OFFSET: usize = 16;
+// execve(filename, argv, envp) — envp is the 3rd arg, two slots past filename.
+const EXECVE_ENVP_OFFSET: usize = 32;
+// execveat(fd, filename, argv, envp, flags) — one slot further along than execve.
+const EXECVEAT_ENVP_OFFSET: usize = 40;
 // personality(persona) — persona is the 1st arg, same slot as execve's filename.
 const PERSONALITY_ARG_OFFSET: usize = 16;
 // execveat(fd, filename, ...) — filename is the 2nd arg, so one slot further in.
@@ -341,8 +362,65 @@ fn in_scope(pid: u32) -> bool {
 
 // ── exec + open observation ─────────────────────────────────────────────────
 
+/// Walk `envp` for [`TASK_VAR`] and record its value against this tgid.
+///
+/// Done here, at `sys_enter_execve`, because this runs in the *execing
+/// process's own context*: the environment is its own user memory and the tgid
+/// is the kernel's, so no namespace translation is needed anywhere. The same
+/// value read from `/proc` in userspace cannot work inside a pid namespace —
+/// see [`TASK_VAR`].
+///
+/// Absent or unreadable leaves any previous value in place rather than clearing
+/// it: an exec that does not re-declare the task is still part of the one that
+/// spawned it, and a failed user read is not evidence that the task ended.
+fn capture_task(ctx: &TracePointContext, envp_off: usize) {
+    if cfg(CFG_TASKS_ON) == 0 {
+        return;
+    }
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let Ok(envp) = (unsafe { ctx.read_at::<u64>(envp_off) }) else {
+        return;
+    };
+    if envp == 0 {
+        return;
+    }
+    for i in 0..MAX_ENV_SCAN {
+        // envp is a NULL-terminated array of pointers in user memory.
+        let slot = (envp as usize).wrapping_add(i * core::mem::size_of::<u64>()) as *const u64;
+        let Ok(entry) = (unsafe { bpf_probe_read_user::<u64>(slot) }) else {
+            return;
+        };
+        if entry == 0 {
+            return; // end of the environment
+        }
+        // Prefix plus value in one read: the string is `KEY=value`, so a match
+        // leaves the value already sitting at a known offset in the buffer.
+        let mut buf = [0u8; TASK_VAR_LEN + TASK_LEN];
+        if unsafe { bpf_probe_read_user_str_bytes(entry as *const u8, &mut buf) }.is_err() {
+            continue;
+        }
+        let mut matched = true;
+        for j in 0..TASK_VAR_LEN {
+            if buf[j] != TASK_VAR[j] {
+                matched = false;
+                break;
+            }
+        }
+        if !matched {
+            continue;
+        }
+        let mut val = [0u8; TASK_LEN];
+        for j in 0..TASK_LEN {
+            val[j] = buf[TASK_VAR_LEN + j];
+        }
+        let _ = TASKS.insert(&tgid, &val, 0);
+        return;
+    }
+}
+
 #[tracepoint]
 pub fn wardyn_execve(ctx: TracePointContext) -> u32 {
+    capture_task(&ctx, EXECVE_ENVP_OFFSET);
     let _ = emit_path_event(&ctx, kind::EXEC, EXECVE_FILENAME_OFFSET, NO_FLAGS);
     0
 }
@@ -372,6 +450,7 @@ pub fn wardyn_openat2(ctx: TracePointContext) -> u32 {
 
 #[tracepoint]
 pub fn wardyn_execveat(ctx: TracePointContext) -> u32 {
+    capture_task(&ctx, EXECVEAT_ENVP_OFFSET);
     let _ = emit_path_event(&ctx, kind::EXEC, EXECVEAT_FILENAME_OFFSET, NO_FLAGS);
     0
 }
@@ -1646,6 +1725,13 @@ fn handle_fork(ctx: &TracePointContext) -> Result<(), i64> {
     // the new thread's tid, which the map does not need (the tgid is already
     // watched) — `wardyn_exit` drops those again as each thread dies, so they
     // cannot accumulate toward saturation.
+    // The child belongs to the same unit of agent work as its parent — a denial
+    // inside a `make` should name the tool call that ran it, not nothing.
+    if cfg(CFG_TASKS_ON) != 0 {
+        if let Some(t) = unsafe { TASKS.get(&parent) } {
+            let _ = TASKS.insert(&child, t, 0);
+        }
+    }
     if WATCHED.insert(&child, &1u8, 0).is_err() {
         // The watch set is full: this child, and its whole subtree, is about to
         // run completely unobserved and unenforced. Userspace turns this counter
@@ -1694,6 +1780,7 @@ pub fn wardyn_exit(_ctx: TracePointContext) -> u32 {
                 // was the last one — the whole group is gone.
                 if live == 0 {
                     let _ = WATCHED.remove(&tgid);
+                    let _ = TASKS.remove(&tgid);
                 } else if tid != tgid {
                     // A worker left; the process lives on. Drop only its tid.
                     let _ = WATCHED.remove(&tid);
@@ -1712,6 +1799,7 @@ pub fn wardyn_exit(_ctx: TracePointContext) -> u32 {
     }
     if cfg(CFG_DEFER_EVICT) == 0 {
         let _ = WATCHED.remove(&tgid);
+        let _ = TASKS.remove(&tgid);
     }
     0
 }
