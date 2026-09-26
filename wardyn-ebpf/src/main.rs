@@ -410,9 +410,7 @@ fn capture_task(ctx: &TracePointContext, envp_off: usize) {
             continue;
         }
         let mut val = [0u8; TASK_LEN];
-        for j in 0..TASK_LEN {
-            val[j] = buf[TASK_VAR_LEN + j];
-        }
+        val.copy_from_slice(&buf[TASK_VAR_LEN..TASK_VAR_LEN + TASK_LEN]);
         let _ = TASKS.insert(&tgid, &val, 0);
         return;
     }
