@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A name rule a symlink redirects was reported as an enforced denial that
+  never happened.** The LSM hooks key on the dentry the kernel resolved; the
+  userspace mirror matched the string the syscall was handed. Where a symlink
+  separates the two the rule does not fire — `**/nc` does not cover
+  `/usr/bin/nc` on Debian or Ubuntu, where it links to `nc.openbsd`, and a link
+  *named* `.env` reads straight through `**/.env`. That much is a documented
+  limit of name matching. What was not documented, and not permitted, is what
+  wardyn said about it: the row read `BLOCK`, the record `"enforced": true`, and
+  a line went into the agent's receipt — for an exec that had just succeeded and
+  an open that had just returned the bytes.
+
+  Found while building a hands-on demo: the feed showed `exec BLOCK
+  /usr/bin/nc` two lines above `kernel denials — 0 exec`, and netcat ran.
+
+  A prediction is now dropped when the path can be *shown* to resolve elsewhere,
+  so the row renders `block~` — flagged, not denied, in the vocabulary the
+  project already had — and nothing is receipted. Refusing to predict whenever
+  the check was merely inconclusive was tried first and is much worse: the
+  observed path is usually relative to the agent's directory, the agent is
+  usually something as short-lived as `cat`, and `/proc/<pid>/cwd` is gone by
+  the time the event is drained, so every ordinary denial lost its path and the
+  feed fell back to naming a bare kernel key. The check costs one
+  `canonicalize` on the rare path where a denial is about to be claimed, and
+  nothing at all on an ordinary allow.
+
+  The exit cross-check grew the other half of this. It only ever fired when the
+  kernel counted **zero** denials, so a run where most denials were real hid the
+  fictional one behind them — five claimed against four counted went unremarked.
+  Any surplus is now named: one invented denial is the same failure as a
+  hundred, because the agent is told it was stopped when it was not.
+
+  `path:` rules were unaffected throughout and remain the sound alternative:
+  they resolve the symlink at load and pin `(dev, ino)`, which the e2e now shows
+  denying the same binary the name rule misses.
+
 - **A directory rule claimed "any depth" while the kernel walked 16 ancestors,
   so a secret buried deeper was read with nothing in the feed.** `--dry-run`
   printed *"denies opening ANY file under a directory named `vault` (any
