@@ -292,6 +292,7 @@ mod tests {
                 true,
                 true,
                 Some("name=.env"),
+                None,
             );
             a.record(
                 42,
@@ -366,6 +367,7 @@ mod tests {
                 true,
                 true,
                 Some("name=.env"),
+                None,
             );
         }
         let text = std::fs::read_to_string(&path).unwrap();
