@@ -221,8 +221,9 @@ impl Audit {
         enforced: bool,
         kernel_reported: bool,
         matched_key: Option<&str>,
+        task: Option<&str>,
     ) {
-        let line = event_json(
+        let mut line = event_json(
             &now(),
             pid,
             comm,
@@ -234,6 +235,11 @@ impl Audit {
             kernel_reported,
             matched_key,
         );
+        // Absent rather than null when the agent reported none, so a consumer
+        // can tell "this agent does not report tasks" from "no task here".
+        if let (Some(t), Some(o)) = (task, line.as_object_mut()) {
+            o.insert("task".into(), t.into());
+        }
         if self.write_line(&line) {
             self.count += 1;
         }
@@ -286,6 +292,7 @@ mod tests {
                 true,
                 true,
                 Some("name=.env"),
+                None,
             );
             a.record(
                 42,
@@ -296,6 +303,7 @@ mod tests {
                 "**/.npmrc",
                 false,
                 false,
+                None,
                 None,
             );
             a.record_exception("name=.env", "opening ANY file named `.env`");
@@ -359,6 +367,7 @@ mod tests {
                 true,
                 true,
                 Some("name=.env"),
+                None,
             );
         }
         let text = std::fs::read_to_string(&path).unwrap();
@@ -377,7 +386,18 @@ mod tests {
         std::fs::remove_file(&path).ok();
         for _ in 0..2 {
             let mut a = Audit::create(&path).unwrap();
-            a.record(1, "x", "open", "/x", Action::Warn, "**", false, false, None);
+            a.record(
+                1,
+                "x",
+                "open",
+                "/x",
+                Action::Warn,
+                "**",
+                false,
+                false,
+                None,
+                None,
+            );
         }
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 2, "a new run must not truncate");
@@ -477,6 +497,7 @@ mod tests {
                 "**",
                 false,
                 false,
+                None,
                 None,
             );
         }

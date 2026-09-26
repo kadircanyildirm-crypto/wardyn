@@ -1240,6 +1240,56 @@ else
   skip "symlink-redirected name rule (needs BPF-LSM)"
 fi
 
+# ── a denial names the agent's own unit of work, not just a pid ─────────────
+# The kernel attributes to a process tree, which is the wrong grain for an
+# agent: one `node` does a hundred unrelated things. A harness that exports
+# WARDYN_TASK around each tool call it spawns gets every event from that
+# subtree labelled — read in the exec hook, in the process's own context, so it
+# works inside a pid namespace where reading /proc from userspace cannot.
+if [[ $LSM_ACTIVE -eq 1 ]]; then
+  TK="$(mktemp -d)"; chmod 755 "$TK"
+  printf 'SECRET_API_KEY=sk-task-not-real\n' >"$TK/.env"; chmod 644 "$TK/.env"
+  cat >"$TK/pol.yaml" <<YAML
+default_action: allow
+files:
+  - { match: "**/.env", action: block }
+network: []
+exec:
+  - { match: "**", action: allow }
+YAML
+  # Two labelled tool calls; the second nests a shell, to show the label is
+  # inherited by the whole subtree and not only the process that carried it.
+  cat >"$TK/harness.sh" <<HARNESS
+cd "$TK"
+WARDYN_TASK=tool-alpha sh -c 'cat .env >/dev/null 2>&1'
+WARDYN_TASK=tool-beta  sh -c 'sh -c "cat .env >/dev/null 2>&1"'
+HARNESS
+  "$WARDYN" --enforce --format json --tasks --policy "$TK/pol.yaml" \
+    --audit "$TK/audit.jsonl" run -- sh "$TK/harness.sh" >"$TK/stream.json" 2>"$TK/err.log" || true
+  if grep -a '"enforced":true' "$TK/audit.jsonl" 2>/dev/null | grep -q '"task":"tool-alpha"'; then
+    pass "tasks: a denial names the tool call that caused it"
+  else
+    fail "tasks: the denial carried no task (got: $(grep -ao '"task":"[^"]*"' "$TK/audit.jsonl" | head -1))"
+  fi
+  if grep -a '"enforced":true' "$TK/audit.jsonl" 2>/dev/null | grep -q '"task":"tool-beta"'; then
+    pass "tasks: the label is inherited by a nested child"
+  else
+    fail "tasks: a nested child lost the task label"
+  fi
+  # Without --tasks the field must not appear at all: it is opt-in, and its
+  # absence is how a consumer knows this agent does not report tasks.
+  "$WARDYN" --enforce --format json --policy "$TK/pol.yaml" --audit "$TK/off.jsonl" \
+    run -- sh "$TK/harness.sh" >/dev/null 2>&1 || true
+  if grep -aq '"task"' "$TK/off.jsonl" 2>/dev/null; then
+    fail "tasks: a task field appeared without --tasks"
+  else
+    pass "tasks: nothing recorded unless asked for"
+  fi
+  rm -rf "$TK"
+else
+  skip "task attribution (needs BPF-LSM)"
+fi
+
 # ── summary ─────────────────────────────────────────────────────────────────
 echo
 if [[ $FAIL -gt 0 ]]; then

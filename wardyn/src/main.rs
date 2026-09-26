@@ -25,7 +25,7 @@ mod overrides_file;
 mod receipt;
 mod tui;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::IsTerminal as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -39,7 +39,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 use wardyn_common::{
     action, fmode, kind, meta, stat, Event, InodeKey, PairKey, PortKey4, PortKey6, ProtoKey4,
-    ProtoKey6, ProtoPortKey4, ProtoPortKey6, NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS,
+    ProtoKey6, ProtoPortKey4, ProtoPortKey6, NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS, TASK_LEN,
 };
 use wardyn_policy::cli::{self, Format, Mode, Opts, ParseOutcome};
 use wardyn_policy::identity::AnchorBase;
@@ -259,6 +259,7 @@ const CFG_PORT_RULES_ON: u32 = 20;
 const CFG_LIFECYCLE_ON: u32 = 21;
 const CFG_PROTO_RULES_ON: u32 = 22;
 const CFG_PAIRS_ON: u32 = 23;
+const CFG_TASKS_ON: u32 = 27;
 const CFG_TASK_SIGNAL_OFF: u32 = 24;
 const CFG_SIGNAL_LIVE_OFF: u32 = 25;
 const CFG_GROUP_DEAD_ON: u32 = 26;
@@ -909,6 +910,10 @@ pub(crate) struct RunCtx<'a> {
     /// Approvals that outlive the run. `None` when the store could not be used;
     /// the run still grants exceptions, they just do not survive it.
     pub approvals: Option<Approvals>,
+    /// Resolves a pid to the unit of agent work it belongs to. `None` unless
+    /// `--task-var` asked for it, so a run that does not want the `/proc` reads
+    /// does not pay for them.
+    pub tasks: Option<TaskIds>,
 }
 
 impl RunCtx<'_> {
@@ -2037,6 +2042,26 @@ async fn run() -> anyhow::Result<i32> {
     let defer_evict = matches!(opts.mode, Mode::Run(_)) && !ns_mismatch;
     config.set(CFG_DEFER_EVICT, u32::from(defer_evict), 0)?;
 
+    // Task attribution is captured in the exec hook, in the execing process's
+    // own context, so it needs no pid translation and works inside a pid
+    // namespace — which is where agents actually run. Reading `/proc` from
+    // userspace was tried first and cannot: an event carries the kernel's pid,
+    // and from inside a namespace there is no way back to a local /proc entry.
+    config.set(CFG_TASKS_ON, u32::from(opts.tasks), 0)?;
+    let tasks = if opts.tasks {
+        match ebpf.take_map("TASKS").map(BpfHashMap::try_from) {
+            Some(Ok(m)) => Some(TaskIds::new(m)),
+            _ => {
+                notices.push(
+                    "the TASKS map could not be opened; events will carry no `task`.".to_string(),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Kept alive for the whole run so the TUI can grant exceptions into them.
     let mut kernel_maps = KernelMaps::load(&mut ebpf, &policy)?;
 
@@ -2213,6 +2238,7 @@ async fn run() -> anyhow::Result<i32> {
         watched: watched_map,
         pending: VecDeque::new(),
         approvals,
+        tasks,
     };
     let result = if use_tui {
         tui::run(async_fd, &mut child, opts.mode.label(), &mut ctx, notices).await
@@ -2527,6 +2553,12 @@ fn stream_json(enforce: bool, d: &Desc) -> serde_json::Value {
     if let Some(o) = v.as_object_mut() {
         o.insert("enforceable".into(), d.enforceable.into());
         o.insert("excepted".into(), d.excepted.into());
+        // Only when the agent supplied one. Absent rather than null, so a
+        // consumer can tell "this agent does not report tasks" from "this
+        // action belonged to no task".
+        if let Some(t) = &d.task {
+            o.insert("task".into(), t.clone().into());
+        }
     }
     v
 }
@@ -2542,6 +2574,70 @@ fn stream_json(enforce: bool, d: &Desc) -> serde_json::Value {
 /// appear in `STATS` — and the honesty cross-check at the end of a run has to
 /// know that, or it declares a working containment run a failure.
 pub(crate) const CONTAINMENT_RULE: &str = "allow_paths: ";
+
+/// Maps a watched process to the unit of *agent* work it is doing, by reading
+/// one environment variable out of `/proc/<pid>/environ` the first time that
+/// process is seen.
+///
+/// The kernel attributes to a process tree, which is the wrong grain for an
+/// agent: one `node` does a hundred unrelated things, and `openat` from tool
+/// call 3 is indistinguishable from `openat` from tool call 40. A harness that
+/// exports `WARDYN_TASK=<id>` around each tool call it spawns closes that gap —
+/// the value is inherited by the whole subtree, so a denial deep in a `make`
+/// still names the tool call that started it.
+///
+/// **What this is not.** The agent sets the variable, so the agent controls it.
+/// That makes it sound for telling *which* of an agent's actions tripped a
+/// rule, and unsound as anything a decision could rest on — an agent that wants
+/// to lie can. Wardyn therefore records it and never matches on it, the same
+/// line it draws between a name and a `(dev, ino)`.
+///
+/// **What it cannot see.** A tool call that does its I/O in-process — a Node or
+/// Python agent calling `open()` itself — creates no new process, so it shares
+/// the tgid and the task id of whatever exec'd last. Per-call attribution there
+/// needs a uprobe on the agent's dispatch, or the agent handing the id to a
+/// helper; neither is in scope here, and the gap is documented rather than
+/// papered over.
+pub(crate) struct TaskIds {
+    map: BpfHashMap<MapData, u32, [u8; TASK_LEN]>,
+    /// `None` is cached too: a process that carried no task id must not cost a
+    /// map lookup on every event it goes on to produce.
+    seen: HashMap<u32, Option<String>>,
+}
+
+impl TaskIds {
+    pub fn new(map: BpfHashMap<MapData, u32, [u8; TASK_LEN]>) -> Self {
+        Self {
+            map,
+            seen: HashMap::new(),
+        }
+    }
+
+    /// The task id for `pid`, looked up once and remembered.
+    pub fn of(&mut self, pid: u32) -> Option<String> {
+        if let Some(hit) = self.seen.get(&pid) {
+            return hit.clone();
+        }
+        let found = self.map.get(&pid, 0).ok().and_then(|v| Self::render(&v));
+        self.seen.insert(pid, found.clone());
+        // A long run churns through processes; keep the cache from growing
+        // without bound. It is an optimisation, so dropping it costs a re-read.
+        if self.seen.len() > 8192 {
+            self.seen.clear();
+        }
+        found
+    }
+
+    /// NUL-padded bytes from the kernel into a label safe to put in a log line.
+    fn render(v: &[u8; TASK_LEN]) -> Option<String> {
+        let end = v.iter().position(|&b| b == 0).unwrap_or(TASK_LEN);
+        let text: String = String::from_utf8_lossy(&v[..end])
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        (!text.is_empty()).then_some(text)
+    }
+}
 
 pub(crate) struct Desc {
     pub pid: u32,
@@ -2563,6 +2659,12 @@ pub(crate) struct Desc {
     /// An operator/diagnostic message, not an observed action: never counted as
     /// a policy verdict.
     pub notice: bool,
+    /// Which unit of the agent's own work this came from, when the agent said
+    /// so — see [`TaskIds`]. `None` when it did not, which is most of the time.
+    ///
+    /// **Attribution, not identity.** The agent sets this itself, so it is
+    /// evidence about an agent making mistakes, never about one telling lies.
+    pub task: Option<String>,
 }
 
 impl Desc {
@@ -2657,6 +2759,7 @@ pub(crate) fn notice_row(text: &str) -> Desc {
         excepted: false,
         kernel: false,
         notice: true,
+        task: None,
     }
 }
 
@@ -2688,9 +2791,18 @@ pub(crate) fn drain(
                 continue;
             }
         }
-        let Some(d) = describe(&ev, ctx.policy, enforce, enforce_files, exceptions) else {
+        let Some(mut d) = describe(&ev, ctx.policy, enforce, enforce_files, exceptions) else {
             continue;
         };
+        // Which unit of the agent's own work this belongs to, if the agent said.
+        // Resolved here rather than in `describe` because it reads `/proc` — a
+        // side effect the pure decoding path is deliberately free of, and one
+        // the unit tests must not depend on the machine for.
+        if !d.notice {
+            if let Some(t) = ctx.tasks.as_mut() {
+                d.task = t.of(ev.pid);
+            }
+        }
         if !d.notice && d.action != Action::Allow {
             ctx.audit.record(
                 d.pid,
@@ -2702,6 +2814,7 @@ pub(crate) fn drain(
                 d.denied(enforce),
                 d.kernel,
                 d.matched_key().as_deref(),
+                d.task.as_deref(),
             );
             // The receipt is the agent's view: only what the kernel really
             // denied belongs there — not warns, not unenforced `block~`.
@@ -2948,6 +3061,7 @@ pub(crate) fn describe(
                 excepted: false,
                 kernel: true,
                 notice: false,
+                task: None,
             });
         }
         kind::DENY_NET => {
@@ -2997,6 +3111,7 @@ pub(crate) fn describe(
                 excepted: false,
                 kernel: true,
                 notice: false,
+                task: None,
             });
         }
         _ => {}
@@ -3026,6 +3141,7 @@ pub(crate) fn describe(
                     excepted: false,
                     kernel: false,
                     notice: false,
+                    task: None,
                 });
             };
             let kd = if enforce_files {
@@ -3130,6 +3246,7 @@ pub(crate) fn describe(
         excepted,
         kernel: false,
         notice: false,
+        task: None,
     })
 }
 
@@ -3891,6 +4008,7 @@ mod tests {
             excepted: false,
             kernel,
             notice: false,
+            task: None,
         }
     }
 

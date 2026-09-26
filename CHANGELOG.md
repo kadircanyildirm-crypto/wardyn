@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--tasks`: a denial names the unit of agent work that caused it, not just a
+  pid.** A pid is the wrong grain for an agent — one `node` does a hundred
+  unrelated things, and at the syscall boundary an `openat` from tool call 3 is
+  indistinguishable from one from tool call 40. A harness that exports
+  `WARDYN_TASK` around each tool call it spawns now gets every event from that
+  subtree labelled with it, in the feed, the JSON stream and the audit log:
+
+  ```json
+  {"event":"open","action":"block","enforced":true,"detail":".env",
+   "rule":"**/.env","task":"tool-2-read-secret","pid":4288}
+  ```
+
+  The label is inherited by the whole subtree, so a denial three processes deep
+  inside a `make` still names the tool call that started it.
+
+  It is read in the **exec hook**, in the execing process's own context.
+  Reading it from `/proc` in userspace was built first and thrown away: an
+  event carries the *kernel's* pid, and from inside a pid namespace there is no
+  way back to a local `/proc` entry — a process cannot see its own
+  outer-namespace pid, which is why wardyn needs a handshake to learn its own.
+  That version worked on a bare host and was off exactly where agents actually
+  run. Doing it at exec sidesteps the mapping entirely.
+
+  Two things it is not, both deliberate. It is **attribution, never
+  authority**: the agent sets the variable, so wardyn records the value and
+  never matches a rule on it — evidence about an agent making mistakes, not
+  about one telling lies. And a tool call that never spawns (a Node or Python
+  agent calling `open()` in-process) keeps the tgid, and the label, of whatever
+  exec'd last; per-call attribution there needs a uprobe on the agent's own
+  dispatch, which is not built. `task` means "the tool call this subtree came
+  from", not "the call that issued this syscall".
+
+  Opt-in, because it costs a bounded walk of the environment on every exec, and
+  absent rather than null when unasked-for, so a consumer can tell "this agent
+  does not report tasks" from "this action belonged to none".
+
 ### Fixed
 
 - **A name rule a symlink redirects was reported as an enforced denial that

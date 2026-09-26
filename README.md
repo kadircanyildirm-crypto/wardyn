@@ -423,6 +423,44 @@ approval granted against the old text is out of force until the text is put
 back, because an exception to one set of rules must not widen the next.
 `--override-ttl 0` keeps exceptions to the run.
 
+## Which of the agent's actions was it?
+
+A pid is the wrong grain for an agent. One `node` does a hundred unrelated
+things, and at the syscall boundary an `openat` from tool call 3 is
+indistinguishable from one from tool call 40 — the kernel has no notion of
+either. So a denial says *which process*, and you still have to guess *which
+piece of work* tripped it.
+
+Export `WARDYN_TASK` around each tool call the harness spawns and pass
+`--tasks`:
+
+```console
+$ sudo wardyn --enforce --tasks --format json run -- ./agent
+{"event":"open","action":"block","enforced":true,"detail":".env",
+ "rule":"**/.env","task":"tool-2-read-secret","pid":4288, …}
+{"event":"open","action":"block","enforced":true,"detail":".env",
+ "rule":"**/.env","task":"tool-3-nested-build","pid":4291, …}
+```
+
+The label is inherited by the whole subtree, so a denial three processes deep
+inside a `make` still names the tool call that started it.
+
+It is read **in the exec hook**, in the execing process's own context. Reading
+it from `/proc` in userspace was the obvious first try and cannot work where it
+matters: an event carries the *kernel's* pid, and from inside a pid namespace
+there is no way back to a local `/proc` entry — a process cannot see its own
+outer-namespace pid, which is why wardyn needs a handshake to learn its own.
+Doing it at exec sidesteps the mapping, so attribution works in a container.
+
+**It is attribution, never authority.** The agent sets the variable, so the
+agent controls it. Wardyn records the value and **never matches a rule on it** —
+it is evidence about an agent making mistakes, not about one telling lies, the
+same line this project draws between a name and a `(dev, ino)`. And a tool call
+that never spawns — a Node or Python agent calling `open()` in-process — keeps
+the tgid, and the label, of whatever exec'd last; per-call attribution there
+needs a uprobe on the agent's dispatch, which is not built. Read `task` as "the
+tool call this subtree came from", not "the call that issued this syscall".
+
 ## How it works
 
 <p align="center"><img src="docs/wardyn-inside-the-syscall.gif" width="820"

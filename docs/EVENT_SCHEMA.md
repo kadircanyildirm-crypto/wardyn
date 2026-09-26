@@ -72,9 +72,39 @@ check `schema_version` only to refuse a *future* major you were not written for.
 | `matched_key` | string or null | the kernel key the decision was made on |
 | `enforceable` | bool | stream only — whether a block here *could* be enforced |
 | `excepted` | bool | stream only — an operator exception is covering this |
+| `task` | string | **absent unless** `--task-var` is set and the agent supplied a value. See below |
 
-The audit log carries every field except the last two, which only make sense for
-a row that might be an allow.
+The audit log carries every field except `enforceable` and `excepted`, which
+only make sense for a row that might be an allow.
+
+### `task` — whose work this was, not who it was
+
+A pid is the wrong grain for an agent. One `node` does a hundred unrelated
+things, and an `openat` from tool call 3 is indistinguishable at the syscall
+boundary from one from tool call 40 — the kernel has no notion of either.
+
+`--task-var WARDYN_TASK` closes that gap for the case the kernel *can* see: a
+harness that exports the variable around each tool call it spawns gets every
+event from that subtree labelled with it, so a denial deep inside a `make`
+still names the tool call that started it. Wardyn reads the variable once per
+process, out of `/proc/<pid>/environ`.
+
+Two limits, both deliberate:
+
+- **It is attribution, never authority.** The agent sets the variable, so the
+  agent controls it. Wardyn records the value and **never matches a rule on
+  it** — it is evidence about an agent making mistakes, not about one telling
+  lies. The same line the project draws between a name and a `(dev, ino)`.
+- **A tool call that never spawns is invisible to it.** A Node or Python agent
+  calling `open()` in-process creates no new process, so it keeps the tgid —
+  and the task id — of whatever exec'd last. Per-call attribution there needs a
+  uprobe on the agent's dispatch, or the agent handing the id to a helper;
+  neither is implemented, and the field will simply be stale rather than wrong
+  in a way you can detect. Treat `task` as "the tool call this subtree came
+  from", not "the tool call that issued this syscall".
+
+The field is **absent**, not null, when no value was supplied, so a consumer can
+tell "this agent does not report tasks" from "this action belonged to no task".
 
 ### `action` is not `enforced`
 

@@ -14,6 +14,28 @@ pub const PATH_LEN: usize = 256;
 /// Fixed key width for the file-enforcement basename / directory maps.
 pub const NAME_LEN: usize = 40;
 
+/// The environment variable a harness sets around each unit of agent work — a
+/// tool call, a subtask — and the width of the value wardyn keeps for it.
+///
+/// Read in the **exec hook**, in the process's own context, rather than from
+/// `/proc` in userspace. That was tried first and cannot work where it matters:
+/// an event carries the kernel's pid, and inside a pid namespace there is no
+/// way back from it to this namespace's `/proc` — a process cannot see its own
+/// outer-namespace pid, which is why wardyn needs a handshake to learn its own.
+/// Reading it at exec sidesteps the mapping entirely, so attribution works in a
+/// container, which is where agents actually run.
+///
+/// The name is fixed rather than configurable so the kernel-side prefix compare
+/// stays a constant — the same reason `WARDYN_DENIALS` is a fixed name.
+pub const TASK_VAR: &[u8] = b"WARDYN_TASK=";
+/// Bytes of the value kept, NUL-padded. A task id is a label for a log line.
+pub const TASK_LEN: usize = 48;
+/// How many environment entries the exec hook walks before giving up. The
+/// variable is normally near the end of a harness's environment, but the loop
+/// has to be bounded for the verifier, and an unbounded scan of a huge
+/// environment is not worth the instructions.
+pub const MAX_ENV_SCAN: usize = 48;
+
 /// A NUL-padded file basename or directory name, used as an exact hash-map key
 /// on both sides of the kernel boundary.
 #[repr(C)]
