@@ -45,6 +45,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absent rather than null when unasked-for, so a consumer can tell "this agent
   does not report tasks" from "this action belonged to none".
 
+- **A long-lived agent can re-declare its task without exec'ing**, by opening
+  `/nonexistent/wardyn-task/<id>`. The environment is read at exec, which is no
+  help to an agent that does its tool calls in-process: it exec'd once and has
+  said the same thing ever since. The open fails with `ENOENT`, costs one
+  syscall, needs no privilege, and works inside a pid namespace because it
+  happens in the agent's own context. The bare prefix clears the label, which
+  is the end marker for a finished call.
+
+  The hook records the id and the event never reaches the feed or the log —
+  bookkeeping is not something the agent did to a file, and filtering it in the
+  kernel is the only place it costs nothing downstream. It is still submitted
+  under its own event kind rather than discarded outright, because userspace
+  caches the label per process and a cache with no invalidation would keep
+  serving the previous tool call's id. One record per tool boundary is a better
+  trade than a map lookup per event, which is the thing that actually hurts at
+  volume.
+
+  The alternative was a uprobe on the agent's own dispatch. That ties wardyn to
+  each runtime's internals and breaks on their next refactor, which is why it
+  is not built.
+
+  **Sequential only, and said so plainly.** The label belongs to a thread
+  group, so an agent interleaving tool calls (asyncio, a Node event loop, Tokio
+  moving a task between threads) attributes to whichever call announced last.
+  Keying on the thread id does not rescue it: Node hands the real `open` to a
+  libuv worker, so the announce and the syscall are already on different
+  threads. Interleaved work should not announce at all — a confident wrong
+  attribution is worse than a gap.
+
+  Both the mechanism and the suppression are pinned by e2e assertions: two
+  reads from one process carry two different labels, and the marker appears in
+  neither the stream nor the audit log.
+
 ### Fixed
 
 - **A name rule a symlink redirects was reported as an enforced denial that

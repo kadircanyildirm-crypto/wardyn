@@ -1290,6 +1290,70 @@ else
   skip "task attribution (needs BPF-LSM)"
 fi
 
+# ── a long-lived agent re-declares its task without exec'ing ────────────────
+# The environment is read at exec, so an agent that does its tool calls
+# in-process says the same thing forever. It announces instead with a failing
+# open on /nonexistent/wardyn-task/<id>, which the hook records and drops — so
+# the label follows the work, and the marker itself never reaches the feed.
+if [[ $LSM_ACTIVE -eq 1 ]]; then
+  TM="$(mktemp -d)"; chmod 755 "$TM"
+  printf 'SECRET_API_KEY=sk-mark-not-real\n' >"$TM/.env"; chmod 644 "$TM/.env"
+  cat >"$TM/pol.yaml" <<YAML
+default_action: allow
+files:
+  - { match: "**/.env", action: block }
+network: []
+exec:
+  - { match: "**", action: allow }
+YAML
+  # The marker and the work have to be the SAME process — that is the whole
+  # case it exists for. A shell doing `cat marker; cat .env` would label the
+  # first `cat` and leave the second unlabelled, which is not what a
+  # long-lived agent does.
+  cat >"$TM/agent.c" <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+static void mark(const char *id) {
+    char p[160];
+    snprintf(p, sizeof p, "/nonexistent/wardyn-task/%s", id);
+    int fd = open(p, O_RDONLY);          /* fails with ENOENT, by design */
+    if (fd >= 0) close(fd);
+}
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    mark("mark-one");
+    int a = open(argv[1], O_RDONLY); if (a >= 0) close(a);
+    mark("mark-two");
+    int b = open(argv[1], O_RDONLY); if (b >= 0) close(b);
+    return 0;
+}
+C
+  if ! gcc -O2 -o "$TM/agent" "$TM/agent.c" 2>"$TM/cc.log"; then
+    skip "task marker: could not compile the fixture ($(head -c 100 "$TM/cc.log"))"
+    rm -rf "$TM"; TM=""
+  fi
+  if [[ -n "$TM" ]]; then
+  "$WARDYN" --enforce --format json --tasks --policy "$TM/pol.yaml" \
+    --audit "$TM/audit.jsonl" run -- "$TM/agent" "$TM/.env" >"$TM/stream.json" 2>"$TM/err.log" || true
+  if grep -aq '"task":"mark-two"' "$TM/audit.jsonl" 2>/dev/null; then
+    pass "task marker: a re-declared label reaches the next denial without an exec"
+  else
+    fail "task marker: second label never took ($(grep -ao '\"task\":\"[^\"]*\"' "$TM/audit.jsonl" | tr '\n' ' '))"
+  fi
+  # The marker is bookkeeping: it must not appear as an event anywhere.
+  if grep -aq "wardyn-task" "$TM/stream.json" "$TM/audit.jsonl" 2>/dev/null; then
+    fail "task marker: the marker open was reported as an event"
+  else
+    pass "task marker: the marker itself never reaches the feed"
+  fi
+  rm -rf "$TM"
+  fi
+else
+  skip "task marker (needs BPF-LSM)"
+fi
+
 # ── summary ─────────────────────────────────────────────────────────────────
 echo
 if [[ $FAIL -gt 0 ]]; then

@@ -95,13 +95,21 @@ Two limits, both deliberate:
   agent controls it. Wardyn records the value and **never matches a rule on
   it** — it is evidence about an agent making mistakes, not about one telling
   lies. The same line the project draws between a name and a `(dev, ino)`.
-- **A tool call that never spawns is invisible to it.** A Node or Python agent
-  calling `open()` in-process creates no new process, so it keeps the tgid —
-  and the task id — of whatever exec'd last. Per-call attribution there needs a
-  uprobe on the agent's dispatch, or the agent handing the id to a helper;
-  neither is implemented, and the field will simply be stale rather than wrong
-  in a way you can detect. Treat `task` as "the tool call this subtree came
-  from", not "the tool call that issued this syscall".
+- **A long-lived agent announces instead of exec'ing.** An agent that does its
+  tool calls in-process exec'd once, so the environment says the same thing
+  forever. It can re-declare by opening `/nonexistent/wardyn-task/<id>`: the
+  open fails with `ENOENT`, costs one syscall, needs no privilege, and works
+  inside a pid namespace because it happens in the agent's own context. Wardyn
+  records the id and drops the event, so the marker itself never appears in the
+  stream or the log. The bare prefix with no id clears the label.
+- **Sequential only.** The label belongs to a thread group. An agent that
+  interleaves tool calls (asyncio, a Node event loop, Tokio moving a task
+  between threads) attributes to whichever call announced last. Keying on the
+  thread id does not fix it — Node hands the real `open` to a libuv worker, so
+  the announce and the syscall are on different threads. Interleaved work
+  should not announce: a confident wrong attribution is worse than a gap. Read
+  `task` as "the tool call this subtree came from", not "the tool call that
+  issued this syscall".
 
 The field is **absent**, not null, when no value was supplied, so a consumer can
 tell "this agent does not report tasks" from "this action belonged to no task".

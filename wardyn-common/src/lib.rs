@@ -30,6 +30,35 @@ pub const NAME_LEN: usize = 40;
 pub const TASK_VAR: &[u8] = b"WARDYN_TASK=";
 /// Bytes of the value kept, NUL-padded. A task id is a label for a log line.
 pub const TASK_LEN: usize = 48;
+
+/// The path prefix an agent opens to announce a tool boundary *without*
+/// exec'ing: `/nonexistent/wardyn-task/<id>`.
+///
+/// [`TASK_VAR`] is read at exec, which covers a harness that spawns a process
+/// per tool call. It cannot cover a long-lived agent that does its work
+/// in-process: that one exec'd once, and its environment has said the same
+/// thing ever since. The alternative was a uprobe on the agent's dispatch,
+/// which ties wardyn to each runtime's internals and breaks on their next
+/// refactor.
+///
+/// So the agent announces through a syscall wardyn already watches. The open
+/// fails with `ENOENT` and costs nothing but the call; no privilege is needed,
+/// and it works inside a pid namespace because it happens in the agent's own
+/// context. The hook recognises it, records the id and **drops the event**, so
+/// the marker never reaches the feed — bookkeeping is not something the agent
+/// did to a file.
+///
+/// Opening the bare prefix with no id clears the label, which is the end
+/// marker for a tool call that has finished.
+///
+/// **Sequential only.** The label is per thread group, so an agent that
+/// interleaves tool calls on one thread (asyncio, a Node event loop, Tokio
+/// moving a task between threads) will attribute to whichever call announced
+/// last. Keying on the thread id instead does not fix it — Node dispatches the
+/// real `open` to a libuv worker, so the announce and the syscall are on
+/// different threads — and a confident wrong attribution is worse than a gap.
+/// Interleaved work should simply not announce.
+pub const TASK_MARK: &[u8] = b"/nonexistent/wardyn-task/";
 /// How many environment entries the exec hook walks before giving up. The
 /// variable is normally near the end of a harness's environment, but the loop
 /// has to be bounded for the verifier, and an unbounded scan of a huge
@@ -122,6 +151,13 @@ pub mod kind {
     /// match on the *name* being created or on an ancestor directory — never on
     /// the new object's own identity, which does not exist to be matched.
     pub const DENY_CREATE: u32 = 8;
+    /// The agent announced a tool boundary with a [`crate::TASK_MARK`] open.
+    /// `path` holds the marker, id included. Never rendered: it records what
+    /// the agent is doing, not something it did to the system. It exists as an
+    /// event only so userspace can refresh the label it caches per process —
+    /// the kernel already stored it, but a cache with no invalidation would go
+    /// stale the moment a long-lived agent moved to its next tool call.
+    pub const TASK_MARK_EV: u32 = 9;
 }
 
 /// Values of [`Event::meta`], interpreted per `kind`.
