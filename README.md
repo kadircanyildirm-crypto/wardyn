@@ -452,14 +452,36 @@ there is no way back to a local `/proc` entry — a process cannot see its own
 outer-namespace pid, which is why wardyn needs a handshake to learn its own.
 Doing it at exec sidesteps the mapping, so attribution works in a container.
 
-**It is attribution, never authority.** The agent sets the variable, so the
-agent controls it. Wardyn records the value and **never matches a rule on it** —
-it is evidence about an agent making mistakes, not about one telling lies, the
-same line this project draws between a name and a `(dev, ino)`. And a tool call
-that never spawns — a Node or Python agent calling `open()` in-process — keeps
-the tgid, and the label, of whatever exec'd last; per-call attribution there
-needs a uprobe on the agent's dispatch, which is not built. Read `task` as "the
-tool call this subtree came from", not "the call that issued this syscall".
+**A long-lived agent can re-declare without exec'ing.** The environment is read
+at exec, which is no help to an agent that does its tool calls in-process: it
+exec'd once, and has said the same thing ever since. It can announce the next
+boundary by opening a path wardyn already watches:
+
+```console
+$ open("/nonexistent/wardyn-task/tool-7")     # fails with ENOENT, by design
+```
+
+One syscall, no privilege, and it works inside a pid namespace because it
+happens in the agent's own context. Wardyn records the id and **drops the
+event**, so the marker never appears in the feed — bookkeeping is not something
+the agent did to a file. Opening the bare prefix with no id clears the label,
+which is how a tool call says it has finished. The alternative was a uprobe on
+the agent's dispatch, which ties wardyn to each runtime's internals and breaks
+on their next refactor.
+
+**It is attribution, never authority.** The agent sets the label, so the agent
+controls it. Wardyn records the value and **never matches a rule on it** — it is
+evidence about an agent making mistakes, not about one telling lies, the same
+line this project draws between a name and a `(dev, ino)`.
+
+**Sequential only.** The label belongs to a thread group, so an agent that
+interleaves tool calls — asyncio, a Node event loop, Tokio moving a task
+between threads — will attribute to whichever call announced last. Keying on
+the thread id instead does not rescue it: Node hands the real `open` to a libuv
+worker, so the announce and the syscall are already on different threads. A
+confident wrong attribution is worse than a gap, so interleaved work should not
+announce at all, and `task` should be read as "the tool call this subtree came
+from" rather than "the call that issued this syscall".
 
 ## How it works
 

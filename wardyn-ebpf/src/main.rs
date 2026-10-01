@@ -30,12 +30,17 @@ use aya_ebpf::{
 use wardyn_common::{
     action, fmode, kind, meta, stat, Event, InodeKey, Ip6Key, NameKey, PairKey, PortKey4, PortKey6,
     ProtoKey4, ProtoKey6, ProtoPortKey4, ProtoPortKey6, COMM_LEN, MAX_DIR_WALK, MAX_ENV_SCAN,
-    NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS, TASK_LEN, TASK_VAR,
+    NAME_LEN, PATH_LEN, PORT_BITS, PROTO_BITS, TASK_LEN, TASK_MARK, TASK_VAR,
 };
 
 /// `TASK_VAR.len()` as a constant usable for array sizes.
 const TASK_VAR_LEN: usize = 12;
 const _: () = assert!(TASK_VAR.len() == TASK_VAR_LEN);
+/// `TASK_MARK.len()`, likewise. The marker plus a full id has to fit in the
+/// path buffer it is read out of.
+const TASK_MARK_LEN: usize = 25;
+const _: () = assert!(TASK_MARK.len() == TASK_MARK_LEN);
+const _: () = assert!(TASK_MARK_LEN + TASK_LEN <= PATH_LEN);
 
 /// The kernel refuses GPL-only helpers (`bpf_probe_read_kernel`, which every
 /// matcher here depends on) unless the object carries a GPL-compatible license
@@ -523,8 +528,47 @@ fn emit_path_event(
             Err(_) => PATH_LEN as u32,
         };
     }
+    // A tool boundary announced by the agent rather than by an exec. Recorded
+    // and then dropped: the marker is bookkeeping, not something the agent did
+    // to a file, and filtering it here is the only place it costs nothing
+    // downstream. See `TASK_MARK`.
+    if ev_kind == kind::OPEN && cfg(CFG_TASKS_ON) != 0 && unsafe { take_task_mark(e) } {
+        // Submitted under its own kind rather than discarded: userspace caches
+        // the label per process, and without a signal that cache would keep
+        // serving the previous tool call's id. It is dropped at the point of
+        // rendering, so it still never appears in the feed or the log.
+        unsafe { (*e).kind = kind::TASK_MARK_EV };
+    }
     entry.submit(0);
     Ok(())
+}
+
+/// If the path just read into `e` is a [`TASK_MARK`], record the id against
+/// this thread group and report that the event should not be emitted.
+///
+/// An empty id (the bare prefix) stores an all-zero value, which userspace
+/// renders as no label — that is the end marker.
+///
+/// # Safety
+/// `e` must point at a reserved entry whose `path` has just been filled.
+#[inline(always)]
+unsafe fn take_task_mark(e: *mut Event) -> bool {
+    // `addr_of!` and a copy, rather than indexing `(*e).path` directly:
+    // borrowing through a raw pointer is what clippy objects to, and comparing
+    // against a local buffer keeps the ring-buffer entry out of it entirely.
+    let src = core::ptr::addr_of!((*e).path) as *const u8;
+    let mut buf = [0u8; TASK_MARK_LEN + TASK_LEN];
+    core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len());
+    for (j, &want) in TASK_MARK.iter().enumerate() {
+        if buf[j] != want {
+            return false;
+        }
+    }
+    let mut val = [0u8; TASK_LEN];
+    val.copy_from_slice(&buf[TASK_MARK_LEN..]);
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let _ = TASKS.insert(&tgid, &val, 0);
+    true
 }
 
 // ── connect observation ─────────────────────────────────────────────────────

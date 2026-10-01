@@ -2613,6 +2613,20 @@ impl TaskIds {
         }
     }
 
+    /// Record a label the kernel just told us about, replacing anything cached.
+    ///
+    /// The map already holds it — this exists because the cache would otherwise
+    /// keep answering with the previous tool call's id for the rest of the
+    /// process's life. `marker` is the whole `/nonexistent/wardyn-task/<id>`
+    /// path; an empty id clears the label, which is how a tool call says it has
+    /// finished.
+    pub fn observe(&mut self, pid: u32, marker: &str) {
+        let id = marker.rsplit('/').next().unwrap_or("");
+        let cleaned: String = id.chars().filter(|c| !c.is_control()).take(64).collect();
+        self.seen
+            .insert(pid, (!cleaned.is_empty()).then_some(cleaned));
+    }
+
     /// The task id for `pid`, looked up once and remembered.
     pub fn of(&mut self, pid: u32) -> Option<String> {
         if let Some(hit) = self.seen.get(&pid) {
@@ -2790,6 +2804,14 @@ pub(crate) fn drain(
             if ctx.take_prediction(ev.pid, obs_kind, &key_text) {
                 continue;
             }
+        }
+        // The agent naming its next tool call. Not an action against the
+        // system, so it updates the label and produces no row anywhere.
+        if ev.kind == kind::TASK_MARK_EV {
+            if let (Some(t), Some(path)) = (ctx.tasks.as_mut(), event_path(&ev)) {
+                t.observe(ev.pid, &path);
+            }
+            continue;
         }
         let Some(mut d) = describe(&ev, ctx.policy, enforce, enforce_files, exceptions) else {
             continue;
