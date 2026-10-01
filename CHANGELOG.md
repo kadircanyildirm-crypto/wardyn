@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-01
+
+Three escapes, every one of them found by attacking the compiled binary rather
+than by reading the source, and a denial that can finally name which piece of
+the agent's work caused it.
+
+All three had already been through review and were marked closed in
+[`docs/AUDIT.md`](./docs/AUDIT.md) with only the easy half of each actually
+fixed. They are written up below with what the e2e suite now asserts, because a
+security tool that quietly repairs its own bypasses is asking for trust it has
+not earned.
+
 ### Added
+
 
 - **`--tasks`: a denial names the unit of agent work that caused it, not just a
   pid.** A pid is the wrong grain for an agent — one `node` does a hundred
@@ -78,7 +91,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads from one process carry two different labels, and the marker appears in
   neither the stream nor the audit log.
 
+
+
+- **A stress suite: four scenarios that try to break wardyn, each recorded
+  separately** (`just stress`, `docs/stress/`). They run against one sixteen-line
+  policy, so nothing is stopped by a rule the viewer cannot see.
+
+  1. **Every known way around a secret-file rule** — rename, hard link, move the
+     parent directory, symlink, `../` noise. 8 attacks, 8 stopped. The recording
+     then runs the *control*: the same attacks against name rules instead of
+     `(dev, ino)`, where the hard link goes straight through.
+  2. **The agent attacks the warden** — reach the BPF maps, read wardyn's memory,
+     kill it, regain privilege, escape into a user namespace, rewrite the policy,
+     erase the audit log. 15 attempts, 14 refused; the one that worked is the
+     documented policy-in-the-working-directory weakness, and the next line shows
+     it bought nothing for the current run.
+  3. **450 processes and 40,000 opens** — the secret stays denied while ~13,000
+     events are dropped by a full ring buffer, and wardyn says so in numbers.
+     Enforcement lives in the kernel hooks; only observation can be outrun.
+  4. **Real work** — git, gcc, make, python3, 300 files created and deleted under
+     the same enforcing policy. 15 operations, none broken.
+
+  Two rules the suite holds itself to, both learned by getting them wrong first:
+  a failed *setup* step is reported separately from a blocked *read* (a `cat`
+  that fails because the file was never created looks identical to one that was
+  denied), and a missing tool is skipped rather than scored — `bpftool` is not
+  installed everywhere, and "command not found" would otherwise have counted as
+  "the kernel refused you". Scenario 2 issues `bpf(2)` directly for that reason.
+
 ### Fixed
+
 
 - **A name rule a symlink redirects was reported as an enforced denial that
   never happened.** The LSM hooks key on the dentry the kernel resolved; the
@@ -168,35 +210,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the previous behaviour. An e2e assertion runs the exact escape under
   `unshare --pid` so the namespace path is what CI tests.
 
-### Added
 
-- **A stress suite: four scenarios that try to break wardyn, each recorded
-  separately** (`just stress`, `docs/stress/`). They run against one sixteen-line
-  policy, so nothing is stopped by a rule the viewer cannot see.
-
-  1. **Every known way around a secret-file rule** — rename, hard link, move the
-     parent directory, symlink, `../` noise. 8 attacks, 8 stopped. The recording
-     then runs the *control*: the same attacks against name rules instead of
-     `(dev, ino)`, where the hard link goes straight through.
-  2. **The agent attacks the warden** — reach the BPF maps, read wardyn's memory,
-     kill it, regain privilege, escape into a user namespace, rewrite the policy,
-     erase the audit log. 15 attempts, 14 refused; the one that worked is the
-     documented policy-in-the-working-directory weakness, and the next line shows
-     it bought nothing for the current run.
-  3. **450 processes and 40,000 opens** — the secret stays denied while ~13,000
-     events are dropped by a full ring buffer, and wardyn says so in numbers.
-     Enforcement lives in the kernel hooks; only observation can be outrun.
-  4. **Real work** — git, gcc, make, python3, 300 files created and deleted under
-     the same enforcing policy. 15 operations, none broken.
-
-  Two rules the suite holds itself to, both learned by getting them wrong first:
-  a failed *setup* step is reported separately from a blocked *read* (a `cat`
-  that fails because the file was never created looks identical to one that was
-  denied), and a missing tool is skipped rather than scored — `bpftool` is not
-  installed everywhere, and "command not found" would otherwise have counted as
-  "the kernel refused you". Scenario 2 issues `bpf(2)` directly for that reason.
-
-### Fixed
 
 - **The agent kept root's `HOME`, `USER` and `LOGNAME` after the privilege
   drop.** It ran as uid 1000 with `HOME=/root` — a directory it could not even
@@ -1465,7 +1479,8 @@ copying a *blocked binary* to a new name still runs it.
   network-only enforcement when BPF LSM is unavailable.
 - Ready-made policy presets (`policies/permissive.yaml`, `policies/strict.yaml`).
 
-[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/kadircanyildirm-crypto/wardyn/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kadircanyildirm-crypto/wardyn/releases/tag/v0.2.0
