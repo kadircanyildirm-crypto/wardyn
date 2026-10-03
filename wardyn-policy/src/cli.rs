@@ -18,6 +18,11 @@ use anyhow::{bail, Result};
 pub enum Mode {
     All,
     Run(Vec<OsString>),
+    /// `wardyn hook`: read a Claude Code hook payload on stdin and report what
+    /// the receipt in `WARDYN_DENIALS` has recorded since the last call. Needs
+    /// no root and touches no kernel state — it runs inside the watched agent,
+    /// not beside it.
+    Hook,
 }
 
 impl Mode {
@@ -26,6 +31,7 @@ impl Mode {
     pub fn label(&self) -> String {
         match self {
             Mode::All => "system-wide".to_string(),
+            Mode::Hook => "hook".to_string(),
             Mode::Run(argv) => argv
                 .iter()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -118,7 +124,8 @@ pub enum ParseOutcome {
 pub const USAGE: &str = "wardyn — a kernel-level warden for AI coding agents\n\n\
      USAGE:\n  \
      wardyn [OPTIONS] run -- <cmd> [args...]   watch that command's subtree\n  \
-     wardyn [OPTIONS] [--all]                  watch system-wide\n\n\
+     wardyn [OPTIONS] [--all]                  watch system-wide\n  \
+     wardyn hook                               Claude Code hook: report denials to the agent\n\n\
      OPTIONS:\n  \
      --enforce         deny blocked file reads / execs / egress (default: observe)\n  \
      --dry-run         load and check the policy, print its gaps, and exit (no root, no eBPF)\n  \
@@ -265,6 +272,16 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
             }
             Mode::All
         }
+        Some("hook") => {
+            if let Some(extra) = it.next() {
+                bail!(
+                    "unexpected argument `{}` — `wardyn hook` takes none; it reads the hook \
+                     payload on stdin and WARDYN_DENIALS from the environment",
+                    extra.to_string_lossy()
+                );
+            }
+            Mode::Hook
+        }
         Some("run") => {
             let mut rest: Vec<OsString> = it.collect();
             if rest.first().is_some_and(|s| s == "--") {
@@ -278,7 +295,7 @@ pub fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutco
         _ => {
             let shown = next.unwrap_or_default();
             bail!(
-                "unknown argument `{}`; usage: wardyn [OPTIONS] [run -- <cmd> | --all] \
+                "unknown argument `{}`; usage: wardyn [OPTIONS] [run -- <cmd> | --all | hook] \
                  (see --help)",
                 shown.to_string_lossy()
             )
@@ -329,7 +346,7 @@ mod tests {
     fn run_argv(o: &Opts) -> Vec<String> {
         match &o.mode {
             Mode::Run(v) => v.iter().map(|s| s.to_string_lossy().into_owned()).collect(),
-            Mode::All => panic!("expected run mode"),
+            Mode::All | Mode::Hook => panic!("expected run mode"),
         }
     }
 
@@ -503,7 +520,7 @@ mod tests {
         match out {
             ParseOutcome::Run(o) => match o.mode {
                 Mode::Run(argv) => assert_eq!(argv[1], odd, "the exact bytes reach exec()"),
-                Mode::All => panic!("expected run mode"),
+                Mode::All | Mode::Hook => panic!("expected run mode"),
             },
             _ => panic!("expected Run"),
         }
@@ -514,5 +531,17 @@ mod tests {
         let o = parse(&["run", "--", "claude", "refactor auth"]).unwrap();
         assert_eq!(o.mode.label(), "claude refactor auth");
         assert_eq!(Mode::All.label(), "system-wide");
+    }
+    #[test]
+    fn hook_is_its_own_mode() {
+        assert!(matches!(parse(&["hook"]).unwrap().mode, Mode::Hook));
+    }
+
+    #[test]
+    fn hook_takes_no_arguments() {
+        // Silently ignoring a trailing token here would let `wardyn hook --enforce`
+        // look like it did something.
+        let err = parse(&["hook", "--enforce"]).unwrap_err().to_string();
+        assert!(err.contains("takes none"), "{err}");
     }
 }
