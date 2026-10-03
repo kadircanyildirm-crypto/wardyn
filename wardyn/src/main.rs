@@ -20,6 +20,7 @@
 //! operation failed instead of flailing against a bare EPERM.
 mod audit;
 mod btf;
+mod hook;
 mod landlock;
 mod overrides_file;
 mod receipt;
@@ -1548,6 +1549,14 @@ async fn run() -> anyhow::Result<i32> {
         }
         ParseOutcome::Run(o) => *o,
     };
+
+    // `wardyn hook` runs *inside* the agent, as the agent, once per tool call.
+    // It reads a file and writes a line, so it is answered before the root
+    // check, the eBPF load and the policy parse — all of which would either
+    // refuse it or make it far too expensive to sit in that loop.
+    if matches!(opts.mode, Mode::Hook) {
+        return Ok(hook::run());
+    }
 
     // `--dry-run` answers "what would this policy actually do?" without root,
     // eBPF, or a target — the check that used to be impossible before deploying

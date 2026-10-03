@@ -1354,6 +1354,90 @@ else
   skip "task marker (needs BPF-LSM)"
 fi
 
+# ── wardyn hook: the denial reaches the model, not just a file ──────────────
+# `run` writes the receipt; `hook` is what a coding agent's harness calls after
+# each tool call to splice the new denials into the model's next turn. The
+# properties that matter are that it reports a denial exactly once, says the
+# operation cannot be retried, and never breaks the agent when there is
+# nothing to say.
+if [[ $LSM_ACTIVE -eq 1 ]]; then
+  HK="$(mktemp -d)"; chmod 755 "$HK"
+  printf 'SECRET_API_KEY=sk-hook-not-real\n' >"$HK/.env"; chmod 644 "$HK/.env"
+  cat >"$HK/pol.yaml" <<YAML
+default_action: allow
+files:
+  - { match: "**/.env", action: block }
+network: []
+exec:
+  - { match: "**", action: allow }
+YAML
+  # Three reads of the same secret: enough to prove the grouping, which is the
+  # shape a model stuck in a retry loop actually produces.
+  printf 'for i in 1 2 3; do cat .env >/dev/null 2>&1; done\n' >"$HK/agent.sh"
+  ( cd "$HK" && "$WARDYN" --enforce --plain --policy "$HK/pol.yaml" \
+      --denials "$HK/denials.jsonl" run -- bash "$HK/agent.sh" ) \
+      >"$HK/run.log" 2>&1 || true
+
+  if [[ -s "$HK/denials.jsonl" ]]; then
+    export WARDYN_DENIALS="$HK/denials.jsonl"
+    printf '{"hook_event_name":"PostToolUseFailure","tool_name":"Bash"}' \
+      | "$WARDYN" hook >"$HK/h1.json" 2>"$HK/h1.err"
+
+    if grep -aq '"hookSpecificOutput"' "$HK/h1.json" \
+       && grep -aq '"hookEventName":"PostToolUseFailure"' "$HK/h1.json"; then
+      pass "hook: emits hookSpecificOutput and echoes the event it was called for"
+    else
+      fail "hook: no usable hook output ($(head -c 160 "$HK/h1.json"))"
+    fi
+
+    # The point of the whole feature: the model is told retrying is pointless.
+    if grep -aq 'fail the same way' "$HK/h1.json" && grep -aq '\*\*/\.env' "$HK/h1.json"; then
+      pass "hook: names the rule and says the call cannot succeed"
+    else
+      fail "hook: the context does not name the rule or warn against retrying"
+    fi
+
+    # Three identical denials collapse to one line with a count.
+    if grep -aq '(x3)' "$HK/h1.json"; then
+      pass "hook: repeated denials are grouped with a count"
+    else
+      fail "hook: repeats were not grouped ($(head -c 200 "$HK/h1.json"))"
+    fi
+
+    # Called again with nothing new, it must say nothing at all — otherwise the
+    # model sees the same denials after every later tool call and learns to
+    # ignore the channel.
+    printf '{"hook_event_name":"PostToolUse"}' | "$WARDYN" hook >"$HK/h2.json" 2>&1
+    if [[ ! -s "$HK/h2.json" ]]; then
+      pass "hook: a denial is reported once, not after every later tool call"
+    else
+      fail "hook: repeated itself ($(head -c 120 "$HK/h2.json"))"
+    fi
+    unset WARDYN_DENIALS
+  else
+    skip "hook: the run produced no receipt to report"
+  fi
+
+  # Outside a wardyn run there is no receipt in the environment. The hook stays
+  # configured in the agent's settings permanently, so this path has to be
+  # silent and successful rather than an error the agent has to handle.
+  if printf '{}' | env -u WARDYN_DENIALS "$WARDYN" hook >"$HK/h3.json" 2>&1 && [[ ! -s "$HK/h3.json" ]]; then
+    pass "hook: silent and exit 0 when not running under wardyn"
+  else
+    fail "hook: not silent outside a run (rc=$?, $(head -c 120 "$HK/h3.json"))"
+  fi
+
+  # It sits in the agent's inner loop; malformed input must never break it.
+  if printf 'not json at all' | "$WARDYN" hook >/dev/null 2>&1; then
+    pass "hook: garbage on stdin does not break the agent"
+  else
+    fail "hook: non-zero exit on malformed stdin"
+  fi
+  rm -rf "$HK"
+else
+  skip "hook (needs BPF-LSM to produce a real receipt)"
+fi
+
 # ── summary ─────────────────────────────────────────────────────────────────
 echo
 if [[ $FAIL -gt 0 ]]; then

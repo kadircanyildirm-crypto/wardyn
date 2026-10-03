@@ -423,6 +423,70 @@ approval granted against the old text is out of force until the text is put
 back, because an exception to one set of rules must not widen the next.
 `--override-ttl 0` keeps exceptions to the run.
 
+### Putting the denial in front of the model
+
+Standing instructions work when the agent follows them. A model that has just
+watched a command fail with `EPERM` often does not — the reasonable-looking
+move is to retry, and nothing in the error says otherwise.
+
+`wardyn hook` removes the step where the agent has to remember. It reads the
+receipt and prints what a harness splices into the model's next turn, so the
+denial arrives as context rather than as a file the agent might consult. Add it
+to `.claude/settings.json` once:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "wardyn hook" }] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "wardyn hook" }] }
+    ]
+  }
+}
+```
+
+Both events, because a denial usually makes the tool call *fail* —
+`PostToolUse` alone would miss exactly the case this exists for.
+
+What the model then sees, after an agent read a blocked file three times:
+
+```
+wardyn denied 3 operations during that tool call.
+
+  open     /home/me/project/.env   (x3)
+           rule: **/.env
+
+These were refused by the Linux kernel, inside the syscall, under a policy this
+session is running beneath. They are not missing files, not a file-mode problem,
+and not something a different path or sudo will get around — the same call will
+fail the same way.
+
+If the task genuinely needs one of these, stop and tell the operator which rule
+is in the way and what you needed it for. Do not try to work around it, and do
+not silently drop the part of the task that depended on it.
+```
+
+Repeats are collapsed with a count, because the shape this feature exists to
+break is the same denial fifty times, and `(x50)` tells the model something
+fifty identical lines do not.
+
+Three properties it has to have, sitting in the agent's inner loop:
+
+- **It reports a denial once.** A byte offset is kept beside the receipt. A
+  channel that repeats itself after every later tool call is a channel the
+  model learns to skip.
+- **It never breaks the agent.** No receipt, malformed JSON, unreadable
+  cursor — it prints nothing and exits 0. Leave it configured permanently; it
+  costs one exec per tool call and says nothing outside a wardyn run.
+- **It needs no privilege.** `wardyn hook` loads no eBPF, reads no policy and
+  does not want root. It runs *inside* the watched agent, as the agent.
+
+Still advisory, for the same reason the receipt is: the agent could ignore the
+context, or delete the cursor. Enforcement is in kernel maps it cannot reach.
+This only makes the refusal impossible to miss.
+
 ## Which of the agent's actions was it?
 
 A pid is the wrong grain for an agent. One `node` does a hundred unrelated
