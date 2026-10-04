@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A coverage benchmark, with its own miss in the table.**
+  `scripts/bench-coverage.sh` answers the question `scripts/bench.sh` does not:
+  not what wardyn costs, but what it buys. Sixteen attempts on a pinned secret,
+  a blocked binary and blocked egress, plus seven ordinary development
+  operations that have to keep working — **15/16 stopped, 7/7 intact** on
+  kernel 6.18 with BPF-LSM active, now in the README.
+
+  Every attempt is scored by what the *agent* observed, never by wardyn's own
+  log; an earlier draft grepped the run output and matched wardyn echoing its
+  own argv, reporting a leak that had not happened. A missing tool is reported
+  as skipped and excluded from the denominator rather than counted as a win,
+  and a failed setup step is distinguished from a blocked attack.
+
+  The one attempt that succeeds — copying a blocked binary to a new name — is
+  already documented in `SECURITY.md`; it is in the table rather than left out
+  of it. Two incidental findings are written up with it: a `match:` exec rule
+  does not survive an `alternatives` symlink (the LSM hook sees the resolved
+  binary, and wardyn correctly rendered that as `block~`, flagged but not
+  enforced, rather than claiming a denial), and removing a hard link to a
+  pinned inode is itself denied, which is correct and worth knowing before
+  writing `access: all`.
+
+
 - **`wardyn hook`: the denial reaches the model, not just a file.** The receipt
   closed the feedback loop only for an agent written to read it. A coding agent
   driven by a language model is not: it sees `EPERM`, which reads exactly like

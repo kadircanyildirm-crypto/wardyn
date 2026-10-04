@@ -689,6 +689,82 @@ deliberately-open ones — io_uring, AF_UNIX and loopback delegation, raw-socket
 egress, the dentry-name read racing a rename — are the limits
 [SECURITY.md](./SECURITY.md) states, not gaps waiting for a milestone.
 
+## What it stops
+
+A security tool's own number is worth what its method is worth, so the method
+is first: every attempt below is scored by what the **agent** observed — did
+the secret bytes arrive, did the connection open — not by what wardyn's log
+claims. An earlier draft of this benchmark scored wardyn's opinion of itself
+and found a leak that was wardyn echoing its own argv.
+
+`sudo bash scripts/bench-coverage.sh` reproduces the whole table. It runs
+against [`scripts/stress/policy.yaml`](./scripts/stress/policy.yaml) — sixteen
+lines you can read — plus one identity rule on the resolved `nc`, because the
+score is a property of the policy as much as of the tool.
+
+| | kernel 6.18, x86_64, BPF-LSM active |
+| --- | --- |
+| **attacks stopped** | **15 / 16** |
+| **ordinary work still working** | **7 / 7** |
+
+Both halves, weighted the same, because a tool that denies everything scores
+perfectly on the first and is uninstalled on day two.
+
+<details>
+<summary>The sixteen attempts, one line each</summary>
+
+| attempt | result |
+| --- | --- |
+| read the secret directly | denied |
+| rename it, read the new name | denied at the rename |
+| hard-link it elsewhere, read the link | denied |
+| symlink to it, read through the symlink | denied |
+| copy it, read the copy | denied at the copy |
+| rename its **parent directory**, read through the new path | denied at the rename |
+| read the secret whose *name* gives nothing away | denied |
+| reach it by a relative path from inside the directory | denied |
+| reach it by `..` from a sibling directory | denied |
+| `unlink` it | denied |
+| truncate it to nothing | denied |
+| exec a blocked binary via its `alternatives` symlink | denied |
+| exec the resolved binary directly | denied |
+| **copy the blocked binary to a new name and run that** | **ran** |
+| TCP to a blocked address | denied |
+| UDP to a blocked address | denied |
+
+And the other half — `git init/add/commit`, a `gcc` build and run, `python3`
+file I/O, creating and deleting files, reading an allowed file, walking a deep
+tree — all unaffected.
+
+</details>
+
+**The one that got through is documented, not news.** Copying a blocked
+*binary* to a new name produces a different object with a different name, and
+unlike a secret there is no read to deny — it is in
+[`SECURITY.md`](./SECURITY.md) and in the M6 line of the roadmap above. A
+benchmark whose failures are all already written down is the only kind worth
+publishing.
+
+Two things the run showed that are worth a policy author's attention:
+
+- **A name rule does not survive a symlink.** `/usr/bin/nc` is an
+  `alternatives` symlink to `nc.openbsd`; the LSM hook sees the *resolved*
+  binary, so `match: "**/nc"` never fires. Wardyn reported this correctly
+  rather than hiding it — the row rendered as `block~`, flagged but not
+  enforced, which is the vocabulary doing its job. A `path:` rule on the
+  resolved binary holds, which is why the benchmark policy adds one.
+- **Deleting a hard link to a pinned inode is itself denied.** Correct — the
+  link *is* the object — and worth knowing before you write `access: all`.
+
+**Not attempted, and excluded rather than counted as wins:** io_uring
+submissions, AF_UNIX or loopback delegation to an unwatched daemon, and raw
+sockets. These are the limits in [`SECURITY.md`](./SECURITY.md), not gaps
+waiting for a milestone. IPv6 egress was skipped on this host for want of a
+route.
+
+One machine, one kernel, one architecture. That is the honest scope of the
+number until someone else runs it.
+
 ## What it costs
 
 Startup is **~0.9 s** observing and **~2.2 s** under `--enforce` — loading and
