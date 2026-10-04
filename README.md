@@ -423,6 +423,70 @@ approval granted against the old text is out of force until the text is put
 back, because an exception to one set of rules must not widen the next.
 `--override-ttl 0` keeps exceptions to the run.
 
+### Putting the denial in front of the model
+
+Standing instructions work when the agent follows them. A model that has just
+watched a command fail with `EPERM` often does not — the reasonable-looking
+move is to retry, and nothing in the error says otherwise.
+
+`wardyn hook` removes the step where the agent has to remember. It reads the
+receipt and prints what a harness splices into the model's next turn, so the
+denial arrives as context rather than as a file the agent might consult. Add it
+to `.claude/settings.json` once:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "wardyn hook" }] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "wardyn hook" }] }
+    ]
+  }
+}
+```
+
+Both events, because a denial usually makes the tool call *fail* —
+`PostToolUse` alone would miss exactly the case this exists for.
+
+What the model then sees, after an agent read a blocked file three times:
+
+```
+wardyn denied 3 operations during that tool call.
+
+  open     /home/me/project/.env   (x3)
+           rule: **/.env
+
+These were refused by the Linux kernel, inside the syscall, under a policy this
+session is running beneath. They are not missing files, not a file-mode problem,
+and not something a different path or sudo will get around — the same call will
+fail the same way.
+
+If the task genuinely needs one of these, stop and tell the operator which rule
+is in the way and what you needed it for. Do not try to work around it, and do
+not silently drop the part of the task that depended on it.
+```
+
+Repeats are collapsed with a count, because the shape this feature exists to
+break is the same denial fifty times, and `(x50)` tells the model something
+fifty identical lines do not.
+
+Three properties it has to have, sitting in the agent's inner loop:
+
+- **It reports a denial once.** A byte offset is kept beside the receipt. A
+  channel that repeats itself after every later tool call is a channel the
+  model learns to skip.
+- **It never breaks the agent.** No receipt, malformed JSON, unreadable
+  cursor — it prints nothing and exits 0. Leave it configured permanently; it
+  costs one exec per tool call and says nothing outside a wardyn run.
+- **It needs no privilege.** `wardyn hook` loads no eBPF, reads no policy and
+  does not want root. It runs *inside* the watched agent, as the agent.
+
+Still advisory, for the same reason the receipt is: the agent could ignore the
+context, or delete the cursor. Enforcement is in kernel maps it cannot reach.
+This only makes the refusal impossible to miss.
+
 ## Which of the agent's actions was it?
 
 A pid is the wrong grain for an agent. One `node` does a hundred unrelated
@@ -624,6 +688,82 @@ All six are done. What is *not* done is listed rather than implied:
 deliberately-open ones — io_uring, AF_UNIX and loopback delegation, raw-socket
 egress, the dentry-name read racing a rename — are the limits
 [SECURITY.md](./SECURITY.md) states, not gaps waiting for a milestone.
+
+## What it stops
+
+A security tool's own number is worth what its method is worth, so the method
+is first: every attempt below is scored by what the **agent** observed — did
+the secret bytes arrive, did the connection open — not by what wardyn's log
+claims. An earlier draft of this benchmark scored wardyn's opinion of itself
+and found a leak that was wardyn echoing its own argv.
+
+`sudo bash scripts/bench-coverage.sh` reproduces the whole table. It runs
+against [`scripts/stress/policy.yaml`](./scripts/stress/policy.yaml) — sixteen
+lines you can read — plus one identity rule on the resolved `nc`, because the
+score is a property of the policy as much as of the tool.
+
+| | kernel 6.18, x86_64, BPF-LSM active |
+| --- | --- |
+| **attacks stopped** | **15 / 16** |
+| **ordinary work still working** | **7 / 7** |
+
+Both halves, weighted the same, because a tool that denies everything scores
+perfectly on the first and is uninstalled on day two.
+
+<details>
+<summary>The sixteen attempts, one line each</summary>
+
+| attempt | result |
+| --- | --- |
+| read the secret directly | denied |
+| rename it, read the new name | denied at the rename |
+| hard-link it elsewhere, read the link | denied |
+| symlink to it, read through the symlink | denied |
+| copy it, read the copy | denied at the copy |
+| rename its **parent directory**, read through the new path | denied at the rename |
+| read the secret whose *name* gives nothing away | denied |
+| reach it by a relative path from inside the directory | denied |
+| reach it by `..` from a sibling directory | denied |
+| `unlink` it | denied |
+| truncate it to nothing | denied |
+| exec a blocked binary via its `alternatives` symlink | denied |
+| exec the resolved binary directly | denied |
+| **copy the blocked binary to a new name and run that** | **ran** |
+| TCP to a blocked address | denied |
+| UDP to a blocked address | denied |
+
+And the other half — `git init/add/commit`, a `gcc` build and run, `python3`
+file I/O, creating and deleting files, reading an allowed file, walking a deep
+tree — all unaffected.
+
+</details>
+
+**The one that got through is documented, not news.** Copying a blocked
+*binary* to a new name produces a different object with a different name, and
+unlike a secret there is no read to deny — it is in
+[`SECURITY.md`](./SECURITY.md) and in the M6 line of the roadmap above. A
+benchmark whose failures are all already written down is the only kind worth
+publishing.
+
+Two things the run showed that are worth a policy author's attention:
+
+- **A name rule does not survive a symlink.** `/usr/bin/nc` is an
+  `alternatives` symlink to `nc.openbsd`; the LSM hook sees the *resolved*
+  binary, so `match: "**/nc"` never fires. Wardyn reported this correctly
+  rather than hiding it — the row rendered as `block~`, flagged but not
+  enforced, which is the vocabulary doing its job. A `path:` rule on the
+  resolved binary holds, which is why the benchmark policy adds one.
+- **Deleting a hard link to a pinned inode is itself denied.** Correct — the
+  link *is* the object — and worth knowing before you write `access: all`.
+
+**Not attempted, and excluded rather than counted as wins:** io_uring
+submissions, AF_UNIX or loopback delegation to an unwatched daemon, and raw
+sockets. These are the limits in [`SECURITY.md`](./SECURITY.md), not gaps
+waiting for a milestone. IPv6 egress was skipped on this host for want of a
+route.
+
+One machine, one kernel, one architecture. That is the honest scope of the
+number until someone else runs it.
 
 ## What it costs
 

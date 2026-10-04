@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A coverage benchmark, with its own miss in the table.**
+  `scripts/bench-coverage.sh` answers the question `scripts/bench.sh` does not:
+  not what wardyn costs, but what it buys. Sixteen attempts on a pinned secret,
+  a blocked binary and blocked egress, plus seven ordinary development
+  operations that have to keep working — **15/16 stopped, 7/7 intact** on
+  kernel 6.18 with BPF-LSM active, now in the README.
+
+  Every attempt is scored by what the *agent* observed, never by wardyn's own
+  log; an earlier draft grepped the run output and matched wardyn echoing its
+  own argv, reporting a leak that had not happened. A missing tool is reported
+  as skipped and excluded from the denominator rather than counted as a win,
+  and a failed setup step is distinguished from a blocked attack.
+
+  The one attempt that succeeds — copying a blocked binary to a new name — is
+  already documented in `SECURITY.md`; it is in the table rather than left out
+  of it. Two incidental findings are written up with it: a `match:` exec rule
+  does not survive an `alternatives` symlink (the LSM hook sees the resolved
+  binary, and wardyn correctly rendered that as `block~`, flagged but not
+  enforced, rather than claiming a denial), and removing a hard link to a
+  pinned inode is itself denied, which is correct and worth knowing before
+  writing `access: all`.
+
+
+- **`wardyn hook`: the denial reaches the model, not just a file.** The receipt
+  closed the feedback loop only for an agent written to read it. A coding agent
+  driven by a language model is not: it sees `EPERM`, which reads exactly like
+  an ordinary permission problem, and does the reasonable-looking thing —
+  retries, rewrites the path, reaches for `sudo`.
+
+  `wardyn hook` is the command a harness runs after each tool call. It tails the
+  receipt in `WARDYN_DENIALS` and prints what Claude Code splices into the
+  model's next turn, so the refusal arrives as context instead of as a file the
+  agent might think to consult:
+
+  ```
+  wardyn denied 3 operations during that tool call.
+
+    open     /home/me/project/.env   (x3)
+             rule: **/.env
+
+  These were refused by the Linux kernel, inside the syscall ... the same call
+  will fail the same way.
+  ```
+
+  Register it on **both** `PostToolUse` and `PostToolUseFailure`: a denial
+  usually makes the tool call fail, and `PostToolUse` fires only on success —
+  on its own it would miss the case the feature exists for.
+
+  Three properties, all of them because it sits in the agent's inner loop. It
+  reports a denial **once**, tracked by a byte offset kept beside the receipt,
+  because a channel that repeats itself is one the model learns to skip. It
+  **never breaks the agent**: no receipt, malformed JSON, unreadable cursor —
+  print nothing, exit 0, so it can stay configured permanently. And it **needs
+  no privilege**: no eBPF, no policy, no root, running inside the watched agent
+  rather than beside it, which is why it is answered before the root check.
+
+  Repeated refusals are grouped with a count. The shape this exists to break is
+  the same denial fifty times, and `(x50)` tells the model it has already been
+  there in a way fifty identical lines do not.
+
+  Still advisory, exactly as the receipt is. The agent can ignore the context or
+  delete the cursor; enforcement lives in kernel maps it cannot reach. This only
+  makes the refusal impossible to miss.
+
+
 ## [0.5.0] — 2026-10-01
 
 Three escapes, every one of them found by attacking the compiled binary rather
