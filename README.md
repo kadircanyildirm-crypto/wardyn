@@ -816,6 +816,28 @@ Wardyn, but any distributed derivative — **including one offered to others ove
 network** — must be released under the AGPL and make its complete source
 available. You must preserve the copyright and licence notices.
 
+### Using it without the AGPL
+
+The AGPL is the licence everyone gets, and for most people it is the end of the
+matter: run it, study it, modify it, redistribute it, keep the notices.
+
+It stops being workable if you need Wardyn inside something you cannot open —
+a closed-source product, or a deployment whose source your organisation will
+not publish. The AGPL does not have a "just this once" clause, and nobody
+should be reading one into it.
+
+**A separate commercial licence is available for exactly that case.** Email
+**kadir.can.yildirm@gmail.com** with `[wardyn licence]` in the subject, saying
+roughly what you want to do. This is possible because every line of Wardyn is
+written by one person who holds the copyright, so there is one person who can
+grant other terms — which is also why the contribution rules in
+[CONTRIBUTING.md](./CONTRIBUTING.md) ask contributors to allow it.
+
+To be plain about what this is and is not: the AGPL version is the whole tool,
+not a crippled edition, and it is not going to become one. There is no feature
+held back for paying users. The commercial licence exists so that "I cannot
+comply with the AGPL" has an answer other than "then you cannot use it".
+
 ### The kernel-side crates are dual-licensed
 
 `wardyn-ebpf` and `wardyn-common` are **`GPL-2.0-only OR AGPL-3.0-or-later`**.
@@ -837,5 +859,6 @@ Userspace — `wardyn` and `wardyn-policy`, which is the tool you run — is
 unchanged: AGPL-3.0-or-later.
 
 Unless you explicitly state otherwise, any contribution you intentionally submit
-for inclusion in the work shall be licensed as above, without any additional
-terms or conditions.
+for inclusion in the work shall be licensed as above, and under the additional
+grant described in [CONTRIBUTING.md](./CONTRIBUTING.md) that lets the
+maintainer offer it under the commercial licence as well.

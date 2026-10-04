@@ -4,7 +4,16 @@ Thanks for your interest in Wardyn! It's an eBPF watchdog for AI coding agents,
 written in Rust. Contributions — bug reports, docs, presets, code — are welcome.
 
 By contributing you agree that your work is licensed under the project's
-[AGPL-3.0-or-later](./LICENSE) license.
+[AGPL-3.0-or-later](./LICENSE) license, **and** that the maintainer may also
+offer it under other licence terms — see
+[Using it without the AGPL](./README.md#using-it-without-the-agpl).
+
+That second half is asked for openly rather than buried, because it is a real
+request: a maintainer who cannot relicense a contribution cannot offer a
+commercial licence that covers it, and a project with one contributed function
+it cannot relicense has no commercial licence to offer at all. If you would
+rather not grant it, say so in the pull request — that is a reasonable position
+and we can talk about where the change fits.
 
 ## Ground rules
 

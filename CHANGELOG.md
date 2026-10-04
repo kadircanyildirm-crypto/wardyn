@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A commercial licence is available alongside the AGPL.** Nothing about the
+  AGPL version changes: it is the whole tool, it stays the whole tool, and no
+  feature is held back for paying users. What is new is an answer for the case
+  the AGPL genuinely cannot serve — a closed-source product, or a deployment
+  whose source an organisation will not publish — other than "then you cannot
+  use it".
+
+  This is possible only because the copyright sits with one person.
+  `CONTRIBUTING.md` now asks contributors to allow the same, and says plainly
+  why it is being asked rather than burying it: a contribution that cannot be
+  relicensed is a contribution no commercial licence can cover. A contributor
+  who would rather not grant it is invited to say so in the pull request.
+
+
+### Changed
+
 - **`docs/COMPARISON.md` now names the project closest to this one, and dates
   every claim.** The page was written in early September and had gone stale in
   the way a competitive comparison always goes stale: in the direction that
