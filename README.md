@@ -798,8 +798,10 @@ tracker. The threat model and known limitations are documented there too.
 
 An independent, adversarially-verified audit of the whole codebase — every gap,
 escape, and honesty caveat, ranked by severity — lives in
-[`docs/AUDIT.md`](./docs/AUDIT.md); an honest comparison against sandboxes,
-Landlock, and Tetragon/Tracee is in [`docs/COMPARISON.md`](./docs/COMPARISON.md).
+[`docs/AUDIT.md`](./docs/AUDIT.md); an honest comparison against the vendor
+sandboxes, Landlock, Tetragon/Tracee — and against **ActPlane**, which is close
+enough to this project that the page says so plainly — is in
+[`docs/COMPARISON.md`](./docs/COMPARISON.md).
 Read both before relying on Wardyn as anything more than a defence-in-depth layer.
 
 ## License

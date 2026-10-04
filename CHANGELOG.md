@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`docs/COMPARISON.md` now names the project closest to this one, and dates
+  every claim.** The page was written in early September and had gone stale in
+  the way a competitive comparison always goes stale: in the direction that
+  flattered the author.
+
+  [ActPlane](https://github.com/eunomia-bpf/ActPlane) (arXiv:2606.25189 — UC
+  Santa Cruz, Virginia Tech, HKUST, Alibaba) is, to a first approximation, this
+  project: eBPF plus BPF-LSM, a near-identical hook set, a YAML policy compiled
+  into the kernel, scoped to the agent's process tree, with a human-readable
+  reason fed back to the agent. MIT, `cargo install actplane`, pre-compiled
+  CO-RE objects, a published evaluation. The page now says so in its own
+  section rather than omitting it, and retires two claims it can no longer
+  make: "agent-agnostic and retrofit" and "a feedback loop into the agent's
+  reasoning" are parity, not a lead.
+
+  The vendor rows were refreshed against the vendors' current documentation,
+  which turned up a genuine and citable differentiator the old page had missed:
+  Claude Code's sandbox wraps **shell commands only** — its own docs list file
+  tools, local MCP servers, command hooks and LSP servers as running outside
+  it — while wardyn's boundary is the process tree.
+
+  Every third-party capability note is now dated, and where a project's
+  documentation is silent the table says *"not documented"* rather than *"does
+  not have"*. The difference is easy to get wrong in one's own favour, which is
+  how the previous version of this page aged badly.
+
+
 ### Added
 
 - **A coverage benchmark, with its own miss in the table.**
